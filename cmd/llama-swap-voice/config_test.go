@@ -68,6 +68,7 @@ func TestServiceConfig_Validate_RejectsInvalidValues(t *testing.T) {
 		"shutdown total zero":   {func(c *ServiceConfig) { c.ShutdownTiming.Total = 0 }, "shutdown.total"},
 		"shutdown grace below0": {func(c *ServiceConfig) { c.ShutdownTiming.Grace = -time.Second }, "shutdown.grace"},
 		"shutdown hard below0":  {func(c *ServiceConfig) { c.ShutdownTiming.Hard = -time.Second }, "shutdown.hard"},
+		"shutdown hard short":   {func(c *ServiceConfig) { c.ShutdownTiming.Hard = time.Second / 2 }, "shutdown.hard must be at least"},
 	}
 
 	for name, tt := range tests {

@@ -97,8 +97,11 @@ voices/
 
 Aliases let clients that ask for a fixed voice name, like OpenAI's `alloy`,
 use your own. Requests that name no voice get the default. Voices are read at
-startup, so restart after adding one. Only use recordings you have the right
-to clone.
+startup, so restart after adding one. A clip over 10 MiB is a startup error.
+Only use recordings you have the right to clone.
+
+The voices directory is trusted operator configuration: symlinks in it are
+followed wherever they point, so only let people you trust write to it.
 
 ## Connect your apps
 
@@ -147,15 +150,25 @@ Everything is set with environment variables. Only the default voice is required
 | `VOICES_DEFAULT` | *required* | Voice used when a request names none |
 | `TTS_LANG` | `en` | Language passed to the speech model |
 | `TTS_MAXINPUTCHARS` | `4096` | Longest text accepted per request |
-| `ASR_TRANSCODEINPUT` | `true` | Convert non-WAV uploads (Opus voice notes, say) to 16 kHz mono WAV before transcribing |
+| `ASR_TRANSCODEINPUT` | `true` | Decode every upload, WAV included, to 16 kHz mono WAV before transcribing, and reject audio over 20 minutes. `false` forwards uploads untouched: no format conversion and no length limit |
 | `ASR_PREFIXREGEX` | `^language \w+<asr_text>` | Removed from the start of each transcript |
 | `FFMPEG` | `ffmpeg` | ffmpeg binary |
-| `REQUEST_TIMEOUT` | `2m` | Longest a request may take, streaming included |
+| `REQUEST_TIMEOUT` | `2m` | Longest a speech or transcription request may take, streaming included. Every other endpoint gets 10 seconds |
 | `REQUEST_MAXCONCURRENT` | `4` | Requests handled at once; more get a 503 |
 | `LOG_LEVEL`, `LOG_FORMAT` | `info`, `json` | `debug`/`info`/`warn`/`error`; `json`/`console` |
-| `SHUTDOWN_TOTAL`, `SHUTDOWN_GRACE`, `SHUTDOWN_HARD` | `15s`, `0s`, `3s` | How long shutdown waits for in-flight requests |
+| `SHUTDOWN_GRACE`, `SHUTDOWN_TOTAL`, `SHUTDOWN_HARD` | `0s`, `15s`, `3s` | How shutdown unfolds; see below |
 
 If anything is wrong at startup, it lists every problem at once and exits.
+
+On SIGTERM or SIGINT, readiness turns 503 and shutdown runs in three steps:
+
+1. **Grace**: keep serving while load balancers notice readiness.
+2. **Total**: stop accepting connections and let in-flight requests finish.
+3. **Hard**: if any are still running, cancel them, close every connection,
+   stop their ffmpeg processes and wait this long for them to wind down.
+   `SHUTDOWN_HARD` must be at least `1s`, the time ffmpeg gets between
+   SIGTERM and SIGKILL. If requests are still running after it, the service
+   logs an error and exits with status 1.
 
 ## API
 
@@ -164,12 +177,15 @@ Every path also works without the `/v1` prefix.
 | Endpoint | Does |
 |---|---|
 | `POST /v1/audio/speech` | Text to speech. JSON: `input`, `voice`, `response_format` (`mp3` default, `opus`, `aac`, `flac`, `wav`, `pcm`), `speed` (0.25 to 4) |
-| `POST /v1/audio/transcriptions` | Speech to text. Multipart `file` (up to 25 MB), `response_format` `json`, `verbose_json` or `text` |
+| `POST /v1/audio/transcriptions` | Speech to text. Multipart `file` (up to 25 MB, and 20 minutes unless `ASR_TRANSCODEINPUT=false`), `response_format` `json`, `verbose_json` or `text` |
 | `GET /v1/models`, `GET /v1/audio/voices` | What's available |
 | `GET /health`, `GET /internal/liveness`, `GET /internal/readiness` | Health checks; readiness turns 503 while shutting down |
 
 `pcm` is raw 16-bit little-endian mono at 24 kHz, as in OpenAI's API. The
 `model` field is accepted and ignored; the models come from your config.
+
+Errors, unknown paths and wrong methods included, come back as JSON:
+`{"error":{"message":"…"}}`. A transcript over 1 MiB from the model is a 502.
 
 ## Development
 
@@ -177,6 +193,9 @@ Every path also works without the `/v1` prefix.
 go test ./...                     # no GPU, models or ffmpeg needed
 golangci-lint run ./...
 ```
+
+With ffmpeg on `PATH` or in `LLAMA_SWAP_VOICE_FFMPEG`, the tests also check
+that real ffmpeg streams every output format before its input ends.
 
 ## Licence
 

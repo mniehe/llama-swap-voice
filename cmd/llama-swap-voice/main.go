@@ -119,8 +119,7 @@ func serve(ctx context.Context, cfg *ServiceConfig, service *server.Server, logg
 	service.SetShuttingDown()
 	time.Sleep(cfg.ShutdownTiming.Grace)
 
-	shutdown(httpServer, &cfg.ShutdownTiming, logger)
-	return nil
+	return shutdown(httpServer, service, stopOngoing, &cfg.ShutdownTiming, logger)
 }
 
 func listen(httpServer *http.Server) error {
@@ -132,23 +131,51 @@ func listen(httpServer *http.Server) error {
 	return fmt.Errorf("http server: %w", err)
 }
 
-// Request contexts descend from the server's BaseContext, which the caller
-// cancels only after this returns, so in-flight audio streams are drained
-// rather than aborted.
-func shutdown(httpServer *http.Server, timing *ShutdownTimingConfig, logger *slog.Logger) {
+// Request contexts descend from the server's BaseContext, so in-flight audio
+// streams first get timing.Total to finish untouched. Past that they are
+// cancelled, which signals their ffmpeg children, and connections are closed;
+// timing.Hard then bounds the wait for handlers to reap those children.
+func shutdown(
+	httpServer *http.Server,
+	service *server.Server,
+	cancelRequests context.CancelFunc,
+	timing *ShutdownTimingConfig,
+	logger *slog.Logger,
+) error {
 	logger.Info("waiting for ongoing requests to finish", slog.String("timeout", timing.Total.String()))
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), timing.Total)
-	defer cancel()
-
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		logger.Error("timed out shutting down server gracefully",
-			slog.Any("error", err),
-			slog.String("hard_timeout", timing.Hard.String()),
-		)
-		time.Sleep(timing.Hard)
-		return
+	err := drain(httpServer, timing.Total)
+	if err == nil {
+		logger.Info("server shut down")
+		return nil
 	}
 
-	logger.Info("server shut down")
+	logger.Warn("requests outlived the shutdown budget, cancelling them",
+		slog.Any("error", err),
+		slog.String("hard_timeout", timing.Hard.String()),
+	)
+	cancelRequests()
+	if err := httpServer.Close(); err != nil {
+		logger.Warn("closing connections", slog.Any("error", err))
+	}
+
+	return awaitHandlers(service, timing.Hard)
+}
+
+func drain(httpServer *http.Server, total time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), total)
+	defer cancel()
+
+	return httpServer.Shutdown(ctx)
+}
+
+func awaitHandlers(service *server.Server, hard time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), hard)
+	defer cancel()
+
+	if err := service.Drain(ctx); err != nil {
+		return fmt.Errorf("requests still running %s after cancellation: %w", hard, err)
+	}
+
+	return nil
 }

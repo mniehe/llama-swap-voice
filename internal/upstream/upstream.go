@@ -24,7 +24,10 @@ const (
 	ttsPath            = "tts"
 	transcriptionsPath = "v1/audio/transcriptions"
 	maxErrorBodyBytes  = 4096
+	maxTranscriptBytes = 1 << 20
 )
+
+var errTranscriptTooLarge = fmt.Errorf("transcript is larger than %d MiB", maxTranscriptBytes>>20)
 
 type StatusError struct {
 	Code    int
@@ -68,7 +71,7 @@ type Audio struct {
 }
 
 func (c *Client) Synthesize(ctx context.Context, speech Speech) (*Audio, error) {
-	body, contentType, err := speechForm(speech)
+	body, contentType, err := speechForm(ctx, speech)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +139,7 @@ func statusError(resp *http.Response) error {
 	return &StatusError{Code: resp.StatusCode, Message: message}
 }
 
-func speechForm(speech Speech) (io.Reader, string, error) {
+func speechForm(ctx context.Context, speech Speech) (io.Reader, string, error) {
 	buf := &bytes.Buffer{}
 	form := multipart.NewWriter(buf)
 
@@ -152,7 +155,7 @@ func speechForm(speech Speech) (io.Reader, string, error) {
 		}
 	}
 
-	if err := attachFile(form, "speaker_ref", speech.SpeakerRef); err != nil {
+	if err := attachFile(ctx, form, "speaker_ref", speech.SpeakerRef); err != nil {
 		return nil, "", err
 	}
 
@@ -163,7 +166,11 @@ func speechForm(speech Speech) (io.Reader, string, error) {
 	return buf, form.FormDataContentType(), nil
 }
 
-func attachFile(form *multipart.Writer, field, path string) error {
+func attachFile(ctx context.Context, form *multipart.Writer, field, path string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("speaker reference: %w", err)
@@ -175,8 +182,21 @@ func attachFile(form *multipart.Writer, field, path string) error {
 		return err
 	}
 
-	_, err = io.Copy(part, file)
+	_, err = io.Copy(part, &contextReader{ctx: ctx, src: file})
 	return err
+}
+
+type contextReader struct {
+	ctx context.Context
+	src io.Reader
+}
+
+func (c *contextReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	return c.src.Read(p)
 }
 
 func recordingForm(rec Recording, model string) (io.Reader, string, error) {
@@ -209,8 +229,17 @@ type transcript struct {
 }
 
 func decodeTranscript(body io.Reader) (string, error) {
+	data, err := io.ReadAll(io.LimitReader(body, maxTranscriptBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read transcript: %w", err)
+	}
+
+	if len(data) > maxTranscriptBytes {
+		return "", errTranscriptTooLarge
+	}
+
 	var result transcript
-	if err := json.NewDecoder(body).Decode(&result); err != nil {
+	if err := json.Unmarshal(data, &result); err != nil {
 		return "", fmt.Errorf("decode transcript: %w", err)
 	}
 

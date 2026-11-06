@@ -3,16 +3,20 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"regexp"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/mniehe/llama-swap-voice/internal/transcode"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
+
+const controlRequestTimeout = 10 * time.Second
 
 var routePrefixes = []string{"/v1", ""}
 
@@ -33,14 +37,16 @@ type Config struct {
 }
 
 type Server struct {
-	cfg          Config
-	upstream     *upstream.Client
-	encoder      *transcode.Encoder
-	prefix       *regexp.Regexp
-	voices       []string
-	slots        chan struct{}
-	log          *slog.Logger
-	shuttingDown atomic.Bool
+	cfg            Config
+	upstream       *upstream.Client
+	encoder        *transcode.Encoder
+	prefix         *regexp.Regexp
+	voices         []string
+	slots          chan struct{}
+	log            *slog.Logger
+	shuttingDown   atomic.Bool
+	admission      admission
+	controlTimeout time.Duration
 }
 
 func New(cfg *Config, client *upstream.Client, log *slog.Logger) (*Server, error) {
@@ -50,29 +56,84 @@ func New(cfg *Config, client *upstream.Client, log *slog.Logger) (*Server, error
 	}
 
 	return &Server{
-		cfg:      *cfg,
-		upstream: client,
-		encoder:  transcode.New(cfg.FFmpeg),
-		prefix:   prefix,
-		voices:   voiceNames(cfg.Voices),
-		slots:    make(chan struct{}, cfg.MaxConcurrent),
-		log:      log,
+		cfg:            *cfg,
+		upstream:       client,
+		encoder:        transcode.New(cfg.FFmpeg),
+		prefix:         prefix,
+		voices:         voiceNames(cfg.Voices),
+		slots:          make(chan struct{}, cfg.MaxConcurrent),
+		log:            log,
+		controlTimeout: controlRequestTimeout,
 	}, nil
 }
 
+type route struct {
+	method  string
+	path    string
+	handler http.HandlerFunc
+}
+
+func (s *Server) routes() []route {
+	probes := []route{
+		{http.MethodGet, "/health", s.handleHealth},
+		{http.MethodGet, "/internal/liveness", s.handleLiveness},
+		{http.MethodGet, "/internal/readiness", s.handleReadiness},
+	}
+	api := []route{
+		{http.MethodPost, "/audio/speech", s.limited(s.handleSpeech)},
+		{http.MethodPost, "/audio/transcriptions", s.limited(s.handleTranscription)},
+		{http.MethodGet, "/models", s.handleModels},
+		{http.MethodGet, "/audio/voices", s.handleVoices},
+	}
+
+	routes := make([]route, 0, len(probes)+len(routePrefixes)*len(api))
+	routes = append(routes, probes...)
+	for _, prefix := range routePrefixes {
+		for _, rt := range api {
+			rt.path = prefix + rt.path
+			routes = append(routes, rt)
+		}
+	}
+
+	return routes
+}
+
+// A pattern with a method outranks the same path without one, so the
+// method-less patterns only see wrong methods and "/" only unknown paths.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	for _, prefix := range routePrefixes {
-		mux.HandleFunc("POST "+prefix+"/audio/speech", s.limited(s.handleSpeech))
-		mux.HandleFunc("POST "+prefix+"/audio/transcriptions", s.limited(s.handleTranscription))
-		mux.HandleFunc("GET "+prefix+"/models", s.handleModels)
-		mux.HandleFunc("GET "+prefix+"/audio/voices", s.handleVoices)
+	allowed := map[string][]string{}
+	for _, rt := range s.routes() {
+		mux.HandleFunc(rt.method+" "+rt.path, rt.handler)
+		allowed[rt.path] = append(allowed[rt.path], servedMethods(rt.method)...)
 	}
-	mux.HandleFunc("GET /health", s.handleHealth)
-	mux.HandleFunc("GET /internal/liveness", s.handleLiveness)
-	mux.HandleFunc("GET /internal/readiness", s.handleReadiness)
 
-	return s.recovered(s.logged(mux))
+	for path, methods := range allowed {
+		mux.HandleFunc(path, s.methodNotAllowed(methods))
+	}
+	mux.HandleFunc("/", s.handleNotFound)
+
+	return s.logged(s.recovered(s.bounded(s.admitted(mux))))
+}
+
+func servedMethods(method string) []string {
+	if method == http.MethodGet {
+		return []string{http.MethodGet, http.MethodHead}
+	}
+
+	return []string{method}
+}
+
+func (s *Server) methodNotAllowed(methods []string) http.HandlerFunc {
+	allow := strings.Join(methods, ", ")
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Allow", allow)
+		s.writeError(w, http.StatusMethodNotAllowed, fmt.Errorf("method %s is not allowed on %s", r.Method, r.URL.Path))
+	}
+}
+
+func (s *Server) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	s.writeError(w, http.StatusNotFound, fmt.Errorf("%s not found", r.URL.Path))
 }
 
 // SetShuttingDown makes the readiness probe fail so load balancers stop
@@ -81,24 +142,41 @@ func (s *Server) SetShuttingDown() {
 	s.shuttingDown.Store(true)
 }
 
+// Every request gets connection deadlines before any handler runs, so a
+// stalled request body cannot hold a connection open. Audio routes replace
+// this bound with request.timeout in limited.
+func (s *Server) bounded(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.setDeadlines(w, time.Now().Add(s.controlTimeout))
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) limited(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		deadline := time.Now().Add(s.cfg.RequestTimeout)
+		s.setDeadlines(w, deadline)
+
 		select {
 		case s.slots <- struct{}{}:
 		default:
-			s.writeError(w, http.StatusServiceUnavailable, errBusy)
+			s.reject(w, errBusy)
 			return
 		}
 		defer func() { <-s.slots }()
-
-		deadline := time.Now().Add(s.cfg.RequestTimeout)
-		s.setDeadlines(w, deadline)
 
 		ctx, cancel := context.WithDeadline(r.Context(), deadline)
 		defer cancel()
 
 		next(w, r.WithContext(ctx))
 	}
+}
+
+// The request body is left unread, and closing the connection stops net/http
+// from trying to drain it after the response.
+func (s *Server) reject(w http.ResponseWriter, err error) {
+	w.Header().Set("Connection", "close")
+	s.writeError(w, http.StatusServiceUnavailable, err)
 }
 
 func (s *Server) setDeadlines(w http.ResponseWriter, deadline time.Time) {

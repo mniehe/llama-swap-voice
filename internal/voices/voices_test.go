@@ -136,6 +136,20 @@ func TestDiscover_UnreadableFile_ReturnsError(t *testing.T) {
 	assert.Contains(t, err.Error(), `voice "locked"`)
 }
 
+func TestDiscover_OversizedClip_ReturnsError(t *testing.T) {
+	dir := (&voiceDir{files: []string{"alice.mp3", "huge.wav", "edge.wav"}}).build(t)
+	require.NoError(t, os.Truncate(filepath.Join(dir, "huge.wav"), maxVoiceBytes+1))
+	require.NoError(t, os.Truncate(filepath.Join(dir, "edge.wav"), maxVoiceBytes))
+
+	found, err := Discover(dir)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `voice "huge"`)
+	assert.Contains(t, err.Error(), "larger than 10 MiB")
+	assert.NotContains(t, err.Error(), `voice "edge"`)
+	assert.Contains(t, found, "edge")
+}
+
 func TestDiscover_MissingDirectory_ReturnsError(t *testing.T) {
 	_, err := Discover(filepath.Join(t.TempDir(), "absent"))
 

@@ -99,15 +99,48 @@ func TestServer_HandleTranscription_WhitelistsInputFormats(t *testing.T) {
 	assert.Less(t, flag, input, "ffmpeg args %v put -format_whitelist after -i", args)
 }
 
-func TestServer_HandleTranscription_ForwardsWAVWithoutTranscode(t *testing.T) {
+func TestServer_HandleTranscription_TranscodingDecodesWAV(t *testing.T) {
+	h := newHarness(t, serveTranscript(t, transcriptText), transcoding)
+
+	resp := h.transcribe(map[string]string{"response_format": "text"}, []byte(streamedWAV))
+
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(readBody(t, resp)))
+	assert.True(t, containsRun(h.ffmpeg.Args(), "-ar", "16000", "-ac", "1"), "ffmpeg args %v, want the WAV decoded to 16 kHz mono", h.ffmpeg.Args())
+	assert.Equal(t, transcodedName, h.upstream.lastCall().names["file"], "want the decoded WAV sent upstream")
+}
+
+func TestServer_HandleTranscription_TranscodingDecodeFailureIs400(t *testing.T) {
 	h := newHarness(t, serveTranscript(t, transcriptText), transcoding)
 	h.ffmpeg.FailWith(t, "corrupt input packet in stream 0")
 
 	resp := h.transcribe(map[string]string{"response_format": "text"}, []byte(streamedWAV))
 
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Contains(t, errorMessage(t, resp), "corrupt input packet")
+	assert.Zero(t, h.upstream.callCount(), "an undecodable WAV reached upstream")
+}
+
+func TestServer_HandleTranscription_NoTranscodingForwardsWAV(t *testing.T) {
+	h := newHarness(t, serveTranscript(t, transcriptText))
+
+	resp := h.transcribe(map[string]string{"response_format": "text"}, []byte(streamedWAV))
+
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(readBody(t, resp)))
 	assert.Nil(t, h.ffmpeg.Args(), "ffmpeg ran, want WAV forwarded untouched")
-	assert.Equal(t, streamedWAV, string(h.upstream.lastCall().files["file"]), "want the uploaded WAV byte for byte")
+
+	call := h.upstream.lastCall()
+	assert.Equal(t, "clip.wav", call.names["file"])
+	assert.Equal(t, streamedWAV, string(call.files["file"]), "want the uploaded WAV byte for byte")
+}
+
+func TestServer_HandleTranscription_OversizedTranscriptIs502(t *testing.T) {
+	const oversized = 2 << 20
+	h := newHarness(t, serveTranscript(t, strings.Repeat("a", oversized)))
+
+	resp := h.transcribe(map[string]string{"response_format": "text"}, []byte("clip"))
+
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	assert.Contains(t, errorMessage(t, resp), "transcript is larger than")
 }
 
 func TestServer_HandleTranscription_Upstream5xxIsJSONError(t *testing.T) {
@@ -134,20 +167,4 @@ func TestServer_HandleTranscription_RejectsBadRequests(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, notMultipart.StatusCode, "not multipart")
 
 	assert.Zero(t, h.upstream.callCount())
-}
-
-func TestIsWAVHeader_Bytes_DetectsRIFFWAVE(t *testing.T) {
-	tests := []struct {
-		head string
-		want bool
-	}{
-		{streamedWAV[:wavSniffLen], true},
-		{"RIFF\x00\x00\x00\x00AVI\x20", false},
-		{"RIFF", false},
-		{"OggS\x00\x02\x00\x00\x00\x00\x00\x00", false},
-	}
-
-	for _, tt := range tests {
-		assert.Equal(t, tt.want, isWAVHeader([]byte(tt.head)), "%q", tt.head)
-	}
 }

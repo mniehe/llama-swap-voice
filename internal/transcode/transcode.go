@@ -34,9 +34,10 @@ const (
 	wavHeaderSize = 44
 	maxASRBytes   = maxASRSeconds*asrSampleRate*asrChannels*asrSampleSize + wavHeaderSize
 	minAtempo     = 0.5
-	killDelay     = time.Second
 	maxStderr     = 4096
 	spoolPattern  = "llama-swap-voice-asr-*"
+	minProbeBytes = "32"
+	noAnalysis    = "0"
 
 	asrInputFormats = "ogg,mp3,flac,wav,mov,matroska,webm,aac"
 
@@ -60,6 +61,9 @@ var codecs = map[Format]codec{
 	PCM:  {muxer: "s16le", encoder: "pcm_s16le", sampleRate: pcmSampleRate, channels: pcmChannels},
 }
 
+// KillDelay is how long ffmpeg has to exit after SIGTERM before it is killed.
+const KillDelay = time.Second
+
 var ErrTooLong = fmt.Errorf("audio is longer than %d minutes", maxASRSeconds/60)
 
 type Encoder struct {
@@ -82,7 +86,14 @@ func EncodeArgs(opts Options) ([]string, error) {
 		return nil, fmt.Errorf("unsupported format %q", opts.Format)
 	}
 
-	args := []string{"-hide_banner", "-loglevel", "error", "-f", "wav", "-i", stdinPipe}
+	// Upstream WAV carries its format in the header, so probing only delays
+	// the first output byte; with default probing ffmpeg waits for EOF on
+	// short replies.
+	args := []string{
+		"-hide_banner", "-loglevel", "error",
+		"-probesize", minProbeBytes, "-analyzeduration", noAnalysis,
+		"-f", "wav", "-i", stdinPipe,
+	}
 	if filter := atempo(opts.Speed); filter != "" {
 		args = append(args, "-filter:a", filter)
 	}
@@ -198,7 +209,7 @@ func (e *Encoder) command(ctx context.Context, src io.Reader, args []string) *ex
 	cmd.Cancel = func() error {
 		return cmd.Process.Signal(syscall.SIGTERM)
 	}
-	cmd.WaitDelay = killDelay
+	cmd.WaitDelay = KillDelay
 	return cmd
 }
 
@@ -229,22 +240,32 @@ func ffmpegError(cmd *exec.Cmd, err error) error {
 	return fmt.Errorf("ffmpeg: %w: %s", err, strings.TrimSpace(stderr.String()))
 }
 
+// The buffer is a named field so that exec.Cmd's io.Copy cannot reach
+// bytes.Buffer.ReadFrom and bypass the cap.
 type limitedBuffer struct {
-	bytes.Buffer
+	buf   bytes.Buffer
 	limit int
 }
 
 func (b *limitedBuffer) Write(p []byte) (int, error) {
-	room := b.limit - b.Len()
+	room := b.limit - b.buf.Len()
 	if room <= 0 {
 		return len(p), nil
 	}
 
-	if _, err := b.Buffer.Write(p[:min(room, len(p))]); err != nil {
+	if _, err := b.buf.Write(p[:min(room, len(p))]); err != nil {
 		return 0, err
 	}
 
 	return len(p), nil
+}
+
+func (b *limitedBuffer) Len() int {
+	return b.buf.Len()
+}
+
+func (b *limitedBuffer) String() string {
+	return b.buf.String()
 }
 
 type cappedBuffer struct {

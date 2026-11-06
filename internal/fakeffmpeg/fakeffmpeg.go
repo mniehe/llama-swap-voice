@@ -1,6 +1,6 @@
 // Package fakeffmpeg turns a Go test binary into a stand-in for ffmpeg so
-// tests can observe the arguments, stdin EOF and SIGTERM without a real
-// ffmpeg. TestMain must call RunIfRequested before m.Run.
+// tests can observe the arguments, process ID, stdin EOF and SIGTERM without
+// a real ffmpeg. TestMain must call RunIfRequested before m.Run.
 package fakeffmpeg
 
 import (
@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -16,16 +17,19 @@ import (
 )
 
 const (
-	recordEnv = "LLAMA_SWAP_VOICE_FAKE_FFMPEG_RECORD"
-	failEnv   = "LLAMA_SWAP_VOICE_FAKE_FFMPEG_FAIL"
+	recordEnv   = "LLAMA_SWAP_VOICE_FAKE_FFMPEG_RECORD"
+	failEnv     = "LLAMA_SWAP_VOICE_FAKE_FFMPEG_FAIL"
+	stubbornEnv = "LLAMA_SWAP_VOICE_FAKE_FFMPEG_STUBBORN"
 
 	EventArgs    = "ARGS"
+	EventPID     = "PID"
 	EventEOF     = "EOF"
 	EventSIGTERM = "SIGTERM"
 
 	stdinPipe   = "pipe:0"
 	exitSIGTERM = 143
 	pollEvery   = 10 * time.Millisecond
+	stuckNap    = time.Hour
 )
 
 type Fake struct {
@@ -49,6 +53,23 @@ func Install(t *testing.T) *Fake {
 
 func (f *Fake) FailWith(t *testing.T, message string) {
 	t.Setenv(failEnv, message)
+}
+
+// Stubborn makes the fake ignore SIGTERM and keep running after stdin ends,
+// so only SIGKILL stops it.
+func (f *Fake) Stubborn(t *testing.T) {
+	t.Setenv(stubbornEnv, "1")
+}
+
+func (f *Fake) PID() (int, bool) {
+	for _, event := range f.Events() {
+		if pid, ok := strings.CutPrefix(event, EventPID+" "); ok {
+			n, err := strconv.Atoi(pid)
+			return n, err == nil
+		}
+	}
+
+	return 0, false
 }
 
 func (f *Fake) Events() []string {
@@ -97,6 +118,8 @@ func RunIfRequested() {
 
 func run(record string) int {
 	appendEvent(record, EventArgs+" "+strings.Join(os.Args[1:], " "))
+	appendEvent(record, EventPID+" "+strconv.Itoa(os.Getpid()))
+	stubborn := os.Getenv(stubbornEnv) != ""
 
 	if message := os.Getenv(failEnv); message != "" {
 		fmt.Fprintln(os.Stderr, message)
@@ -108,7 +131,9 @@ func run(record string) int {
 	go func() {
 		<-terminated
 		appendEvent(record, EventSIGTERM)
-		os.Exit(exitSIGTERM)
+		if !stubborn {
+			os.Exit(exitSIGTERM)
+		}
 	}()
 
 	input, err := openInput(os.Args[1:])
@@ -123,6 +148,11 @@ func run(record string) int {
 		return 1
 	}
 	appendEvent(record, EventEOF)
+
+	for stubborn {
+		time.Sleep(stuckNap)
+	}
+
 	return 0
 }
 

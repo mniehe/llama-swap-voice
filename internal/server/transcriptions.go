@@ -23,11 +23,6 @@ const (
 	uploadFieldName  = "file"
 	formatFieldName  = "response_format"
 	missingFileError = "multipart field \"file\" is required"
-
-	riffMagic   = "RIFF"
-	waveMagic   = "WAVE"
-	waveOffset  = 8
-	wavSniffLen = waveOffset + len(waveMagic)
 )
 
 var transcriptFormats = map[string]bool{
@@ -87,42 +82,12 @@ func (s *Server) recording(r *http.Request, name string, data io.Reader) (upstre
 		return upstream.Recording{Name: name, Data: data}, nil
 	}
 
-	audio, isWAV, err := sniffWAV(data)
-	if err != nil {
-		return upstream.Recording{}, fmt.Errorf("read upload: %w", err)
-	}
-
-	if isWAV {
-		return upstream.Recording{Name: name, Data: audio}, nil
-	}
-
-	wav, err := s.encoder.ToASRInput(r.Context(), audio)
+	wav, err := s.encoder.ToASRInput(r.Context(), data)
 	if err != nil {
 		return upstream.Recording{}, fmt.Errorf("could not decode audio: %w", err)
 	}
 
 	return upstream.Recording{Name: transcodedName, Data: bytes.NewReader(wav)}, nil
-}
-
-func sniffWAV(data io.Reader) (io.Reader, bool, error) {
-	head := make([]byte, wavSniffLen)
-	n, err := io.ReadFull(data, head)
-	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
-		return nil, false, err
-	}
-
-	head = head[:n]
-	audio := io.MultiReader(bytes.NewReader(head), data)
-
-	return audio, isWAVHeader(head), nil
-}
-
-func isWAVHeader(head []byte) bool {
-	if len(head) < wavSniffLen {
-		return false
-	}
-
-	return string(head[:len(riffMagic)]) == riffMagic && string(head[waveOffset:wavSniffLen]) == waveMagic
 }
 
 func (s *Server) stripPrefix(text string) string {

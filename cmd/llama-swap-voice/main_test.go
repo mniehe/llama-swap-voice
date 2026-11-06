@@ -8,16 +8,20 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mniehe/llama-swap-voice/internal/fakeffmpeg"
 	"github.com/mniehe/llama-swap-voice/internal/server"
+	"github.com/mniehe/llama-swap-voice/internal/transcode"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
@@ -25,7 +29,15 @@ const (
 	probeTimeout = 3 * time.Second
 	probeEvery   = 10 * time.Millisecond
 	slowAudio    = "RIFF....WAVEslow audio"
+
+	forcedTotal   = 200 * time.Millisecond
+	shutdownSlack = 500 * time.Millisecond
 )
+
+func TestMain(m *testing.M) {
+	fakeffmpeg.RunIfRequested()
+	os.Exit(m.Run())
+}
 
 func freePort(t *testing.T) int {
 	t.Helper()
@@ -148,6 +160,81 @@ func TestServe_Signal_DrainsInFlightRequest(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+// stuckSpeech starts a speech request whose upstream never finishes, encoded
+// by a fake ffmpeg that ignores SIGTERM, and returns once ffmpeg is running.
+func stuckSpeech(t *testing.T, cfg *ServiceConfig) (cancel context.CancelFunc, done <-chan error, pid int) {
+	t.Helper()
+
+	fake := fakeffmpeg.Install(t)
+	fake.Stubborn(t)
+	cfg.Port = freePort(t)
+	base := "http://" + net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+
+	service := newService(t, func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.WriteString(w, slowAudio)
+		assert.NoError(t, err)
+		assert.NoError(t, http.NewResponseController(w).Flush())
+		<-r.Context().Done()
+	})
+
+	cancel, done = startServe(t, cfg, service)
+	waitReady(t, base)
+
+	go func() {
+		_, err := postSpeechAs(t.Context(), base, "mp3")
+		assert.Error(t, err, "a cancelled stream must not end cleanly")
+	}()
+
+	require.Eventually(t, func() bool {
+		var ok bool
+		pid, ok = fake.PID()
+		return ok
+	}, probeTimeout, probeEvery, "ffmpeg never started")
+
+	return cancel, done, pid
+}
+
+func processGone(pid int) bool {
+	return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
+}
+
+func TestServe_StuckRequest_CancelsAndReapsFFmpeg(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.ShutdownTiming = ShutdownTimingConfig{Total: forcedTotal, Hard: 3 * transcode.KillDelay / 2}
+
+	cancel, done, pid := stuckSpeech(t, &cfg)
+	signalled := time.Now()
+	cancel()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err, "every handler returned within shutdown.hard")
+	case <-time.After(cfg.ShutdownTiming.Total + cfg.ShutdownTiming.Hard + shutdownSlack):
+		require.Fail(t, "serve did not return within total+hard")
+	}
+
+	assert.Less(t, time.Since(signalled), cfg.ShutdownTiming.Total+cfg.ShutdownTiming.Hard+shutdownSlack)
+	assert.True(t, processGone(pid), "ffmpeg %d outlived serve", pid)
+}
+
+func TestServe_HandlersOutliveHard_ReturnsError(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.ShutdownTiming = ShutdownTimingConfig{Total: forcedTotal, Hard: forcedTotal}
+
+	cancel, done, pid := stuckSpeech(t, &cfg)
+	cancel()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "still running")
+	case <-time.After(cfg.ShutdownTiming.Total + cfg.ShutdownTiming.Hard + shutdownSlack):
+		require.Fail(t, "serve did not return within total+hard")
+	}
+
+	assert.Eventually(t, func() bool { return processGone(pid) }, probeTimeout, probeEvery, "ffmpeg %d was never killed", pid)
+}
+
 func TestServe_PortInUse_ReturnsError(t *testing.T) {
 	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -171,7 +258,11 @@ func TestServe_PortInUse_ReturnsError(t *testing.T) {
 }
 
 func postSpeech(ctx context.Context, base string) (string, error) {
-	body := strings.NewReader(`{"input":"hi","response_format":"wav"}`)
+	return postSpeechAs(ctx, base, "wav")
+}
+
+func postSpeechAs(ctx context.Context, base, format string) (string, error) {
+	body := strings.NewReader(`{"input":"hi","response_format":"` + format + `"}`)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/audio/speech", body)
 	if err != nil {
 		return "", err

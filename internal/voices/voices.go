@@ -8,7 +8,10 @@ import (
 	"strings"
 )
 
-const hiddenPrefix = "."
+const (
+	hiddenPrefix  = "."
+	maxVoiceBytes = 10 << 20
+)
 
 var extensions = []string{".wav", ".mp3"}
 
@@ -88,6 +91,10 @@ func isReadableFile(path string) (bool, error) {
 
 	if !info.Mode().IsRegular() {
 		return false, nil
+	}
+
+	if info.Size() > maxVoiceBytes {
+		return false, fmt.Errorf("%s is %d bytes, larger than %d MiB", path, info.Size(), maxVoiceBytes>>20)
 	}
 
 	file, err := os.Open(path)

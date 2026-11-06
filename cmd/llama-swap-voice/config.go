@@ -11,6 +11,7 @@ import (
 
 	"github.com/mniehe/llama-swap-voice/internal/observability"
 	"github.com/mniehe/llama-swap-voice/internal/server"
+	"github.com/mniehe/llama-swap-voice/internal/transcode"
 	"github.com/mniehe/llama-swap-voice/internal/voices"
 )
 
@@ -224,8 +225,8 @@ func (c *ServiceConfig) validateShutdown() error {
 		errs = append(errs, fmt.Errorf("shutdown.grace must not be negative, got %s", c.ShutdownTiming.Grace))
 	}
 
-	if c.ShutdownTiming.Hard < 0 {
-		errs = append(errs, fmt.Errorf("shutdown.hard must not be negative, got %s", c.ShutdownTiming.Hard))
+	if c.ShutdownTiming.Hard < transcode.KillDelay {
+		errs = append(errs, fmt.Errorf("shutdown.hard must be at least %s so ffmpeg can be killed and reaped, got %s", transcode.KillDelay, c.ShutdownTiming.Hard))
 	}
 
 	return errors.Join(errs...)

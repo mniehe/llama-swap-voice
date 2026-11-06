@@ -24,13 +24,13 @@ func TestEncodeArgs_Options_BuildsCommandLine(t *testing.T) {
 		opts Options
 		want string
 	}{
-		{Options{Format: Opus, Speed: 1}, "-hide_banner -loglevel error -f wav -i pipe:0 -f ogg -c:a libopus pipe:1"},
-		{Options{Format: MP3, Speed: 1.15}, "-hide_banner -loglevel error -f wav -i pipe:0 -filter:a atempo=1.15 -f mp3 -c:a libmp3lame pipe:1"},
-		{Options{Format: WAV, Speed: 0.25}, "-hide_banner -loglevel error -f wav -i pipe:0 -filter:a atempo=0.5,atempo=0.5 -f wav -c:a pcm_s16le pipe:1"},
-		{Options{Format: FLAC}, "-hide_banner -loglevel error -f wav -i pipe:0 -f flac -c:a flac pipe:1"},
-		{Options{Format: AAC, Speed: 2}, "-hide_banner -loglevel error -f wav -i pipe:0 -filter:a atempo=2 -f adts -c:a aac pipe:1"},
-		{Options{Format: PCM, Speed: 1}, "-hide_banner -loglevel error -f wav -i pipe:0 -ar 24000 -ac 1 -f s16le -c:a pcm_s16le pipe:1"},
-		{Options{Format: PCM, Speed: 1.5}, "-hide_banner -loglevel error -f wav -i pipe:0 -filter:a atempo=1.5 -ar 24000 -ac 1 -f s16le -c:a pcm_s16le pipe:1"},
+		{Options{Format: Opus, Speed: 1}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -f ogg -c:a libopus pipe:1"},
+		{Options{Format: MP3, Speed: 1.15}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -filter:a atempo=1.15 -f mp3 -c:a libmp3lame pipe:1"},
+		{Options{Format: WAV, Speed: 0.25}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -filter:a atempo=0.5,atempo=0.5 -f wav -c:a pcm_s16le pipe:1"},
+		{Options{Format: FLAC}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -f flac -c:a flac pipe:1"},
+		{Options{Format: AAC, Speed: 2}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -filter:a atempo=2 -f adts -c:a aac pipe:1"},
+		{Options{Format: PCM, Speed: 1}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -ar 24000 -ac 1 -f s16le -c:a pcm_s16le pipe:1"},
+		{Options{Format: PCM, Speed: 1.5}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -filter:a atempo=1.5 -ar 24000 -ac 1 -f s16le -c:a pcm_s16le pipe:1"},
 	}
 	for _, tt := range tests {
 		args, err := EncodeArgs(tt.opts)
@@ -73,6 +73,22 @@ func TestEncoder_Encode_FailureReportsStderrOnClose(t *testing.T) {
 	err = out.Close()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Unknown encoder")
+}
+
+func TestEncoder_Encode_CapsCapturedStderr(t *testing.T) {
+	const noise = "z"
+	fake := fakeffmpeg.Install(t)
+	fake.FailWith(t, strings.Repeat(noise, 10*maxStderr))
+
+	out, err := New(fake.Path).Encode(t.Context(), strings.NewReader("wav stream"), Options{Format: Opus})
+	require.NoError(t, err)
+
+	_, err = io.ReadAll(out)
+	require.NoError(t, err)
+
+	err = out.Close()
+	require.Error(t, err)
+	assert.Equal(t, maxStderr, strings.Count(err.Error(), noise), "stderr bytes kept in the error")
 }
 
 func TestEncoder_Encode_MissingBinaryReturnsError(t *testing.T) {

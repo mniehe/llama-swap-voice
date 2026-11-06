@@ -7,7 +7,9 @@ import (
 	"runtime/debug"
 )
 
-const internalErrorText = "Internal Server Error"
+const internalErrorText = "internal server error"
+
+var errInternal = errors.New(internalErrorText)
 
 func (s *Server) recovered(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -28,9 +30,21 @@ func (s *Server) recovered(next http.Handler) http.Handler {
 				slog.String("stack", string(debug.Stack())),
 				slog.String("path", r.URL.Path),
 			)
-			http.Error(w, internalErrorText, http.StatusInternalServerError)
+
+			// Audio may already be on the wire; an error body appended to it
+			// would play as noise, so the client gets a broken transfer instead.
+			if committed(w) {
+				panic(http.ErrAbortHandler)
+			}
+
+			s.writeError(w, http.StatusInternalServerError, errInternal)
 		}()
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func committed(w http.ResponseWriter) bool {
+	tracked, ok := w.(*trackingWriter)
+	return ok && tracked.wroteHeader
 }
