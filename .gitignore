@@ -1,0 +1,18 @@
+# Binaries
+/llama-swap-voice
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries and coverage output
+*.test
+*.out
+
+# Go workspace file
+go.work
+
+# Editor and OS clutter
+*~
+.DS_Store
