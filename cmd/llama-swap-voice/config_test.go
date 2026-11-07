@@ -120,7 +120,6 @@ func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 		"TTS_LANG":                "de",
 		"TTS_MAXINPUTCHARS":       "512",
 		"ASR_PREFIXREGEX":         "^x",
-		"ASR_TRANSCODEINPUT":      "false",
 		"FFMPEG":                  "/opt/ffmpeg/bin/ffmpeg",
 		"REQUEST_TIMEOUT":         "45s",
 		"REQUEST_MAXCONCURRENT":   "2",
@@ -143,7 +142,7 @@ func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 		Upstream:       UpstreamConfig{URL: "https://llama.example:8443", TTSModel: "tts-alt", ASRModel: "asr-alt", TTSConcurrency: 3},
 		Voices:         VoicesConfig{Dir: "/srv/voices", Default: "bm_fable"},
 		TTS:            TTSConfig{Lang: "de", MaxInputChars: 512},
-		ASR:            ASRConfig{PrefixRegex: "^x", TranscodeInput: false},
+		ASR:            ASRConfig{PrefixRegex: "^x"},
 		FFmpeg:         "/opt/ffmpeg/bin/ffmpeg",
 		Request:        RequestConfig{Timeout: 45 * time.Second, MaxConcurrent: 2},
 		Logger:         LoggerConfig{Level: "debug", Format: "console"},
@@ -176,5 +175,4 @@ func TestServiceConfig_ServerConfig_CopiesSettings(t *testing.T) {
 	assert.Equal(t, cfg.Request.MaxConcurrent, got.MaxConcurrent)
 	assert.Equal(t, cfg.Upstream.TTSConcurrency, got.TTSConcurrency)
 	assert.Equal(t, cfg.ASR.PrefixRegex, got.ASRPrefixRegex)
-	assert.Equal(t, cfg.ASR.TranscodeInput, got.TranscodeASRInput)
 }

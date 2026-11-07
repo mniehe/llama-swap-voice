@@ -26,18 +26,17 @@ var routePrefixes = []string{"/v1", ""}
 var errBusy = errors.New("too many concurrent requests, retry shortly")
 
 type Config struct {
-	TTSModel          string
-	ASRModel          string
-	Voices            map[string]string
-	DefaultVoice      string
-	Lang              string
-	FFmpeg            string
-	RequestTimeout    time.Duration
-	MaxInputChars     int
-	MaxConcurrent     int
-	TTSConcurrency    int
-	ASRPrefixRegex    string
-	TranscodeASRInput bool
+	TTSModel       string
+	ASRModel       string
+	Voices         map[string]string
+	DefaultVoice   string
+	Lang           string
+	FFmpeg         string
+	RequestTimeout time.Duration
+	MaxInputChars  int
+	MaxConcurrent  int
+	TTSConcurrency int
+	ASRPrefixRegex string
 }
 
 type Server struct {

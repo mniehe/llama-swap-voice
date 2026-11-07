@@ -1,10 +1,8 @@
 package transcode
 
 import (
-	"bytes"
 	"io"
 	"os"
-	"slices"
 	"strings"
 	"testing"
 
@@ -96,43 +94,6 @@ func TestEncoder_Encode_MissingBinaryReturnsError(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "start ffmpeg")
-}
-
-func TestEncoder_ToASRInput_ReportsFFmpegStderr(t *testing.T) {
-	fake := fakeffmpeg.Install(t)
-	fake.FailWith(t, "Invalid data found when processing input")
-
-	_, err := New(fake.Path).ToASRInput(t.Context(), bytes.NewReader([]byte("junk")))
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "Invalid data found")
-}
-
-func TestEncoder_ToASRInput_CapsDecodedSize(t *testing.T) {
-	fake := fakeffmpeg.Install(t)
-	encoder := New(fake.Path)
-	encoder.maxASRBytes = 16
-
-	_, err := encoder.ToASRInput(t.Context(), strings.NewReader(strings.Repeat("x", 64)))
-
-	require.ErrorIs(t, err, ErrTooLong)
-}
-
-func TestEncoder_ToASRInput_ReadsSeekableFile(t *testing.T) {
-	fake := fakeffmpeg.Install(t)
-
-	out, err := New(fake.Path).ToASRInput(t.Context(), strings.NewReader("m4a bytes"))
-	require.NoError(t, err)
-
-	args := fake.Args()
-	inputFlag := slices.Index(args, "-i")
-	require.GreaterOrEqual(t, inputFlag, 0, "ffmpeg args %v lack -i", args)
-	input := args[inputFlag+1]
-
-	assert.NotEqual(t, stdinPipe, input, "want a file input")
-	assert.Contains(t, args, "-xerror")
-	assert.Equal(t, "m4a bytes", string(out), "want the uploaded bytes")
-	assert.NoFileExists(t, input, "temporary input was not removed")
 }
 
 func TestLimitedBuffer_Write_KeepsPrefix(t *testing.T) {

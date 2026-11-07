@@ -4,11 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/mniehe/llama-swap-voice/internal/audio"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
@@ -23,6 +24,12 @@ const (
 	uploadFieldName  = "file"
 	formatFieldName  = "response_format"
 	missingFileError = "multipart field \"file\" is required"
+	maxAudioMinutes  = 20
+)
+
+var (
+	asrLimits       = audio.Limits{MaxDuration: maxAudioMinutes * time.Minute}
+	errAudioTooLong = fmt.Errorf("audio is longer than %d minutes", maxAudioMinutes)
 )
 
 var transcriptFormats = map[string]bool{
@@ -54,18 +61,20 @@ func (s *Server) handleTranscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	file, header, err := r.FormFile(uploadFieldName)
+	file, _, err := r.FormFile(uploadFieldName)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, errors.New(missingFileError))
 		return
 	}
 	defer file.Close()
 
-	rec, err := s.recording(r, header.Filename, file)
+	wav, err := audio.NormaliseUpload(r.Context(), file, asrLimits)
 	if err != nil {
-		s.writeError(w, http.StatusBadRequest, err)
+		s.decodeFailure(w, r, err)
 		return
 	}
+
+	rec := upstream.Recording{Name: transcodedName, Data: bytes.NewReader(wav)}
 
 	text, err := s.upstream.Transcribe(r.Context(), rec)
 	if err != nil {
@@ -77,17 +86,42 @@ func (s *Server) handleTranscription(w http.ResponseWriter, r *http.Request) {
 	s.writeTranscript(w, format, s.stripPrefix(text))
 }
 
-func (s *Server) recording(r *http.Request, name string, data io.Reader) (upstream.Recording, error) {
-	if !s.cfg.TranscodeASRInput {
-		return upstream.Recording{Name: name, Data: data}, nil
+// Hermes retries a 400 through its own transcoder only when the message says
+// "unsupported", "corrupted" or "invalid file", so those words must survive.
+// A deadline that passed mid-decode explains any decoder error, so it wins.
+func (s *Server) decodeFailure(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case r.Context().Err() != nil:
+		s.writeError(w, http.StatusGatewayTimeout, fmt.Errorf("decoding audio: %w", r.Context().Err()))
+	case errors.Is(err, audio.ErrTooLong):
+		s.writeError(w, http.StatusBadRequest, errAudioTooLong)
+	case errors.Is(err, audio.ErrUnsupported):
+		s.rejectAudio(w, r, audio.ErrUnsupported, err)
+	case errors.Is(err, audio.ErrCorrupt):
+		s.rejectAudio(w, r, audio.ErrCorrupt, err)
+	default:
+		s.log.Error("could not read upload", slog.String("request_id", record(r).id), slog.Any("error", err))
+		s.writeError(w, http.StatusInternalServerError, errInternal)
+	}
+}
+
+// The decoder's detail names offsets and library internals, so it goes to
+// the log and the client gets only the reason.
+func (s *Server) rejectAudio(w http.ResponseWriter, r *http.Request, reason, err error) {
+	s.logDecodeError(r, err)
+	s.writeError(w, http.StatusBadRequest, fmt.Errorf("could not decode audio: %w", reason))
+}
+
+func (s *Server) logDecodeError(r *http.Request, err error) {
+	requestID := slog.String("request_id", record(r).id)
+
+	var crash interface{ Stack() []byte }
+	if errors.As(err, &crash) {
+		s.log.Error("audio decoder panicked", requestID, slog.Any("error", err), slog.String("stack", string(crash.Stack())))
+		return
 	}
 
-	wav, err := s.encoder.ToASRInput(r.Context(), data)
-	if err != nil {
-		return upstream.Recording{}, fmt.Errorf("could not decode audio: %w", err)
-	}
-
-	return upstream.Recording{Name: transcodedName, Data: bytes.NewReader(wav)}, nil
+	s.log.Warn("could not decode audio", requestID, slog.Any("error", err))
 }
 
 func (s *Server) stripPrefix(text string) string {

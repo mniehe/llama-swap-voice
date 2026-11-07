@@ -26,6 +26,7 @@ const (
 	pcmFormatTag   uint16 = 1
 	fmtChunkBytes  uint32 = 16
 	riffHeadBytes  uint32 = 8
+	wavHeaderBytes uint32 = 44
 )
 
 func realFFmpeg(t *testing.T) string {
@@ -56,7 +57,7 @@ func silentWAV() []byte {
 
 	le := binary.LittleEndian
 	wav := []byte("RIFF")
-	wav = le.AppendUint32(wav, wavHeaderSize-riffHeadBytes+dataBytes)
+	wav = le.AppendUint32(wav, wavHeaderBytes-riffHeadBytes+dataBytes)
 	wav = append(wav, "WAVEfmt "...)
 	wav = le.AppendUint32(wav, fmtChunkBytes)
 	wav = le.AppendUint16(wav, pcmFormatTag)

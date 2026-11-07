@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -27,19 +26,10 @@ const (
 const (
 	stdinPipe     = "pipe:0"
 	stdoutPipe    = "pipe:1"
-	asrSampleRate = 16000
-	asrChannels   = 1
-	asrSampleSize = 2
-	maxASRSeconds = 20 * 60
-	wavHeaderSize = 44
-	maxASRBytes   = maxASRSeconds*asrSampleRate*asrChannels*asrSampleSize + wavHeaderSize
 	minAtempo     = 0.5
 	maxStderr     = 4096
-	spoolPattern  = "llama-swap-voice-asr-*"
 	minProbeBytes = "32"
 	noAnalysis    = "0"
-
-	asrInputFormats = "ogg,mp3,flac,wav,mov,matroska,webm,aac"
 
 	pcmSampleRate = 24000
 	pcmChannels   = 1
@@ -64,15 +54,12 @@ var codecs = map[Format]codec{
 // KillDelay is how long ffmpeg has to exit after SIGTERM before it is killed.
 const KillDelay = time.Second
 
-var ErrTooLong = fmt.Errorf("audio is longer than %d minutes", maxASRSeconds/60)
-
 type Encoder struct {
-	ffmpeg      string
-	maxASRBytes int
+	ffmpeg string
 }
 
 func New(ffmpeg string) *Encoder {
-	return &Encoder{ffmpeg: ffmpeg, maxASRBytes: maxASRBytes}
+	return &Encoder{ffmpeg: ffmpeg}
 }
 
 type Options struct {
@@ -112,15 +99,6 @@ func (c codec) resampling() []string {
 	return []string{"-ar", strconv.Itoa(c.sampleRate), "-ac", strconv.Itoa(c.channels)}
 }
 
-func ASRArgs(input string) []string {
-	return []string{
-		"-hide_banner", "-loglevel", "error", "-xerror",
-		"-format_whitelist", asrInputFormats, "-i", input,
-		"-ar", strconv.Itoa(asrSampleRate), "-ac", strconv.Itoa(asrChannels),
-		"-f", "wav", "-c:a", "pcm_s16le", stdoutPipe,
-	}
-}
-
 func atempo(speed float64) string {
 	if speed <= 0 || speed == 1 {
 		return ""
@@ -156,50 +134,6 @@ func (e *Encoder) Encode(ctx context.Context, src io.Reader, opts Options) (io.R
 	}
 
 	return &stream{cmd: cmd, stdout: stdout}, nil
-}
-
-func (e *Encoder) ToASRInput(ctx context.Context, src io.Reader) ([]byte, error) {
-	input, err := spool(src)
-	if err != nil {
-		return nil, err
-	}
-	defer os.Remove(input)
-
-	return e.decodeASR(ctx, input)
-}
-
-// Containers such as MP4 with the moov atom at the end need a seekable input;
-// from a pipe ffmpeg decodes nothing and still exits 0.
-func spool(src io.Reader) (string, error) {
-	file, err := os.CreateTemp("", spoolPattern)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
-	if _, err := io.Copy(file, src); err != nil {
-		os.Remove(file.Name())
-		return "", err
-	}
-
-	return file.Name(), nil
-}
-
-func (e *Encoder) decodeASR(ctx context.Context, input string) ([]byte, error) {
-	cmd := e.command(ctx, nil, ASRArgs(input))
-	out := &cappedBuffer{limit: e.maxASRBytes}
-	cmd.Stdout = out
-
-	err := cmd.Run()
-	if out.overflowed {
-		return nil, ErrTooLong
-	}
-
-	if err != nil {
-		return nil, ffmpegError(cmd, err)
-	}
-
-	return out.Bytes(), nil
 }
 
 func (e *Encoder) command(ctx context.Context, src io.Reader, args []string) *exec.Cmd {
@@ -266,23 +200,4 @@ func (b *limitedBuffer) Len() int {
 
 func (b *limitedBuffer) String() string {
 	return b.buf.String()
-}
-
-type cappedBuffer struct {
-	buf        bytes.Buffer
-	limit      int
-	overflowed bool
-}
-
-func (b *cappedBuffer) Write(p []byte) (int, error) {
-	if b.buf.Len()+len(p) > b.limit {
-		b.overflowed = true
-		return 0, ErrTooLong
-	}
-
-	return b.buf.Write(p)
-}
-
-func (b *cappedBuffer) Bytes() []byte {
-	return b.buf.Bytes()
 }

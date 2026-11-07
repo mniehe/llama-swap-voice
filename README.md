@@ -151,7 +151,6 @@ Everything is set with environment variables. Only the default voice is required
 | `VOICES_DEFAULT` | *required* | Voice used when a request names none |
 | `TTS_LANG` | `en` | Language passed to the speech model |
 | `TTS_MAXINPUTCHARS` | `4096` | Longest text accepted per request |
-| `ASR_TRANSCODEINPUT` | `true` | Decode every upload, WAV included, to 16 kHz mono WAV before transcribing, and reject audio over 20 minutes. `false` forwards uploads untouched: no format conversion and no length limit |
 | `ASR_PREFIXREGEX` | `^language \w+<asr_text>` | Removed from the start of each transcript |
 | `FFMPEG` | `ffmpeg` | ffmpeg binary |
 | `REQUEST_TIMEOUT` | `2m` | Longest a speech or transcription request may take, streaming included. Every other endpoint gets 10 seconds |
@@ -184,7 +183,7 @@ Every path also works without the `/v1` prefix.
 | Endpoint | Does |
 |---|---|
 | `POST /v1/audio/speech` | Text to speech. JSON: `input`, `voice`, `response_format` (`mp3` default, `opus`, `aac`, `flac`, `wav`, `pcm`), `speed` (0.25 to 4) |
-| `POST /v1/audio/transcriptions` | Speech to text. Multipart `file` (up to 25 MB, and 20 minutes unless `ASR_TRANSCODEINPUT=false`), `response_format` `json`, `verbose_json` or `text` |
+| `POST /v1/audio/transcriptions` | Speech to text. Multipart `file` (up to 25 MB and 20 minutes) in WAV (16-bit, 24-bit or float), Ogg Opus or MP3, mono or stereo at 8 to 48 kHz, decoded in Go to 16 kHz mono before transcribing. Anything else, FLAC, M4A, WebM, AAC and chained Ogg included, is a 400 `could not decode audio: unsupported audio format`; a damaged or empty file is a 400 `could not decode audio: corrupted audio`, and audio over 20 minutes a 400 `audio is longer than 20 minutes`. `response_format` `json`, `verbose_json` or `text` |
 | `GET /v1/models`, `GET /v1/audio/voices` | What's available |
 | `GET /health`, `GET /internal/liveness`, `GET /internal/readiness` | Health checks; readiness turns 503 while shutting down |
 

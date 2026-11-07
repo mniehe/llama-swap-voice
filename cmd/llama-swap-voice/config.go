@@ -60,8 +60,7 @@ type TTSConfig struct {
 }
 
 type ASRConfig struct {
-	PrefixRegex    string `koanf:"prefixregex"`
-	TranscodeInput bool   `koanf:"transcodeinput"`
+	PrefixRegex string `koanf:"prefixregex"`
 }
 
 type RequestConfig struct {
@@ -97,8 +96,7 @@ var defaultConfig = ServiceConfig{
 		MaxInputChars: 4096,
 	},
 	ASR: ASRConfig{
-		PrefixRegex:    `^language \w+<asr_text>`,
-		TranscodeInput: true,
+		PrefixRegex: `^language \w+<asr_text>`,
 	},
 	FFmpeg: "ffmpeg",
 	Request: RequestConfig{
@@ -241,17 +239,16 @@ func (c *ServiceConfig) validateShutdown() error {
 
 func (c *ServiceConfig) serverConfig(voiceFiles map[string]string) server.Config {
 	return server.Config{
-		TTSModel:          c.Upstream.TTSModel,
-		ASRModel:          c.Upstream.ASRModel,
-		Voices:            voiceFiles,
-		DefaultVoice:      c.Voices.Default,
-		Lang:              c.TTS.Lang,
-		FFmpeg:            c.FFmpeg,
-		RequestTimeout:    c.Request.Timeout,
-		MaxInputChars:     c.TTS.MaxInputChars,
-		MaxConcurrent:     c.Request.MaxConcurrent,
-		TTSConcurrency:    c.Upstream.TTSConcurrency,
-		ASRPrefixRegex:    c.ASR.PrefixRegex,
-		TranscodeASRInput: c.ASR.TranscodeInput,
+		TTSModel:       c.Upstream.TTSModel,
+		ASRModel:       c.Upstream.ASRModel,
+		Voices:         voiceFiles,
+		DefaultVoice:   c.Voices.Default,
+		Lang:           c.TTS.Lang,
+		FFmpeg:         c.FFmpeg,
+		RequestTimeout: c.Request.Timeout,
+		MaxInputChars:  c.TTS.MaxInputChars,
+		MaxConcurrent:  c.Request.MaxConcurrent,
+		TTSConcurrency: c.Upstream.TTSConcurrency,
+		ASRPrefixRegex: c.ASR.PrefixRegex,
 	}
 }
