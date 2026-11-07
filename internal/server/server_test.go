@@ -139,7 +139,7 @@ func TestServer_Limited_NonReadingClientReleasesSlot(t *testing.T) {
 
 	body := `{"input":"first","response_format":"wav"}`
 	writeOrFail(t, conn, rawSpeechRequest+strconv.Itoa(len(body))+"\r\n\r\n"+body)
-	time.Sleep(time.Second)
+	time.Sleep(h.cfg.RequestTimeout + responseWriteSlack + deadlineSlack)
 
 	resp := h.speech(speechPath, map[string]any{"input": "second", "response_format": "wav"})
 	assert.Equal(t, http.StatusOK, resp.StatusCode, "want 200 while the first client still reads nothing")

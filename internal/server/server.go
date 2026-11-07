@@ -16,7 +16,10 @@ import (
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
-const controlRequestTimeout = 10 * time.Second
+const (
+	controlRequestTimeout = 10 * time.Second
+	responseWriteSlack    = 2 * time.Second
+)
 
 var routePrefixes = []string{"/v1", ""}
 
@@ -32,6 +35,7 @@ type Config struct {
 	RequestTimeout    time.Duration
 	MaxInputChars     int
 	MaxConcurrent     int
+	TTSConcurrency    int
 	ASRPrefixRegex    string
 	TranscodeASRInput bool
 }
@@ -43,6 +47,7 @@ type Server struct {
 	prefix         *regexp.Regexp
 	voices         []string
 	slots          chan struct{}
+	ttsGate        *ttsGate
 	log            *slog.Logger
 	shuttingDown   atomic.Bool
 	admission      admission
@@ -62,6 +67,7 @@ func New(cfg *Config, client *upstream.Client, log *slog.Logger) (*Server, error
 		prefix:         prefix,
 		voices:         voiceNames(cfg.Voices),
 		slots:          make(chan struct{}, cfg.MaxConcurrent),
+		ttsGate:        newTTSGate(cfg.TTSConcurrency),
 		log:            log,
 		controlTimeout: controlRequestTimeout,
 	}, nil
@@ -144,18 +150,21 @@ func (s *Server) SetShuttingDown() {
 
 // Every request gets connection deadlines before any handler runs, so a
 // stalled request body cannot hold a connection open. Audio routes replace
-// this bound with request.timeout in limited.
+// these deadlines with their own in limited.
 func (s *Server) bounded(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.setDeadlines(w, time.Now().Add(s.controlTimeout))
+		deadline := time.Now().Add(s.controlTimeout)
+		s.setDeadlines(w, deadline, deadline)
 		next.ServeHTTP(w, r)
 	})
 }
 
+// The request context ends at deadline, so writes get responseWriteSlack
+// longer: otherwise the 504 a timeout produces never reaches the client.
 func (s *Server) limited(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		deadline := time.Now().Add(s.cfg.RequestTimeout)
-		s.setDeadlines(w, deadline)
+		s.setDeadlines(w, deadline, deadline.Add(responseWriteSlack))
 
 		select {
 		case s.slots <- struct{}{}:
@@ -179,9 +188,9 @@ func (s *Server) reject(w http.ResponseWriter, err error) {
 	s.writeError(w, http.StatusServiceUnavailable, err)
 }
 
-func (s *Server) setDeadlines(w http.ResponseWriter, deadline time.Time) {
+func (s *Server) setDeadlines(w http.ResponseWriter, read, write time.Time) {
 	rc := http.NewResponseController(w)
-	err := errors.Join(rc.SetReadDeadline(deadline), rc.SetWriteDeadline(deadline))
+	err := errors.Join(rc.SetReadDeadline(read), rc.SetWriteDeadline(write))
 	if err != nil {
 		s.log.Warn("could not set connection deadlines", slog.Any("error", err))
 	}

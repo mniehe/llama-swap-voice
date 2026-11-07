@@ -146,6 +146,7 @@ func newHarness(t *testing.T, respond http.HandlerFunc, tweak ...func(*Config)) 
 		RequestTimeout: harnessTimeout,
 		MaxInputChars:  harnessMaxChars,
 		MaxConcurrent:  4,
+		TTSConcurrency: 1,
 	}
 
 	for _, apply := range tweak {

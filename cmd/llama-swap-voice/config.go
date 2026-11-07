@@ -18,8 +18,9 @@ import (
 var Version = "0.0.0-dev"
 
 const (
-	minPort = 1
-	maxPort = 65535
+	minPort           = 1
+	maxPort           = 65535
+	minTTSConcurrency = 1
 )
 
 var (
@@ -42,9 +43,10 @@ type ServiceConfig struct {
 }
 
 type UpstreamConfig struct {
-	URL      string `koanf:"url"`
-	TTSModel string `koanf:"ttsmodel"`
-	ASRModel string `koanf:"asrmodel"`
+	URL            string `koanf:"url"`
+	TTSModel       string `koanf:"ttsmodel"`
+	ASRModel       string `koanf:"asrmodel"`
+	TTSConcurrency int    `koanf:"ttsconcurrency"`
 }
 
 type VoicesConfig struct {
@@ -82,9 +84,10 @@ var defaultConfig = ServiceConfig{
 	Host: "127.0.0.1",
 	Port: 8920,
 	Upstream: UpstreamConfig{
-		URL:      "http://127.0.0.1:8080",
-		TTSModel: "qwen3-tts",
-		ASRModel: "qwen3-asr",
+		URL:            "http://127.0.0.1:8080",
+		TTSModel:       "qwen3-tts",
+		ASRModel:       "qwen3-asr",
+		TTSConcurrency: 1,
 	},
 	Voices: VoicesConfig{
 		Dir: "/var/lib/llama-swap-voice/voices",
@@ -152,6 +155,10 @@ func (c *ServiceConfig) validateUpstream() error {
 
 	if c.Upstream.ASRModel == "" {
 		errs = append(errs, errors.New("upstream.asrmodel must not be empty"))
+	}
+
+	if c.Upstream.TTSConcurrency < minTTSConcurrency {
+		errs = append(errs, fmt.Errorf("upstream.ttsconcurrency must be at least %d, got %d", minTTSConcurrency, c.Upstream.TTSConcurrency))
 	}
 
 	return errors.Join(errs...)
@@ -243,6 +250,7 @@ func (c *ServiceConfig) serverConfig(voiceFiles map[string]string) server.Config
 		RequestTimeout:    c.Request.Timeout,
 		MaxInputChars:     c.TTS.MaxInputChars,
 		MaxConcurrent:     c.Request.MaxConcurrent,
+		TTSConcurrency:    c.Upstream.TTSConcurrency,
 		ASRPrefixRegex:    c.ASR.PrefixRegex,
 		TranscodeASRInput: c.ASR.TranscodeInput,
 	}

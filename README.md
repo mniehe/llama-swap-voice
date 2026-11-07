@@ -146,6 +146,7 @@ Everything is set with environment variables. Only the default voice is required
 | `HOST`, `PORT` | `127.0.0.1`, `8920` | Where to listen |
 | `UPSTREAM_URL` | `http://127.0.0.1:8080` | Your llama-swap |
 | `UPSTREAM_TTSMODEL`, `UPSTREAM_ASRMODEL` | `qwen3-tts`, `qwen3-asr` | Model names in your llama-swap config |
+| `UPSTREAM_TTSCONCURRENCY` | `1` | Speech requests sent to the TTS model at once; see below |
 | `VOICES_DIR` | `/var/lib/llama-swap-voice/voices` | Where voice clips live |
 | `VOICES_DEFAULT` | *required* | Voice used when a request names none |
 | `TTS_LANG` | `en` | Language passed to the speech model |
@@ -159,6 +160,12 @@ Everything is set with environment variables. Only the default voice is required
 | `SHUTDOWN_GRACE`, `SHUTDOWN_TOTAL`, `SHUTDOWN_HARD` | `0s`, `15s`, `3s` | How shutdown unfolds; see below |
 
 If anything is wrong at startup, it lists every problem at once and exits.
+
+**Concurrent requests.** Speech requests beyond `UPSTREAM_TTSCONCURRENCY`
+wait their turn in arrival order, for up to `REQUEST_TIMEOUT`, and still count
+towards `REQUEST_MAXCONCURRENT`. One that is still waiting when the timeout
+ends gets a 504. `UPSTREAM_TTSCONCURRENCY` must not exceed llama-swap's
+`concurrencyLimit` or llama-server's `-np` for the TTS model.
 
 On SIGTERM or SIGINT, readiness turns 503 and shutdown runs in three steps:
 

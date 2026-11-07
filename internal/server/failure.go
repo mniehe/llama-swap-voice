@@ -46,6 +46,14 @@ func (s *Server) logStreamFailure(r *http.Request, err error) {
 	s.log.Error("stream failed", slog.String("request_id", record(r).id), slog.Any("error", err))
 }
 
+func unlessRequestEnded(r *http.Request, status int) int {
+	if r.Context().Err() != nil {
+		return http.StatusGatewayTimeout
+	}
+
+	return status
+}
+
 func clientStatus(upstreamCode int) int {
 	if upstreamCode < http.StatusBadRequest {
 		return http.StatusBadGateway

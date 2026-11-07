@@ -54,6 +54,7 @@ func TestServiceConfig_Validate_RejectsInvalidValues(t *testing.T) {
 		"upstream unparsable":   {func(c *ServiceConfig) { c.Upstream.URL = "http://[::1" }, "upstream.url"},
 		"tts model empty":       {func(c *ServiceConfig) { c.Upstream.TTSModel = "" }, "upstream.ttsmodel"},
 		"asr model empty":       {func(c *ServiceConfig) { c.Upstream.ASRModel = "" }, "upstream.asrmodel"},
+		"tts concurrency zero":  {func(c *ServiceConfig) { c.Upstream.TTSConcurrency = 0 }, "upstream.ttsconcurrency must be at least 1"},
 		"default missing":       {func(c *ServiceConfig) { c.Voices.Default = "" }, "voices.default must name a voice"},
 		"default unknown":       {func(c *ServiceConfig) { c.Voices.Default = "alloy" }, `voices.default "alloy" is not a voice`},
 		"voices dir missing":    {func(c *ServiceConfig) { c.Voices.Dir = "/nonexistent/voices" }, "voices directory"},
@@ -108,25 +109,26 @@ func TestServiceConfig_Validate_EmptyPrefixRegexIsAllowed(t *testing.T) {
 
 func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 	env := map[string]string{
-		"HOST":                  "0.0.0.0",
-		"PORT":                  "9001",
-		"UPSTREAM_URL":          "https://llama.example:8443",
-		"UPSTREAM_TTSMODEL":     "tts-alt",
-		"UPSTREAM_ASRMODEL":     "asr-alt",
-		"VOICES_DIR":            "/srv/voices",
-		"VOICES_DEFAULT":        "bm_fable",
-		"TTS_LANG":              "de",
-		"TTS_MAXINPUTCHARS":     "512",
-		"ASR_PREFIXREGEX":       "^x",
-		"ASR_TRANSCODEINPUT":    "false",
-		"FFMPEG":                "/opt/ffmpeg/bin/ffmpeg",
-		"REQUEST_TIMEOUT":       "45s",
-		"REQUEST_MAXCONCURRENT": "2",
-		"LOG_LEVEL":             "debug",
-		"LOG_FORMAT":            "console",
-		"SHUTDOWN_TOTAL":        "20s",
-		"SHUTDOWN_GRACE":        "5s",
-		"SHUTDOWN_HARD":         "1s",
+		"HOST":                    "0.0.0.0",
+		"PORT":                    "9001",
+		"UPSTREAM_URL":            "https://llama.example:8443",
+		"UPSTREAM_TTSMODEL":       "tts-alt",
+		"UPSTREAM_ASRMODEL":       "asr-alt",
+		"UPSTREAM_TTSCONCURRENCY": "3",
+		"VOICES_DIR":              "/srv/voices",
+		"VOICES_DEFAULT":          "bm_fable",
+		"TTS_LANG":                "de",
+		"TTS_MAXINPUTCHARS":       "512",
+		"ASR_PREFIXREGEX":         "^x",
+		"ASR_TRANSCODEINPUT":      "false",
+		"FFMPEG":                  "/opt/ffmpeg/bin/ffmpeg",
+		"REQUEST_TIMEOUT":         "45s",
+		"REQUEST_MAXCONCURRENT":   "2",
+		"LOG_LEVEL":               "debug",
+		"LOG_FORMAT":              "console",
+		"SHUTDOWN_TOTAL":          "20s",
+		"SHUTDOWN_GRACE":          "5s",
+		"SHUTDOWN_HARD":           "1s",
 	}
 	for key, value := range env {
 		t.Setenv(envPrefix+key, value)
@@ -138,7 +140,7 @@ func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 	assert.Equal(t, ServiceConfig{
 		Host:           "0.0.0.0",
 		Port:           9001,
-		Upstream:       UpstreamConfig{URL: "https://llama.example:8443", TTSModel: "tts-alt", ASRModel: "asr-alt"},
+		Upstream:       UpstreamConfig{URL: "https://llama.example:8443", TTSModel: "tts-alt", ASRModel: "asr-alt", TTSConcurrency: 3},
 		Voices:         VoicesConfig{Dir: "/srv/voices", Default: "bm_fable"},
 		TTS:            TTSConfig{Lang: "de", MaxInputChars: 512},
 		ASR:            ASRConfig{PrefixRegex: "^x", TranscodeInput: false},
@@ -154,6 +156,7 @@ func TestLoadConfig_NoEnvironment_ReturnsDefaults(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, defaultConfig, cfg)
+	assert.Equal(t, 1, cfg.Upstream.TTSConcurrency)
 }
 
 func TestServiceConfig_ServerConfig_CopiesSettings(t *testing.T) {
@@ -171,6 +174,7 @@ func TestServiceConfig_ServerConfig_CopiesSettings(t *testing.T) {
 	assert.Equal(t, cfg.Request.Timeout, got.RequestTimeout)
 	assert.Equal(t, cfg.TTS.MaxInputChars, got.MaxInputChars)
 	assert.Equal(t, cfg.Request.MaxConcurrent, got.MaxConcurrent)
+	assert.Equal(t, cfg.Upstream.TTSConcurrency, got.TTSConcurrency)
 	assert.Equal(t, cfg.ASR.PrefixRegex, got.ASRPrefixRegex)
 	assert.Equal(t, cfg.ASR.TranscodeInput, got.TranscodeASRInput)
 }

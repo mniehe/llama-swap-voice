@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -84,7 +85,7 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	rec.voice = job.voice
 	rec.format = job.format
 
-	audio, err := s.upstream.Synthesize(r.Context(), upstream.Speech{
+	audio, err := s.synthesize(r.Context(), upstream.Speech{
 		Input:      job.input,
 		Lang:       s.cfg.Lang,
 		SpeakerRef: job.voicePath,
@@ -102,6 +103,21 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.transcoded(w, r, audio, &job)
+}
+
+func (s *Server) synthesize(ctx context.Context, speech upstream.Speech) (*upstream.Audio, error) {
+	if err := s.ttsGate.acquire(ctx); err != nil {
+		return nil, fmt.Errorf("waiting for a free TTS slot: %w", err)
+	}
+
+	audio, err := s.upstream.Synthesize(ctx, speech)
+	if err != nil {
+		s.ttsGate.release()
+		return nil, err
+	}
+
+	audio.Body = &gatedBody{ReadCloser: audio.Body, release: s.ttsGate.release}
+	return audio, nil
 }
 
 func (s *Server) parseSpeech(w http.ResponseWriter, r *http.Request) (speechJob, error) {
@@ -196,7 +212,7 @@ func (s *Server) transcoded(w http.ResponseWriter, r *http.Request, audio *upstr
 	first, err := readFirstChunk(encoded)
 	if err != nil {
 		s.closeUpstream(audio)
-		s.writeError(w, http.StatusBadGateway, errors.Join(err, encoded.Close()))
+		s.writeError(w, unlessRequestEnded(r, http.StatusBadGateway), errors.Join(err, encoded.Close()))
 		return
 	}
 
