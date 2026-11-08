@@ -113,20 +113,7 @@ func (n *normaliser) finish() ([]byte, error) {
 	}
 
 	dataBytes := uint32(size)
-	header := n.wav[:0]
-	header = append(header, riffMagic...)
-	header = binary.LittleEndian.AppendUint32(header, dataBytes+wavHeaderBytes-riffHeaderBytes)
-	header = append(header, waveMagic...)
-	header = append(header, fmtChunkID...)
-	header = binary.LittleEndian.AppendUint32(header, fmtChunkBytes)
-	header = binary.LittleEndian.AppendUint16(header, formatPCM)
-	header = binary.LittleEndian.AppendUint16(header, targetChannels)
-	header = binary.LittleEndian.AppendUint32(header, targetRate)
-	header = binary.LittleEndian.AppendUint32(header, targetRate*targetChannels*sampleBytes)
-	header = binary.LittleEndian.AppendUint16(header, targetChannels*sampleBytes)
-	header = binary.LittleEndian.AppendUint16(header, targetBits)
-	header = append(header, dataChunkID...)
-	binary.LittleEndian.AppendUint32(header, dataBytes)
+	appendWAVHeader(n.wav[:0], targetRate, dataBytes+wavHeaderBytes-riffHeaderBytes, dataBytes)
 
 	return n.wav, nil
 }

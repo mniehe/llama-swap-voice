@@ -8,48 +8,21 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
-type Format string
-
 const (
-	MP3  Format = "mp3"
-	Opus Format = "opus"
-	FLAC Format = "flac"
-	AAC  Format = "aac"
-	WAV  Format = "wav"
-	PCM  Format = "pcm"
-)
+	stdinPipe  = "pipe:0"
+	stdoutPipe = "pipe:1"
+	minAtempo  = 0.5
+	maxStderr  = 4096
 
-const (
-	stdinPipe     = "pipe:0"
-	stdoutPipe    = "pipe:1"
-	minAtempo     = 0.5
-	maxStderr     = 4096
-	minProbeBytes = "32"
-	noAnalysis    = "0"
-
+	rawPCM        = "s16le"
 	pcmSampleRate = 24000
 	pcmChannels   = 1
 )
-
-type codec struct {
-	muxer      string
-	encoder    string
-	sampleRate int
-	channels   int
-}
-
-var codecs = map[Format]codec{
-	MP3:  {muxer: "mp3", encoder: "libmp3lame"},
-	Opus: {muxer: "ogg", encoder: "libopus"},
-	FLAC: {muxer: "flac", encoder: "flac"},
-	AAC:  {muxer: "adts", encoder: "aac"},
-	WAV:  {muxer: "wav", encoder: "pcm_s16le"},
-	PCM:  {muxer: "s16le", encoder: "pcm_s16le", sampleRate: pcmSampleRate, channels: pcmChannels},
-}
 
 // KillDelay is how long ffmpeg has to exit after SIGTERM before it is killed.
 const KillDelay = time.Second
@@ -63,40 +36,22 @@ func New(ffmpeg string) *Encoder {
 }
 
 type Options struct {
-	Format Format
-	Speed  float64
+	Speed float64
 }
 
-func EncodeArgs(opts Options) ([]string, error) {
-	out, ok := codecs[opts.Format]
-	if !ok {
-		return nil, fmt.Errorf("unsupported format %q", opts.Format)
-	}
+// EncodeArgs stretches raw 24 kHz mono s16le samples by the requested speed
+// and writes them back in the same layout.
+func EncodeArgs(opts Options) []string {
+	pcm := []string{"-f", rawPCM, "-ar", strconv.Itoa(pcmSampleRate), "-ac", strconv.Itoa(pcmChannels)}
 
-	// Upstream WAV carries its format in the header, so probing only delays
-	// the first output byte; with default probing ffmpeg waits for EOF on
-	// short replies.
-	args := []string{
-		"-hide_banner", "-loglevel", "error",
-		"-probesize", minProbeBytes, "-analyzeduration", noAnalysis,
-		"-f", "wav", "-i", stdinPipe,
-	}
+	args := append([]string{"-hide_banner", "-loglevel", "error"}, pcm...)
+	args = append(args, "-i", stdinPipe)
 	if filter := atempo(opts.Speed); filter != "" {
 		args = append(args, "-filter:a", filter)
 	}
 
-	args = append(args, out.resampling()...)
-	return append(args, "-f", out.muxer, "-c:a", out.encoder, stdoutPipe), nil
-}
-
-// Raw PCM carries no header, so its rate and layout must be fixed rather
-// than inherited from whatever the upstream WAV declares.
-func (c codec) resampling() []string {
-	if c.sampleRate == 0 {
-		return nil
-	}
-
-	return []string{"-ar", strconv.Itoa(c.sampleRate), "-ac", strconv.Itoa(c.channels)}
+	args = append(args, pcm...)
+	return append(args, stdoutPipe)
 }
 
 func atempo(speed float64) string {
@@ -118,12 +73,7 @@ func formatTempo(value float64) string {
 }
 
 func (e *Encoder) Encode(ctx context.Context, src io.Reader, opts Options) (io.ReadCloser, error) {
-	args, err := EncodeArgs(opts)
-	if err != nil {
-		return nil, err
-	}
-
-	cmd := e.command(ctx, src, args)
+	cmd := e.command(ctx, src, EncodeArgs(opts))
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -148,21 +98,26 @@ func (e *Encoder) command(ctx context.Context, src io.Reader, args []string) *ex
 }
 
 type stream struct {
-	cmd    *exec.Cmd
-	stdout io.ReadCloser
+	cmd      *exec.Cmd
+	stdout   io.ReadCloser
+	once     sync.Once
+	closeErr error
 }
 
 func (s *stream) Read(p []byte) (int, error) {
 	return s.stdout.Read(p)
 }
 
+// Close waits for ffmpeg once; later calls return the same result.
 func (s *stream) Close() error {
-	s.stdout.Close()
-	if err := s.cmd.Wait(); err != nil {
-		return ffmpegError(s.cmd, err)
-	}
+	s.once.Do(func() {
+		s.stdout.Close()
+		if err := s.cmd.Wait(); err != nil {
+			s.closeErr = ffmpegError(s.cmd, err)
+		}
+	})
 
-	return nil
+	return s.closeErr
 }
 
 func ffmpegError(cmd *exec.Cmd, err error) error {

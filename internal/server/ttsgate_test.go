@@ -216,7 +216,8 @@ func requireTimeoutBody(t *testing.T, got speechResult) {
 func TestServer_HandleSpeech_ConcurrentRequestsNeverOverlapUpstream(t *testing.T) {
 	const requests = 3
 
-	for _, format := range []string{"wav", "mp3"} {
+	tests := map[string]string{"wav": upstreamAudio, "mp3": mp3FrameSync}
+	for format, prefix := range tests {
 		t.Run(format, func(t *testing.T) {
 			fake := &overlapUpstream{hold: gateHold}
 			h := newHarness(t, fake.serve(t))
@@ -231,7 +232,7 @@ func TestServer_HandleSpeech_ConcurrentRequestsNeverOverlapUpstream(t *testing.T
 			for i, got := range results {
 				require.NoError(t, got.err, "request %d", i)
 				assert.Equal(t, http.StatusOK, got.status, "request %d: %s", i, got.body)
-				assert.Equal(t, upstreamAudio, got.body, "request %d", i)
+				assert.True(t, strings.HasPrefix(got.body, prefix), "request %d: body %q", i, got.body)
 			}
 			assert.NotContains(t, strings.Join(fake.log(), "\n"), "429", "upstream saw overlapping calls: %v", fake.log())
 		})

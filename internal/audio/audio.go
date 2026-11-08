@@ -1,5 +1,6 @@
 // Package audio turns an untrusted upload into the 16 kHz mono 16-bit WAV the
-// speech recogniser expects, without spawning any external decoder.
+// speech recogniser expects, without spawning any external decoder, and
+// encodes streamed 24 kHz speech into the reply formats.
 package audio
 
 import (

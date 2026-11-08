@@ -17,52 +17,41 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func TestEncodeArgs_Options_BuildsCommandLine(t *testing.T) {
+func TestEncodeArgs_Options_StretchesRawPCM(t *testing.T) {
+	const pcm = "-f s16le -ar 24000 -ac 1"
 	tests := []struct {
 		opts Options
 		want string
 	}{
-		{Options{Format: Opus, Speed: 1}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -f ogg -c:a libopus pipe:1"},
-		{Options{Format: MP3, Speed: 1.15}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -filter:a atempo=1.15 -f mp3 -c:a libmp3lame pipe:1"},
-		{Options{Format: WAV, Speed: 0.25}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -filter:a atempo=0.5,atempo=0.5 -f wav -c:a pcm_s16le pipe:1"},
-		{Options{Format: FLAC}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -f flac -c:a flac pipe:1"},
-		{Options{Format: AAC, Speed: 2}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -filter:a atempo=2 -f adts -c:a aac pipe:1"},
-		{Options{Format: PCM, Speed: 1}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -ar 24000 -ac 1 -f s16le -c:a pcm_s16le pipe:1"},
-		{Options{Format: PCM, Speed: 1.5}, "-hide_banner -loglevel error -probesize 32 -analyzeduration 0 -f wav -i pipe:0 -filter:a atempo=1.5 -ar 24000 -ac 1 -f s16le -c:a pcm_s16le pipe:1"},
+		{Options{Speed: 1.15}, "-hide_banner -loglevel error " + pcm + " -i pipe:0 -filter:a atempo=1.15 " + pcm + " pipe:1"},
+		{Options{Speed: 0.25}, "-hide_banner -loglevel error " + pcm + " -i pipe:0 -filter:a atempo=0.5,atempo=0.5 " + pcm + " pipe:1"},
+		{Options{Speed: 2}, "-hide_banner -loglevel error " + pcm + " -i pipe:0 -filter:a atempo=2 " + pcm + " pipe:1"},
+		{Options{Speed: 1}, "-hide_banner -loglevel error " + pcm + " -i pipe:0 " + pcm + " pipe:1"},
 	}
 	for _, tt := range tests {
-		args, err := EncodeArgs(tt.opts)
-
-		require.NoError(t, err)
-		assert.Equal(t, tt.want, strings.Join(args, " "), "%+v", tt.opts)
+		assert.Equal(t, tt.want, strings.Join(EncodeArgs(tt.opts), " "), "%+v", tt.opts)
 	}
-}
-
-func TestEncodeArgs_UnknownFormat_ReturnsError(t *testing.T) {
-	_, err := EncodeArgs(Options{Format: "ogg"})
-
-	require.Error(t, err)
 }
 
 func TestEncoder_Encode_StreamsThroughFFmpeg(t *testing.T) {
 	fake := fakeffmpeg.Install(t)
 
-	out, err := New(fake.Path).Encode(t.Context(), strings.NewReader("wav stream"), Options{Format: FLAC, Speed: 1})
+	out, err := New(fake.Path).Encode(t.Context(), strings.NewReader("pcm stream"), Options{Speed: 1.5})
 	require.NoError(t, err)
 
 	data, err := io.ReadAll(out)
 	require.NoError(t, err)
 	require.NoError(t, out.Close())
 
-	assert.Equal(t, "wav stream", string(data))
+	assert.Equal(t, "pcm stream", string(data))
 	assert.Contains(t, fake.Events(), fakeffmpeg.EventEOF, "want stdin EOF")
 }
 
 func TestEncoder_Encode_FailureReportsStderrOnClose(t *testing.T) {
 	fake := fakeffmpeg.Install(t)
-	fake.FailWith(t, "Unknown encoder 'libopus'")
+	fake.FailWith(t, "Invalid argument")
 
-	out, err := New(fake.Path).Encode(t.Context(), strings.NewReader("wav stream"), Options{Format: Opus})
+	out, err := New(fake.Path).Encode(t.Context(), strings.NewReader("pcm stream"), Options{Speed: 1.5})
 	require.NoError(t, err)
 
 	_, err = io.ReadAll(out)
@@ -70,7 +59,7 @@ func TestEncoder_Encode_FailureReportsStderrOnClose(t *testing.T) {
 
 	err = out.Close()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "Unknown encoder")
+	assert.Contains(t, err.Error(), "Invalid argument")
 }
 
 func TestEncoder_Encode_CapsCapturedStderr(t *testing.T) {
@@ -78,7 +67,7 @@ func TestEncoder_Encode_CapsCapturedStderr(t *testing.T) {
 	fake := fakeffmpeg.Install(t)
 	fake.FailWith(t, strings.Repeat(noise, 10*maxStderr))
 
-	out, err := New(fake.Path).Encode(t.Context(), strings.NewReader("wav stream"), Options{Format: Opus})
+	out, err := New(fake.Path).Encode(t.Context(), strings.NewReader("pcm stream"), Options{Speed: 1.5})
 	require.NoError(t, err)
 
 	_, err = io.ReadAll(out)
@@ -90,7 +79,7 @@ func TestEncoder_Encode_CapsCapturedStderr(t *testing.T) {
 }
 
 func TestEncoder_Encode_MissingBinaryReturnsError(t *testing.T) {
-	_, err := New("/nonexistent/ffmpeg").Encode(t.Context(), strings.NewReader(""), Options{Format: MP3})
+	_, err := New("/nonexistent/ffmpeg").Encode(t.Context(), strings.NewReader(""), Options{Speed: 1.5})
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "start ffmpeg")

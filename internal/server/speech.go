@@ -12,40 +12,41 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/mniehe/llama-swap-voice/internal/audio"
 	"github.com/mniehe/llama-swap-voice/internal/transcode"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
 const (
-	contentTypeWAV  = "audio/wav"
-	contentTypeMP3  = "audio/mpeg"
-	contentTypeOgg  = "audio/ogg"
-	contentTypeFLAC = "audio/flac"
-	contentTypeAAC  = "audio/aac"
-	contentTypePCM  = "audio/pcm"
+	contentTypeWAV = "audio/wav"
+	contentTypeMP3 = "audio/mpeg"
+	contentTypeOgg = "audio/ogg"
+	contentTypePCM = "audio/pcm"
 
 	defaultSpeechFormat = "mp3"
 	normalSpeed         = 1.0
 	minSpeed            = 0.25
 	maxSpeed            = 4.0
 	maxSpeechBodyBytes  = 1 << 20
+	pcmSampleBytes      = 2
 )
 
-var errNoAudio = errors.New("encoder produced no audio")
+var errNoAudio = errors.New("upstream sent no audio")
+
+// newEncoder is a variable so tests can substitute an encoder that fails.
+var newEncoder = audio.NewEncoder
 
 type outputFormat struct {
 	contentType string
 	upstream    upstream.Format
-	codec       transcode.Format
+	codec       audio.Format
 }
 
 var outputFormats = map[string]outputFormat{
-	"wav":  {contentType: contentTypeWAV, upstream: upstream.WAV},
-	"pcm":  {contentType: contentTypePCM, upstream: upstream.WAV, codec: transcode.PCM},
-	"mp3":  {contentType: contentTypeMP3, upstream: upstream.WAV, codec: transcode.MP3},
-	"opus": {contentType: contentTypeOgg, upstream: upstream.WAV, codec: transcode.Opus},
-	"flac": {contentType: contentTypeFLAC, upstream: upstream.WAV, codec: transcode.FLAC},
-	"aac":  {contentType: contentTypeAAC, upstream: upstream.WAV, codec: transcode.AAC},
+	"wav":  {contentType: contentTypeWAV, upstream: upstream.WAV, codec: audio.WAV},
+	"pcm":  {contentType: contentTypePCM, upstream: upstream.WAV, codec: audio.PCM},
+	"mp3":  {contentType: contentTypeMP3, upstream: upstream.WAV, codec: audio.MP3},
+	"opus": {contentType: contentTypeOgg, upstream: upstream.WAV, codec: audio.Opus},
 }
 
 type speechRequest struct {
@@ -66,12 +67,8 @@ type speechJob struct {
 	speed     float64
 }
 
-func (j *speechJob) codec() transcode.Format {
-	if j.output.codec == "" && j.speed != normalSpeed {
-		return transcode.WAV
-	}
-
-	return j.output.codec
+func (j *speechJob) passesThrough() bool {
+	return j.output.codec == audio.WAV && j.speed == normalSpeed
 }
 
 func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
@@ -85,7 +82,7 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	rec.voice = job.voice
 	rec.format = job.format
 
-	audio, err := s.synthesize(r.Context(), upstream.Speech{
+	reply, err := s.synthesize(r.Context(), upstream.Speech{
 		Input:      job.input,
 		Lang:       s.cfg.Lang,
 		SpeakerRef: job.voicePath,
@@ -95,14 +92,14 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 		s.upstreamFailure(w, r, err)
 		return
 	}
-	rec.upstreamStatus = audio.Status
+	rec.upstreamStatus = reply.Status
 
-	if job.codec() == "" {
-		s.passThrough(w, r, audio, &job)
+	if job.passesThrough() {
+		s.passThrough(w, r, reply, &job)
 		return
 	}
 
-	s.transcoded(w, r, audio, &job)
+	s.encoded(w, r, reply, &job)
 }
 
 func (s *Server) synthesize(ctx context.Context, speech upstream.Speech) (*upstream.Audio, error) {
@@ -110,14 +107,14 @@ func (s *Server) synthesize(ctx context.Context, speech upstream.Speech) (*upstr
 		return nil, fmt.Errorf("waiting for a free TTS slot: %w", err)
 	}
 
-	audio, err := s.upstream.Synthesize(ctx, speech)
+	reply, err := s.upstream.Synthesize(ctx, speech)
 	if err != nil {
 		s.ttsGate.release()
 		return nil, err
 	}
 
-	audio.Body = &gatedBody{ReadCloser: audio.Body, release: s.ttsGate.release}
-	return audio, nil
+	reply.Body = &gatedBody{ReadCloser: reply.Body, release: s.ttsGate.release}
+	return reply, nil
 }
 
 func (s *Server) parseSpeech(w http.ResponseWriter, r *http.Request) (speechJob, error) {
@@ -193,54 +190,110 @@ func resolveSpeed(requested *float64) (float64, error) {
 	return speed, nil
 }
 
-func (s *Server) passThrough(w http.ResponseWriter, r *http.Request, audio *upstream.Audio, job *speechJob) {
-	defer s.closeUpstream(audio)
+func (s *Server) passThrough(w http.ResponseWriter, r *http.Request, reply *upstream.Audio, job *speechJob) {
+	defer s.closeUpstream(reply)
 
-	if err := streamBody(w, job.output.contentType, audio.Body); err != nil {
+	if err := streamBody(w, job.output.contentType, reply.Body); err != nil {
 		s.streamFailure(r, err)
 	}
 }
 
-func (s *Server) transcoded(w http.ResponseWriter, r *http.Request, audio *upstream.Audio, job *speechJob) {
-	encoded, err := s.encoder.Encode(r.Context(), audio.Body, transcode.Options{Format: job.codec(), Speed: job.speed})
+// encoded holds the 200 back until the first samples arrive and the encoder
+// exists, so a failure before any audio is still a JSON error. The upstream
+// body is closed before ffmpeg is waited for, because ffmpeg's stdin copy may
+// be blocked reading it; the deferred closes keep that order on a panic.
+func (s *Server) encoded(w http.ResponseWriter, r *http.Request, reply *upstream.Audio, job *speechJob) {
+	pcm, status, err := s.speechPCM(r.Context(), reply.Body, job.speed)
 	if err != nil {
-		s.closeUpstream(audio)
-		s.writeError(w, http.StatusInternalServerError, err)
+		s.closeUpstream(reply)
+		s.writeError(w, unlessRequestEnded(r, status), err)
+		return
+	}
+	defer pcm.Close()
+	defer s.closeUpstream(reply)
+
+	first, err := readFirstChunk(pcm)
+	if err != nil {
+		s.closeUpstream(reply)
+		s.writeError(w, unlessRequestEnded(r, http.StatusBadGateway), errors.Join(err, pcm.Close()))
 		return
 	}
 
-	first, err := readFirstChunk(encoded)
+	w.Header().Set("Content-Type", job.output.contentType)
+	encoder, err := newEncoder(job.output.codec, &flushWriter{w: w, rc: http.NewResponseController(w)})
 	if err != nil {
-		s.closeUpstream(audio)
-		s.writeError(w, unlessRequestEnded(r, http.StatusBadGateway), errors.Join(err, encoded.Close()))
+		s.encoderFailure(w, r, err)
 		return
 	}
 
-	streamErr := streamBody(w, job.output.contentType, io.MultiReader(bytes.NewReader(first), encoded))
-	s.closeUpstream(audio)
-	closeErr := encoded.Close()
+	streamErr := streamEncoded(encoder, io.MultiReader(bytes.NewReader(first), pcm))
+	s.closeUpstream(reply)
+	closeErr := pcm.Close()
 
 	if err := errors.Join(streamErr, closeErr); err != nil {
 		s.streamFailure(r, err)
 	}
 }
 
+// encoderFailure is a JSON error unless writing the Opus headers already
+// committed the 200.
+func (s *Server) encoderFailure(w http.ResponseWriter, r *http.Request, err error) {
+	if committed(w) {
+		s.streamFailure(r, err)
+	}
+
+	s.writeError(w, unlessRequestEnded(r, http.StatusInternalServerError), err)
+}
+
+// speechPCM strips the upstream WAV header and, when the request changes the
+// speed, stretches the samples through ffmpeg. Closing the result waits for
+// ffmpeg. On failure it also returns the status to answer with.
+func (s *Server) speechPCM(ctx context.Context, body io.Reader, speed float64) (io.ReadCloser, int, error) {
+	pcm, err := audio.NewWAVReader(body)
+	if err != nil {
+		return nil, http.StatusBadGateway, fmt.Errorf("upstream audio: %w", err)
+	}
+
+	if speed == normalSpeed {
+		return io.NopCloser(pcm), http.StatusOK, nil
+	}
+
+	stretched, err := s.encoder.Encode(ctx, pcm, transcode.Options{Speed: speed})
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+
+	return stretched, http.StatusOK, nil
+}
+
+// The encoder is closed on every path, a failed write included, because an
+// Opus encoder holds memory outside the Go heap until then. The first write
+// commits the 200.
+func streamEncoded(encoder io.WriteCloser, pcm io.Reader) (err error) {
+	defer func() { err = errors.Join(err, encoder.Close()) }()
+
+	_, err = io.CopyBuffer(encoder, pcm, make([]byte, copyBufferBytes))
+	return err
+}
+
 // The response is already decided by the time the upstream body is closed,
 // so a close error only matters for diagnosis.
-func (s *Server) closeUpstream(audio *upstream.Audio) {
-	if err := audio.Body.Close(); err != nil {
+func (s *Server) closeUpstream(reply *upstream.Audio) {
+	if err := reply.Body.Close(); err != nil {
 		s.log.Debug("closing upstream audio", slog.Any("error", err))
 	}
 }
 
+// readFirstChunk waits for at least one whole sample, so the 200 is never
+// committed for a reply that cannot hold any audio.
 func readFirstChunk(r io.Reader) ([]byte, error) {
 	chunk := make([]byte, copyBufferBytes)
-	n, err := r.Read(chunk)
-	if n > 0 {
+	n, err := io.ReadAtLeast(r, chunk, pcmSampleBytes)
+	if err == nil {
 		return chunk[:n], nil
 	}
 
-	if err == nil || err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		return nil, errNoAudio
 	}
 

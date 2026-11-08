@@ -3,6 +3,7 @@ module github.com/mniehe/llama-swap-voice
 go 1.26
 
 require (
+	github.com/braheezy/shine-mp3 v0.2.0
 	github.com/hajimehoshi/go-mp3 v0.3.4
 	github.com/knadh/koanf/providers/env v1.1.0
 	github.com/knadh/koanf/providers/structs v1.0.1

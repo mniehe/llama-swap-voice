@@ -17,6 +17,11 @@ import (
 	"github.com/mniehe/llama-swap-voice/internal/fakeffmpeg"
 )
 
+const (
+	upstreamHeaderBytes = len(upstreamHeader)
+	mp3FrameSync        = "\xff\xf3"
+)
+
 func TestServer_HandleSpeech_MapsVoiceToReferenceFile(t *testing.T) {
 	h := newHarness(t, serveWAV(t))
 
@@ -86,7 +91,7 @@ func TestServer_HandleSpeech_WAVPassThroughIsByteEqual(t *testing.T) {
 	assert.Nil(t, h.ffmpeg.Args(), "ffmpeg ran for wav pass-through")
 }
 
-func TestServer_HandleSpeech_PCMIsS16LE24kMono(t *testing.T) {
+func TestServer_HandleSpeech_PCMIsUpstreamSamplesWithoutHeader(t *testing.T) {
 	h := newHarness(t, serveWAV(t))
 
 	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "pcm"})
@@ -94,14 +99,12 @@ func TestServer_HandleSpeech_PCMIsS16LE24kMono(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 	assert.Equal(t, "wav", h.upstream.lastCall().fields["response_format"], "llama-server's own pcm is float32")
-	args := h.ffmpeg.Args()
-	assert.True(t, containsRun(args, "-ar", "24000", "-ac", "1"), "ffmpeg args %v lack 24 kHz mono", args)
-	assert.True(t, containsRun(args, "-f", "s16le", "-c:a", "pcm_s16le"), "ffmpeg args %v lack raw s16le output", args)
 	assert.Equal(t, contentTypePCM, resp.Header.Get("Content-Type"))
-	assert.Equal(t, upstreamAudio, string(body), "want the fake ffmpeg's echo of the upstream WAV")
+	assert.Equal(t, upstreamAudio[upstreamHeaderBytes:], string(body))
+	assert.Nil(t, h.ffmpeg.Args(), "ffmpeg ran at normal speed")
 }
 
-func TestServer_HandleSpeech_PCMWithSpeedAddsAtempo(t *testing.T) {
+func TestServer_HandleSpeech_SpeedStretchesRawPCMThroughFFmpeg(t *testing.T) {
 	h := newHarness(t, serveWAV(t))
 
 	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "pcm", "speed": 1.5})
@@ -109,20 +112,19 @@ func TestServer_HandleSpeech_PCMWithSpeedAddsAtempo(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 	args := h.ffmpeg.Args()
-	assert.True(t, containsRun(args, "-filter:a", "atempo=1.5"), "ffmpeg args %v", args)
-	assert.True(t, containsRun(args, "-f", "s16le", "-c:a", "pcm_s16le"), "ffmpeg args %v", args)
+	assert.True(t, containsRun(args, "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0"), "ffmpeg args %v lack raw PCM input", args)
+	assert.True(t, containsRun(args, "-filter:a", "atempo=1.5", "-f", "s16le", "-ar", "24000", "-ac", "1", "pipe:1"), "ffmpeg args %v", args)
+	assert.Equal(t, upstreamAudio[upstreamHeaderBytes:], string(body), "want the fake ffmpeg's echo of the upstream samples")
 }
 
-func TestServer_HandleSpeech_TranscodedContentTypes(t *testing.T) {
+func TestServer_HandleSpeech_EncodesInProcess(t *testing.T) {
 	tests := []struct {
 		format      string
 		contentType string
-		codecArgs   []string
+		magic       string
 	}{
-		{"opus", contentTypeOgg, []string{"-f", "ogg", "-c:a", "libopus"}},
-		{"mp3", contentTypeMP3, []string{"-f", "mp3", "-c:a", "libmp3lame"}},
-		{"flac", contentTypeFLAC, []string{"-f", "flac", "-c:a", "flac"}},
-		{"aac", contentTypeAAC, []string{"-f", "adts", "-c:a", "aac"}},
+		{"opus", contentTypeOgg, "OggS"},
+		{"mp3", contentTypeMP3, mp3FrameSync},
 	}
 	for _, tt := range tests {
 		t.Run(tt.format, func(t *testing.T) {
@@ -131,33 +133,98 @@ func TestServer_HandleSpeech_TranscodedContentTypes(t *testing.T) {
 			resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": tt.format})
 			body := readBody(t, resp)
 
+			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 			assert.Equal(t, tt.contentType, resp.Header.Get("Content-Type"))
-			assert.Equal(t, upstreamAudio, string(body), "want the fake ffmpeg's echo of the upstream WAV")
-			assert.True(t, containsRun(h.ffmpeg.Args(), tt.codecArgs...), "ffmpeg args %v lack %v", h.ffmpeg.Args(), tt.codecArgs)
+			assert.True(t, strings.HasPrefix(string(body), tt.magic), "body starts %q", body[:min(len(body), len(tt.magic))])
+			assert.Nil(t, h.ffmpeg.Args(), "ffmpeg ran at normal speed")
 			assert.Equal(t, "wav", h.upstream.lastCall().fields["response_format"])
 		})
 	}
 }
 
-func TestServer_HandleSpeech_SpeedAddsAtempo(t *testing.T) {
+func TestServer_HandleSpeech_AACAndFLACAre400(t *testing.T) {
+	h := newHarness(t, serveWAV(t))
+
+	for _, format := range []string{"aac", "flac"} {
+		resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": format})
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, format)
+
+		assert.Contains(t, errorMessage(t, resp), `unsupported response_format "`+format+`"`)
+	}
+
+	assert.Zero(t, h.upstream.callCount(), "upstream called for a rejected format")
+}
+
+func TestServer_HandleSpeech_SpeedStretchesBeforeEncoding(t *testing.T) {
 	h := newHarness(t, serveWAV(t))
 
 	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "mp3", "speed": 1.15})
-	readBody(t, resp)
+	body := readBody(t, resp)
 
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 	assert.True(t, containsRun(h.ffmpeg.Args(), "-filter:a", "atempo=1.15"), "ffmpeg args %v", h.ffmpeg.Args())
+	assert.True(t, strings.HasPrefix(string(body), mp3FrameSync), "want MP3 frames, not ffmpeg output")
 }
 
-func TestServer_HandleSpeech_WAVWithSpeedIsTranscoded(t *testing.T) {
+func TestServer_HandleSpeech_WAVWithSpeedIsStretched(t *testing.T) {
 	h := newHarness(t, serveWAV(t))
 
 	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "wav", "speed": 0.9})
-	readBody(t, resp)
+	body := readBody(t, resp)
 
 	args := h.ffmpeg.Args()
 	assert.True(t, containsRun(args, "-filter:a", "atempo=0.9"), "ffmpeg args %v", args)
-	assert.True(t, containsRun(args, "-c:a", "pcm_s16le"), "ffmpeg args %v", args)
 	assert.Equal(t, contentTypeWAV, resp.Header.Get("Content-Type"))
+	assert.Equal(t, upstreamAudio, string(body), "want a streamed WAV header around the fake ffmpeg's echo")
+}
+
+func TestServer_HandleSpeech_NonWAVUpstreamIsJSONError(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", contentTypeJSON)
+		writeOrFail(t, w, `{"error":"not audio"}`)
+	})
+
+	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "opus"})
+
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	assert.Contains(t, errorMessage(t, resp), "not a WAV stream")
+}
+
+func TestServer_HandleSpeech_HeaderOnlyUpstreamIsJSONError(t *testing.T) {
+	h := newHarness(t, serveBody(t, []byte(upstreamHeader)))
+
+	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "pcm"})
+
+	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	assert.Equal(t, "upstream sent no audio", errorMessage(t, resp))
+}
+
+func TestServer_HandleSpeech_HalfSampleUpstreamIsJSONError(t *testing.T) {
+	for _, format := range []string{"pcm", "mp3", "opus"} {
+		t.Run(format, func(t *testing.T) {
+			h := newHarness(t, serveBody(t, []byte(upstreamHeader+"\x01")))
+
+			resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": format})
+
+			require.Equal(t, http.StatusBadGateway, resp.StatusCode, "want no 200 for half a sample")
+			assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"))
+			assert.Contains(t, errorMessage(t, resp), "inside a sample")
+		})
+	}
+}
+
+func TestServer_HandleSpeech_TrailingHalfSampleAbortsStream(t *testing.T) {
+	for _, format := range []string{"pcm", "mp3", "opus"} {
+		t.Run(format, func(t *testing.T) {
+			h := newHarness(t, serveBody(t, []byte(upstreamHeader+"\x01\x02\x03")))
+
+			resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": format})
+			require.Equal(t, http.StatusOK, resp.StatusCode, "want 200 once a whole sample arrived")
+
+			_, err := io.ReadAll(resp.Body)
+			assert.Error(t, err, "a stream ending inside a sample ended cleanly, want a transport error")
+		})
+	}
 }
 
 func TestServer_HandleSpeech_Upstream5xxIsJSONError(t *testing.T) {
@@ -177,7 +244,7 @@ func TestServer_HandleSpeech_ClientCancelStopsUpstreamAndFFmpeg(t *testing.T) {
 	upstreamDone := make(chan time.Time, 1)
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", contentTypeWAV)
-		writeOrFail(t, w, upstreamWAVs)
+		writeOrFail(t, w, upstreamAudio)
 		assert.NoError(t, http.NewResponseController(w).Flush())
 		select {
 		case <-r.Context().Done():
@@ -189,13 +256,13 @@ func TestServer_HandleSpeech_ClientCancelStopsUpstreamAndFFmpeg(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	payload, err := json.Marshal(map[string]any{"input": "a long story", "response_format": "opus"})
+	payload, err := json.Marshal(map[string]any{"input": "a long story", "response_format": "pcm", "speed": 1.5})
 	require.NoError(t, err)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.server.URL+speechPath, bytes.NewReader(payload))
 	require.NoError(t, err)
 	resp := h.do(req)
 
-	first := make([]byte, len(upstreamWAVs))
+	first := make([]byte, len(upstreamAudio)-upstreamHeaderBytes)
 	_, err = io.ReadFull(resp.Body, first)
 	require.NoError(t, err, "no streamed bytes before cancel")
 
@@ -215,12 +282,12 @@ func TestServer_HandleSpeech_ClientCancelStopsUpstreamAndFFmpeg(t *testing.T) {
 
 func TestServer_HandleSpeech_FFmpegFailureIsJSONError(t *testing.T) {
 	h := newHarness(t, serveWAV(t))
-	h.ffmpeg.FailWith(t, "Unknown encoder 'libmp3lame'")
+	h.ffmpeg.FailWith(t, "Invalid argument")
 
-	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "mp3"})
+	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "mp3", "speed": 1.5})
 
 	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
-	assert.Contains(t, errorMessage(t, resp), "Unknown encoder")
+	assert.Contains(t, errorMessage(t, resp), "Invalid argument")
 }
 
 func TestServer_HandleSpeech_TruncatedUpstreamIsClientError(t *testing.T) {
@@ -228,10 +295,10 @@ func TestServer_HandleSpeech_TruncatedUpstreamIsClientError(t *testing.T) {
 	truncated := func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", contentTypeWAV)
 		w.Header().Set("Content-Length", strconv.Itoa(promisedBytes))
-		writeOrFail(t, w, upstreamWAVs+strings.Repeat("a", 5000))
+		writeOrFail(t, w, upstreamAudio+strings.Repeat("a", 5000))
 	}
 
-	for _, format := range []string{"wav", "opus"} {
+	for _, format := range []string{"wav", "pcm", "mp3", "opus"} {
 		t.Run(format, func(t *testing.T) {
 			h := newHarness(t, truncated)
 

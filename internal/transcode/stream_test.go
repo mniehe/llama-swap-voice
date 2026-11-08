@@ -1,12 +1,9 @@
 package transcode
 
 import (
-	"encoding/binary"
 	"io"
-	"maps"
 	"os"
 	"os/exec"
-	"slices"
 	"testing"
 	"time"
 
@@ -18,15 +15,12 @@ const (
 	ffmpegEnv        = "LLAMA_SWAP_VOICE_FFMPEG"
 	ffmpegName       = "ffmpeg"
 	firstByteTimeout = 5 * time.Second
+	stretchedSpeed   = 1.15
+	pcmSampleBytes   = 2
 
-	toneRate       uint32 = 24000
-	toneSeconds    uint32 = 2
-	toneChannels   uint16 = 1
-	toneSampleBits uint16 = 16
-	pcmFormatTag   uint16 = 1
-	fmtChunkBytes  uint32 = 16
-	riffHeadBytes  uint32 = 8
-	wavHeaderBytes uint32 = 44
+	// Half a second of 24 kHz mono s16le, less than ffmpeg's 32 KiB output
+	// buffer, so output before the input ends proves ffmpeg flushes.
+	pausedPCMBytes = pcmSampleRate / 2 * pcmSampleBytes
 )
 
 func realFFmpeg(t *testing.T) string {
@@ -51,27 +45,6 @@ func realFFmpeg(t *testing.T) string {
 	return path
 }
 
-func silentWAV() []byte {
-	blockAlign := toneChannels * toneSampleBits / 8
-	dataBytes := toneRate * toneSeconds * uint32(blockAlign)
-
-	le := binary.LittleEndian
-	wav := []byte("RIFF")
-	wav = le.AppendUint32(wav, wavHeaderBytes-riffHeadBytes+dataBytes)
-	wav = append(wav, "WAVEfmt "...)
-	wav = le.AppendUint32(wav, fmtChunkBytes)
-	wav = le.AppendUint16(wav, pcmFormatTag)
-	wav = le.AppendUint16(wav, toneChannels)
-	wav = le.AppendUint32(wav, toneRate)
-	wav = le.AppendUint32(wav, toneRate*uint32(blockAlign))
-	wav = le.AppendUint16(wav, blockAlign)
-	wav = le.AppendUint16(wav, toneSampleBits)
-	wav = append(wav, "data"...)
-	wav = le.AppendUint32(wav, dataBytes)
-
-	return append(wav, make([]byte, dataBytes)...)
-}
-
 type firstRead struct {
 	n   int
 	err error
@@ -87,37 +60,31 @@ func readFirst(out io.Reader) <-chan firstRead {
 	return got
 }
 
-func TestEncoder_Encode_RealFFmpegStreamsBeforeInputEnds(t *testing.T) {
+func TestEncoder_Encode_RealFFmpegStretchesBeforeInputEnds(t *testing.T) {
 	ffmpeg := realFFmpeg(t)
-	audio := silentWAV()
+	src, sink := io.Pipe()
+	out, err := New(ffmpeg).Encode(t.Context(), src, Options{Speed: stretchedSpeed})
+	require.NoError(t, err)
 
-	for _, format := range slices.Sorted(maps.Keys(codecs)) {
-		t.Run(string(format), func(t *testing.T) {
-			src, sink := io.Pipe()
-			out, err := New(ffmpeg).Encode(t.Context(), src, Options{Format: format, Speed: 1})
-			require.NoError(t, err)
+	written := make(chan error, 1)
+	go func() {
+		_, writeErr := sink.Write(make([]byte, pausedPCMBytes))
+		written <- writeErr
+	}()
 
-			written := make(chan error, 1)
-			go func() {
-				_, writeErr := sink.Write(audio)
-				written <- writeErr
-			}()
-
-			got := readFirst(out)
-			select {
-			case first := <-got:
-				assert.Positive(t, first.n, "ffmpeg produced no output before its input ended: %v", first.err)
-			case <-time.After(firstByteTimeout):
-				assert.Fail(t, "ffmpeg produced no output before its input ended")
-				require.NoError(t, sink.Close())
-				<-got
-			}
-
-			require.NoError(t, sink.Close())
-			require.NoError(t, <-written)
-			_, err = io.Copy(io.Discard, out)
-			require.NoError(t, err)
-			require.NoError(t, out.Close())
-		})
+	got := readFirst(out)
+	select {
+	case first := <-got:
+		assert.Positive(t, first.n, "ffmpeg produced no output before its input ended: %v", first.err)
+	case <-time.After(firstByteTimeout):
+		assert.Fail(t, "ffmpeg produced no output before its input ended")
+		require.NoError(t, sink.Close())
+		<-got
 	}
+
+	require.NoError(t, <-written)
+	require.NoError(t, sink.Close())
+	_, err = io.Copy(io.Discard, out)
+	require.NoError(t, err)
+	require.NoError(t, out.Close())
 }

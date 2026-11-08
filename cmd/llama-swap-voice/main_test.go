@@ -28,7 +28,7 @@ import (
 const (
 	probeTimeout = 3 * time.Second
 	probeEvery   = 10 * time.Millisecond
-	slowAudio    = "RIFF....WAVEslow audio"
+	slowAudio    = "RIFF\xff\xff\xff\xffWAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\xff\xff\xff\xffslow audio"
 
 	forcedTotal   = 200 * time.Millisecond
 	shutdownSlack = 500 * time.Millisecond
@@ -160,8 +160,9 @@ func TestServe_Signal_DrainsInFlightRequest(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
-// stuckSpeech starts a speech request whose upstream never finishes, encoded
-// by a fake ffmpeg that ignores SIGTERM, and returns once ffmpeg is running.
+// stuckSpeech starts a speech request whose upstream never finishes, slowed
+// down by a fake ffmpeg that ignores SIGTERM, and returns once ffmpeg is
+// running. Only a speed change runs ffmpeg.
 func stuckSpeech(t *testing.T, cfg *ServiceConfig) (cancel context.CancelFunc, done <-chan error, pid int) {
 	t.Helper()
 
@@ -181,7 +182,7 @@ func stuckSpeech(t *testing.T, cfg *ServiceConfig) (cancel context.CancelFunc, d
 	waitReady(t, base)
 
 	go func() {
-		_, err := postSpeechAs(t.Context(), base, "mp3")
+		_, err := postSpeechBody(t.Context(), base, `{"input":"hi","response_format":"mp3","speed":1.5}`)
 		assert.Error(t, err, "a cancelled stream must not end cleanly")
 	}()
 
@@ -258,12 +259,11 @@ func TestServe_PortInUse_ReturnsError(t *testing.T) {
 }
 
 func postSpeech(ctx context.Context, base string) (string, error) {
-	return postSpeechAs(ctx, base, "wav")
+	return postSpeechBody(ctx, base, `{"input":"hi","response_format":"wav"}`)
 }
 
-func postSpeechAs(ctx context.Context, base, format string) (string, error) {
-	body := strings.NewReader(`{"input":"hi","response_format":"` + format + `"}`)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/audio/speech", body)
+func postSpeechBody(ctx context.Context, base, body string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/audio/speech", strings.NewReader(body))
 	if err != nil {
 		return "", err
 	}

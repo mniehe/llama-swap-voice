@@ -19,20 +19,22 @@ a short clip you provide.
  Hermes ─────────┼──▶ llama-swap-voice ──▶ llama-swap ──▶ llama-server
  any OpenAI app ─┘     (this repo)                         ├─ qwen3-asr  (listens)
                          │                                 └─ qwen3-tts  (speaks)
-                         └─ ffmpeg: mp3, opus, flac, aac, pcm
+                         └─ encodes mp3, opus, wav, pcm itself
 ```
 
 1. A client sends audio to `/v1/audio/transcriptions` or text to `/v1/audio/speech`.
 2. llama-swap-voice turns that OpenAI-shaped request into the one llama-server
    expects, adding the voice's reference clip for speech.
 3. llama-swap starts the right model if it isn't running and passes the request on.
-4. The reply streams back through ffmpeg into the format the client asked for,
+4. The reply is encoded into the format the client asked for as it arrives,
    so playback starts before the whole sentence is ready.
 
 ## Quick start
 
-You need llama-swap, a recent llama.cpp `llama-server` (v0.8.0 or later, for its
-`/tts` endpoint) and ffmpeg.
+You need llama-swap and a recent llama.cpp `llama-server` (v0.8.0 or later, for
+its `/tts` endpoint). ffmpeg is only needed for speech requests that change
+`speed`. Building needs a C compiler, pkg-config and libopus, because Opus
+output is encoded with libopus.
 
 **1. Add the two models to your llama-swap config.** llama-server downloads them
 from Hugging Face on first start, around 4.5 GB in total.
@@ -152,7 +154,7 @@ Everything is set with environment variables. Only the default voice is required
 | `TTS_LANG` | `en` | Language passed to the speech model |
 | `TTS_MAXINPUTCHARS` | `4096` | Longest text accepted per request |
 | `ASR_PREFIXREGEX` | `^language \w+<asr_text>` | Removed from the start of each transcript |
-| `FFMPEG` | `ffmpeg` | ffmpeg binary |
+| `FFMPEG` | `ffmpeg` | ffmpeg binary, used only to change speech speed |
 | `REQUEST_TIMEOUT` | `2m` | Longest a speech or transcription request may take, streaming included. Every other endpoint gets 10 seconds |
 | `REQUEST_MAXCONCURRENT` | `4` | Requests handled at once; more get a 503 |
 | `LOG_LEVEL`, `LOG_FORMAT` | `info`, `json` | `debug`/`info`/`warn`/`error`; `json`/`console` |
@@ -182,12 +184,13 @@ Every path also works without the `/v1` prefix.
 
 | Endpoint | Does |
 |---|---|
-| `POST /v1/audio/speech` | Text to speech. JSON: `input`, `voice`, `response_format` (`mp3` default, `opus`, `aac`, `flac`, `wav`, `pcm`), `speed` (0.25 to 4) |
+| `POST /v1/audio/speech` | Text to speech. JSON: `input`, `voice`, `response_format` (`mp3` default, `opus`, `wav`, `pcm`; `aac` and `flac` are a 400 `unsupported response_format`), `speed` (0.25 to 4) |
 | `POST /v1/audio/transcriptions` | Speech to text. Multipart `file` (up to 25 MB and 20 minutes) in WAV (16-bit, 24-bit or float), Ogg Opus or MP3, mono or stereo at 8 to 48 kHz, decoded in Go to 16 kHz mono before transcribing. Anything else, FLAC, M4A, WebM, AAC and chained Ogg included, is a 400 `could not decode audio: unsupported audio format`; a damaged or empty file is a 400 `could not decode audio: corrupted audio`, and audio over 20 minutes a 400 `audio is longer than 20 minutes`. `response_format` `json`, `verbose_json` or `text` |
 | `GET /v1/models`, `GET /v1/audio/voices` | What's available |
 | `GET /health`, `GET /internal/liveness`, `GET /internal/readiness` | Health checks; readiness turns 503 while shutting down |
 
-`pcm` is raw 16-bit little-endian mono at 24 kHz, as in OpenAI's API. The
+`pcm` is raw 16-bit little-endian mono at 24 kHz, as in OpenAI's API. `mp3`
+is 128 kbit/s mono at 24 kHz and `opus` is Ogg Opus at 24 kbit/s mono. The
 `model` field is accepted and ignored; the models come from your config.
 
 Errors, unknown paths and wrong methods included, come back as JSON:
@@ -196,14 +199,20 @@ Errors, unknown paths and wrong methods included, come back as JSON:
 ## Development
 
 ```sh
-go test ./...                     # no GPU, models or ffmpeg needed
+nix-shell -p libopus pkg-config gcc opus-tools ffmpeg-headless   # or install them yourself
+go test ./...                     # no GPU or models needed
 golangci-lint run ./...
 ```
 
-With ffmpeg on `PATH` or in `LLAMA_SWAP_VOICE_FFMPEG`, the tests also check
-that real ffmpeg streams every output format before its input ends.
+The tests use `opusinfo` and `opusdec` from opus-tools and ffmpeg to decode
+the encoded replies, and skip those checks when the tools are missing. With
+ffmpeg on `PATH` or in `LLAMA_SWAP_VOICE_FFMPEG`, they also check that real
+ffmpeg changes speed while streaming.
 
 ## Licence
 
-MIT. The Qwen3 models are Apache-2.0, published by the Qwen team and
-converted to GGUF by [ggml-org](https://huggingface.co/ggml-org).
+MIT. Binaries built from it also include
+[shine-mp3](https://github.com/braheezy/shine-mp3), which is LGPL-2.0, and
+link [libopus](https://opus-codec.org), which is BSD-3-Clause. The Qwen3
+models are Apache-2.0, published by the Qwen team and converted to GGUF by
+[ggml-org](https://huggingface.co/ggml-org).

@@ -32,7 +32,8 @@ const (
 	ttsRoute        = "/upstream/" + ttsModel + "/tts"
 	asrRoute        = "/upstream/" + asrModel + "/v1/audio/transcriptions"
 	upstreamWAVs    = "RIFF\xff\xff\xff\xffWAVEfmt "
-	upstreamAudio   = upstreamWAVs + "audio frames"
+	upstreamHeader  = upstreamWAVs + "\x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\xff\xff\xff\xff"
+	upstreamAudio   = upstreamHeader + "audio frames"
 	speechPath      = "/v1/audio/speech"
 	fakeFormMemory  = 1 << 20
 	harnessTimeout  = 10 * time.Second
