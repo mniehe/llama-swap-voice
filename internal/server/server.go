@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mniehe/llama-swap-voice/internal/transcode"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
@@ -31,7 +30,6 @@ type Config struct {
 	Voices         map[string]string
 	DefaultVoice   string
 	Lang           string
-	FFmpeg         string
 	RequestTimeout time.Duration
 	MaxInputChars  int
 	MaxConcurrent  int
@@ -42,7 +40,6 @@ type Config struct {
 type Server struct {
 	cfg            Config
 	upstream       *upstream.Client
-	encoder        *transcode.Encoder
 	prefix         *regexp.Regexp
 	voices         []string
 	slots          chan struct{}
@@ -62,7 +59,6 @@ func New(cfg *Config, client *upstream.Client, log *slog.Logger) (*Server, error
 	return &Server{
 		cfg:            *cfg,
 		upstream:       client,
-		encoder:        transcode.New(cfg.FFmpeg),
 		prefix:         prefix,
 		voices:         voiceNames(cfg.Voices),
 		slots:          make(chan struct{}, cfg.MaxConcurrent),

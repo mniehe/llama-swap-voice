@@ -13,7 +13,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/mniehe/llama-swap-voice/internal/audio"
-	"github.com/mniehe/llama-swap-voice/internal/transcode"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
@@ -25,8 +24,6 @@ const (
 
 	defaultSpeechFormat = "mp3"
 	normalSpeed         = 1.0
-	minSpeed            = 0.25
-	maxSpeed            = 4.0
 	maxSpeechBodyBytes  = 1 << 20
 	pcmSampleBytes      = 2
 )
@@ -67,10 +64,6 @@ type speechJob struct {
 	speed     float64
 }
 
-func (j *speechJob) passesThrough() bool {
-	return j.output.codec == audio.WAV && j.speed == normalSpeed
-}
-
 func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	job, err := s.parseSpeech(w, r)
 	if err != nil {
@@ -93,11 +86,6 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec.upstreamStatus = reply.Status
-
-	if job.passesThrough() {
-		s.passThrough(w, r, reply, &job)
-		return
-	}
 
 	s.encoded(w, r, reply, &job)
 }
@@ -183,39 +171,27 @@ func resolveSpeed(requested *float64) (float64, error) {
 	}
 
 	speed := *requested
-	if speed < minSpeed || speed > maxSpeed {
-		return 0, fmt.Errorf("speed must be between %g and %g", minSpeed, maxSpeed)
+	if speed < audio.MinSpeed || speed > audio.MaxSpeed {
+		return 0, fmt.Errorf("speed must be between %g and %g", audio.MinSpeed, audio.MaxSpeed)
 	}
 
 	return speed, nil
 }
 
-func (s *Server) passThrough(w http.ResponseWriter, r *http.Request, reply *upstream.Audio, job *speechJob) {
+// encoded holds the 200 back until the first samples arrive and the encoder
+// exists, so a failure before any audio is still a JSON error.
+func (s *Server) encoded(w http.ResponseWriter, r *http.Request, reply *upstream.Audio, job *speechJob) {
 	defer s.closeUpstream(reply)
 
-	if err := streamBody(w, job.output.contentType, reply.Body); err != nil {
-		s.streamFailure(r, err)
-	}
-}
-
-// encoded holds the 200 back until the first samples arrive and the encoder
-// exists, so a failure before any audio is still a JSON error. The upstream
-// body is closed before ffmpeg is waited for, because ffmpeg's stdin copy may
-// be blocked reading it; the deferred closes keep that order on a panic.
-func (s *Server) encoded(w http.ResponseWriter, r *http.Request, reply *upstream.Audio, job *speechJob) {
-	pcm, status, err := s.speechPCM(r.Context(), reply.Body, job.speed)
+	pcm, status, err := speechPCM(reply.Body, job.speed)
 	if err != nil {
-		s.closeUpstream(reply)
 		s.writeError(w, unlessRequestEnded(r, status), err)
 		return
 	}
-	defer pcm.Close()
-	defer s.closeUpstream(reply)
 
 	first, err := readFirstChunk(pcm)
 	if err != nil {
-		s.closeUpstream(reply)
-		s.writeError(w, unlessRequestEnded(r, http.StatusBadGateway), errors.Join(err, pcm.Close()))
+		s.writeError(w, unlessRequestEnded(r, http.StatusBadGateway), err)
 		return
 	}
 
@@ -226,11 +202,7 @@ func (s *Server) encoded(w http.ResponseWriter, r *http.Request, reply *upstream
 		return
 	}
 
-	streamErr := streamEncoded(encoder, io.MultiReader(bytes.NewReader(first), pcm))
-	s.closeUpstream(reply)
-	closeErr := pcm.Close()
-
-	if err := errors.Join(streamErr, closeErr); err != nil {
+	if err := streamEncoded(encoder, io.MultiReader(bytes.NewReader(first), pcm)); err != nil {
 		s.streamFailure(r, err)
 	}
 }
@@ -246,19 +218,15 @@ func (s *Server) encoderFailure(w http.ResponseWriter, r *http.Request, err erro
 }
 
 // speechPCM strips the upstream WAV header and, when the request changes the
-// speed, stretches the samples through ffmpeg. Closing the result waits for
-// ffmpeg. On failure it also returns the status to answer with.
-func (s *Server) speechPCM(ctx context.Context, body io.Reader, speed float64) (io.ReadCloser, int, error) {
+// speed, time-stretches the samples as they arrive. On failure it also
+// returns the status to answer with.
+func speechPCM(body io.Reader, speed float64) (io.Reader, int, error) {
 	pcm, err := audio.NewWAVReader(body)
 	if err != nil {
 		return nil, http.StatusBadGateway, fmt.Errorf("upstream audio: %w", err)
 	}
 
-	if speed == normalSpeed {
-		return io.NopCloser(pcm), http.StatusOK, nil
-	}
-
-	stretched, err := s.encoder.Encode(ctx, pcm, transcode.Options{Speed: speed})
+	stretched, err := audio.NewStretcher(pcm, speed)
 	if err != nil {
 		return nil, http.StatusInternalServerError, err
 	}

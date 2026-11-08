@@ -45,15 +45,6 @@ func (s *Server) logWriteFailure(err error) {
 	s.log.Info("client went away before the response was written", slog.Any("error", err))
 }
 
-func streamBody(w http.ResponseWriter, contentType string, body io.Reader) error {
-	w.Header().Set("Content-Type", contentType)
-	w.WriteHeader(http.StatusOK)
-
-	flusher := &flushWriter{w: w, rc: http.NewResponseController(w)}
-	_, err := io.CopyBuffer(flusher, body, make([]byte, copyBufferBytes))
-	return err
-}
-
 type flushWriter struct {
 	w  io.Writer
 	rc *http.ResponseController

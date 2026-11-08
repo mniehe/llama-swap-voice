@@ -123,7 +123,7 @@ func TestServer_Limited_NonReadingClientReleasesSlot(t *testing.T) {
 	chunk := make([]byte, chunkBytes)
 	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", contentTypeWAV)
-		writeOrFail(t, w, upstreamWAVs)
+		writeOrFail(t, w, upstreamHeader)
 		for range streamChunks {
 			if _, err := w.Write(chunk); err != nil {
 				return

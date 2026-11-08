@@ -133,8 +133,8 @@ func listen(httpServer *http.Server) error {
 
 // Request contexts descend from the server's BaseContext, so in-flight audio
 // streams first get timing.Total to finish untouched. Past that they are
-// cancelled, which signals their ffmpeg children, and connections are closed;
-// timing.Hard then bounds the wait for handlers to reap those children.
+// cancelled and connections are closed; timing.Hard then bounds the wait for
+// their handlers to return.
 func shutdown(
 	httpServer *http.Server,
 	service *server.Server,

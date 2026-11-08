@@ -26,12 +26,8 @@ func voicesDir(t *testing.T, names ...string) string {
 func validConfig(t *testing.T) ServiceConfig {
 	t.Helper()
 
-	ffmpeg, err := os.Executable()
-	require.NoError(t, err)
-
 	cfg := defaultConfig
 	cfg.Voices = VoicesConfig{Dir: voicesDir(t, "alice.mp3"), Default: "alice"}
-	cfg.FFmpeg = ffmpeg
 
 	return cfg
 }
@@ -63,13 +59,12 @@ func TestServiceConfig_Validate_RejectsInvalidValues(t *testing.T) {
 		"max concurrent zero":   {func(c *ServiceConfig) { c.Request.MaxConcurrent = 0 }, "request.maxconcurrent"},
 		"timeout zero":          {func(c *ServiceConfig) { c.Request.Timeout = 0 }, "request.timeout"},
 		"bad regex":             {func(c *ServiceConfig) { c.ASR.PrefixRegex = "(" }, "asr.prefixregex"},
-		"missing ffmpeg":        {func(c *ServiceConfig) { c.FFmpeg = "/nonexistent/ffmpeg" }, "ffmpeg"},
 		"bad log level":         {func(c *ServiceConfig) { c.Logger.Level = "trace" }, "log.level"},
 		"bad log format":        {func(c *ServiceConfig) { c.Logger.Format = "xml" }, "log.format"},
 		"shutdown total zero":   {func(c *ServiceConfig) { c.ShutdownTiming.Total = 0 }, "shutdown.total"},
 		"shutdown grace below0": {func(c *ServiceConfig) { c.ShutdownTiming.Grace = -time.Second }, "shutdown.grace"},
 		"shutdown hard below0":  {func(c *ServiceConfig) { c.ShutdownTiming.Hard = -time.Second }, "shutdown.hard"},
-		"shutdown hard short":   {func(c *ServiceConfig) { c.ShutdownTiming.Hard = time.Second / 2 }, "shutdown.hard must be at least"},
+		"shutdown hard zero":    {func(c *ServiceConfig) { c.ShutdownTiming.Hard = 0 }, "shutdown.hard must be positive"},
 	}
 
 	for name, tt := range tests {
@@ -120,7 +115,6 @@ func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 		"TTS_LANG":                "de",
 		"TTS_MAXINPUTCHARS":       "512",
 		"ASR_PREFIXREGEX":         "^x",
-		"FFMPEG":                  "/opt/ffmpeg/bin/ffmpeg",
 		"REQUEST_TIMEOUT":         "45s",
 		"REQUEST_MAXCONCURRENT":   "2",
 		"LOG_LEVEL":               "debug",
@@ -143,11 +137,24 @@ func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 		Voices:         VoicesConfig{Dir: "/srv/voices", Default: "bm_fable"},
 		TTS:            TTSConfig{Lang: "de", MaxInputChars: 512},
 		ASR:            ASRConfig{PrefixRegex: "^x"},
-		FFmpeg:         "/opt/ffmpeg/bin/ffmpeg",
 		Request:        RequestConfig{Timeout: 45 * time.Second, MaxConcurrent: 2},
 		Logger:         LoggerConfig{Level: "debug", Format: "console"},
 		ShutdownTiming: ShutdownTimingConfig{Total: 20 * time.Second, Grace: 5 * time.Second, Hard: time.Second},
 	}, cfg)
+}
+
+func TestLoadConfig_FFmpegVariable_IsIgnored(t *testing.T) {
+	dir := voicesDir(t, "alice.mp3")
+	t.Setenv(envPrefix+"FFMPEG", "/nonexistent/ffmpeg")
+	t.Setenv(envPrefix+"VOICES_DIR", dir)
+	t.Setenv(envPrefix+"VOICES_DEFAULT", "alice")
+
+	cfg, err := loadConfig()
+
+	require.NoError(t, err)
+	want := defaultConfig
+	want.Voices = VoicesConfig{Dir: dir, Default: "alice"}
+	assert.Equal(t, want, cfg)
 }
 
 func TestLoadConfig_NoEnvironment_ReturnsDefaults(t *testing.T) {
@@ -169,7 +176,6 @@ func TestServiceConfig_ServerConfig_CopiesSettings(t *testing.T) {
 	assert.Equal(t, voiceFiles, got.Voices)
 	assert.Equal(t, "alice", got.DefaultVoice)
 	assert.Equal(t, cfg.TTS.Lang, got.Lang)
-	assert.Equal(t, cfg.FFmpeg, got.FFmpeg)
 	assert.Equal(t, cfg.Request.Timeout, got.RequestTimeout)
 	assert.Equal(t, cfg.TTS.MaxInputChars, got.MaxInputChars)
 	assert.Equal(t, cfg.Request.MaxConcurrent, got.MaxConcurrent)

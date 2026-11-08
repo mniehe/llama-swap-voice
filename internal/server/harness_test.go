@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -18,7 +17,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/mniehe/llama-swap-voice/internal/fakeffmpeg"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
@@ -39,11 +37,6 @@ const (
 	harnessTimeout  = 10 * time.Second
 	harnessMaxChars = 100
 )
-
-func TestMain(m *testing.M) {
-	fakeffmpeg.RunIfRequested()
-	os.Exit(m.Run())
-}
 
 type upstreamCall struct {
 	path   string
@@ -123,7 +116,6 @@ func (f *fakeUpstream) callCount() int {
 type harness struct {
 	t        *testing.T
 	upstream *fakeUpstream
-	ffmpeg   *fakeffmpeg.Fake
 	service  *Server
 	server   *httptest.Server
 	cfg      Config
@@ -136,14 +128,13 @@ func newHarness(t *testing.T, respond http.HandlerFunc, tweak ...func(*Config)) 
 	alice := writeFile(t, dir, "alice.mp3", aliceRef)
 	narrator := writeFile(t, dir, "narrator.wav", narratorRef)
 
-	h := &harness{t: t, upstream: newFakeUpstream(t, respond), ffmpeg: fakeffmpeg.Install(t)}
+	h := &harness{t: t, upstream: newFakeUpstream(t, respond)}
 	h.cfg = Config{
 		TTSModel:       ttsModel,
 		ASRModel:       asrModel,
 		Voices:         map[string]string{"alice": alice, "bm_fable": alice, "narrator": narrator},
 		DefaultVoice:   "alice",
 		Lang:           "en",
-		FFmpeg:         h.ffmpeg.Path,
 		RequestTimeout: harnessTimeout,
 		MaxInputChars:  harnessMaxChars,
 		MaxConcurrent:  4,
@@ -276,14 +267,4 @@ func serveTranscript(t *testing.T, text string) http.HandlerFunc {
 		w.Header().Set("Content-Type", contentTypeJSON)
 		assert.NoError(t, json.NewEncoder(w).Encode(map[string]string{"type": "transcript.text.done", "text": text}))
 	}
-}
-
-func containsRun(haystack []string, run ...string) bool {
-	for i := range haystack {
-		if i+len(run) <= len(haystack) && slices.Equal(haystack[i:i+len(run)], run) {
-			return true
-		}
-	}
-
-	return false
 }

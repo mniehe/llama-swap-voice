@@ -13,8 +13,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/mniehe/llama-swap-voice/internal/fakeffmpeg"
 )
 
 const (
@@ -81,14 +79,20 @@ func TestServer_HandleSpeech_RejectsInvalidInput(t *testing.T) {
 	assert.Zero(t, h.upstream.callCount(), "upstream called for invalid input")
 }
 
-func TestServer_HandleSpeech_WAVPassThroughIsByteEqual(t *testing.T) {
-	h := newHarness(t, serveWAV(t))
+func TestServer_HandleSpeech_WAVIsReencodedWithStreamedHeader(t *testing.T) {
+	fixture := readFixture(t, speechFixture)
+	h := newHarness(t, serveBody(t, fixture))
 
 	resp := h.speech(speechPath, map[string]any{"voice": "alice", "input": "hi", "response_format": "wav"})
+	body := readBody(t, resp)
 
-	assert.Equal(t, []byte(upstreamAudio), readBody(t, resp))
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 	assert.Equal(t, contentTypeWAV, resp.Header.Get("Content-Type"))
-	assert.Nil(t, h.ffmpeg.Args(), "ffmpeg ran for wav pass-through")
+	require.Greater(t, len(body), wavHeaderBytes)
+	streamedHeader := streamedSpeech(t, 0)
+	assert.Equal(t, streamedHeader, body[:wavHeaderBytes], "want the streamed header with unknown sizes")
+	assert.Equal(t, fixture[wavHeaderBytes:], body[wavHeaderBytes:])
+	assert.Len(t, decodeWAV(t, body), fixtureSamples(t)*bytesPerSample)
 }
 
 func TestServer_HandleSpeech_PCMIsUpstreamSamplesWithoutHeader(t *testing.T) {
@@ -101,20 +105,6 @@ func TestServer_HandleSpeech_PCMIsUpstreamSamplesWithoutHeader(t *testing.T) {
 	assert.Equal(t, "wav", h.upstream.lastCall().fields["response_format"], "llama-server's own pcm is float32")
 	assert.Equal(t, contentTypePCM, resp.Header.Get("Content-Type"))
 	assert.Equal(t, upstreamAudio[upstreamHeaderBytes:], string(body))
-	assert.Nil(t, h.ffmpeg.Args(), "ffmpeg ran at normal speed")
-}
-
-func TestServer_HandleSpeech_SpeedStretchesRawPCMThroughFFmpeg(t *testing.T) {
-	h := newHarness(t, serveWAV(t))
-
-	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "pcm", "speed": 1.5})
-	body := readBody(t, resp)
-
-	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
-	args := h.ffmpeg.Args()
-	assert.True(t, containsRun(args, "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0"), "ffmpeg args %v lack raw PCM input", args)
-	assert.True(t, containsRun(args, "-filter:a", "atempo=1.5", "-f", "s16le", "-ar", "24000", "-ac", "1", "pipe:1"), "ffmpeg args %v", args)
-	assert.Equal(t, upstreamAudio[upstreamHeaderBytes:], string(body), "want the fake ffmpeg's echo of the upstream samples")
 }
 
 func TestServer_HandleSpeech_EncodesInProcess(t *testing.T) {
@@ -136,7 +126,6 @@ func TestServer_HandleSpeech_EncodesInProcess(t *testing.T) {
 			require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 			assert.Equal(t, tt.contentType, resp.Header.Get("Content-Type"))
 			assert.True(t, strings.HasPrefix(string(body), tt.magic), "body starts %q", body[:min(len(body), len(tt.magic))])
-			assert.Nil(t, h.ffmpeg.Args(), "ffmpeg ran at normal speed")
 			assert.Equal(t, "wav", h.upstream.lastCall().fields["response_format"])
 		})
 	}
@@ -156,26 +145,13 @@ func TestServer_HandleSpeech_AACAndFLACAre400(t *testing.T) {
 }
 
 func TestServer_HandleSpeech_SpeedStretchesBeforeEncoding(t *testing.T) {
-	h := newHarness(t, serveWAV(t))
+	h := newHarness(t, serveBody(t, streamedSpeech(t, fixtureSamples(t))))
 
 	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "mp3", "speed": 1.15})
 	body := readBody(t, resp)
 
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
-	assert.True(t, containsRun(h.ffmpeg.Args(), "-filter:a", "atempo=1.15"), "ffmpeg args %v", h.ffmpeg.Args())
-	assert.True(t, strings.HasPrefix(string(body), mp3FrameSync), "want MP3 frames, not ffmpeg output")
-}
-
-func TestServer_HandleSpeech_WAVWithSpeedIsStretched(t *testing.T) {
-	h := newHarness(t, serveWAV(t))
-
-	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "wav", "speed": 0.9})
-	body := readBody(t, resp)
-
-	args := h.ffmpeg.Args()
-	assert.True(t, containsRun(args, "-filter:a", "atempo=0.9"), "ffmpeg args %v", args)
-	assert.Equal(t, contentTypeWAV, resp.Header.Get("Content-Type"))
-	assert.Equal(t, upstreamAudio, string(body), "want a streamed WAV header around the fake ffmpeg's echo")
+	assert.True(t, strings.HasPrefix(string(body), mp3FrameSync), "want MP3 frames")
 }
 
 func TestServer_HandleSpeech_NonWAVUpstreamIsJSONError(t *testing.T) {
@@ -200,7 +176,7 @@ func TestServer_HandleSpeech_HeaderOnlyUpstreamIsJSONError(t *testing.T) {
 }
 
 func TestServer_HandleSpeech_HalfSampleUpstreamIsJSONError(t *testing.T) {
-	for _, format := range []string{"pcm", "mp3", "opus"} {
+	for _, format := range []string{"wav", "pcm", "mp3", "opus"} {
 		t.Run(format, func(t *testing.T) {
 			h := newHarness(t, serveBody(t, []byte(upstreamHeader+"\x01")))
 
@@ -214,7 +190,7 @@ func TestServer_HandleSpeech_HalfSampleUpstreamIsJSONError(t *testing.T) {
 }
 
 func TestServer_HandleSpeech_TrailingHalfSampleAbortsStream(t *testing.T) {
-	for _, format := range []string{"pcm", "mp3", "opus"} {
+	for _, format := range []string{"wav", "pcm", "mp3", "opus"} {
 		t.Run(format, func(t *testing.T) {
 			h := newHarness(t, serveBody(t, []byte(upstreamHeader+"\x01\x02\x03")))
 
@@ -237,14 +213,14 @@ func TestServer_HandleSpeech_Upstream5xxIsJSONError(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 	assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"))
 	assert.Contains(t, errorMessage(t, resp), "model crashed")
-	assert.Nil(t, h.ffmpeg.Args(), "ffmpeg ran after upstream failure")
 }
 
-func TestServer_HandleSpeech_ClientCancelStopsUpstreamAndFFmpeg(t *testing.T) {
+func TestServer_HandleSpeech_ClientCancelStopsUpstream(t *testing.T) {
+	wav := streamedSpeech(t, fixtureSamples(t))
 	upstreamDone := make(chan time.Time, 1)
 	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", contentTypeWAV)
-		writeOrFail(t, w, upstreamAudio)
+		writeOrFail(t, w, string(wav[:wavHeaderBytes+pausedAudioBytes]))
 		assert.NoError(t, http.NewResponseController(w).Flush())
 		select {
 		case <-r.Context().Done():
@@ -262,7 +238,7 @@ func TestServer_HandleSpeech_ClientCancelStopsUpstreamAndFFmpeg(t *testing.T) {
 	require.NoError(t, err)
 	resp := h.do(req)
 
-	first := make([]byte, len(upstreamAudio)-upstreamHeaderBytes)
+	first := make([]byte, earlyBytes)
 	_, err = io.ReadFull(resp.Body, first)
 	require.NoError(t, err, "no streamed bytes before cancel")
 
@@ -275,19 +251,6 @@ func TestServer_HandleSpeech_ClientCancelStopsUpstreamAndFFmpeg(t *testing.T) {
 	case <-time.After(waitTimeout):
 		require.Fail(t, "upstream request still open 1s after client cancel")
 	}
-
-	_, ok := h.ffmpeg.WaitFor(waitTimeout, fakeffmpeg.EventSIGTERM, fakeffmpeg.EventEOF)
-	require.True(t, ok, "ffmpeg saw neither SIGTERM nor EOF within 1s; events %v", h.ffmpeg.Events())
-}
-
-func TestServer_HandleSpeech_FFmpegFailureIsJSONError(t *testing.T) {
-	h := newHarness(t, serveWAV(t))
-	h.ffmpeg.FailWith(t, "Invalid argument")
-
-	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "mp3", "speed": 1.5})
-
-	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
-	assert.Contains(t, errorMessage(t, resp), "Invalid argument")
 }
 
 func TestServer_HandleSpeech_TruncatedUpstreamIsClientError(t *testing.T) {
@@ -309,4 +272,13 @@ func TestServer_HandleSpeech_TruncatedUpstreamIsClientError(t *testing.T) {
 			assert.Error(t, err, "truncated stream ended cleanly, want a transport error")
 		})
 	}
+}
+
+func TestSpeechPCM_SpeedOutsideStretcherRangeIsInternalError(t *testing.T) {
+	pcm, status, err := speechPCM(strings.NewReader(upstreamAudio), 0)
+
+	require.Error(t, err)
+	assert.Nil(t, pcm)
+	assert.Equal(t, http.StatusInternalServerError, status)
+	assert.Contains(t, err.Error(), "between 0.25 and 4")
 }

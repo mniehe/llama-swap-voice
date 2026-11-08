@@ -19,7 +19,7 @@ a short clip you provide.
  Hermes ─────────┼──▶ llama-swap-voice ──▶ llama-swap ──▶ llama-server
  any OpenAI app ─┘     (this repo)                         ├─ qwen3-asr  (listens)
                          │                                 └─ qwen3-tts  (speaks)
-                         └─ encodes mp3, opus, wav, pcm itself
+                         └─ encodes mp3, opus, wav, pcm and changes speed itself
 ```
 
 1. A client sends audio to `/v1/audio/transcriptions` or text to `/v1/audio/speech`.
@@ -32,9 +32,8 @@ a short clip you provide.
 ## Quick start
 
 You need llama-swap and a recent llama.cpp `llama-server` (v0.8.0 or later, for
-its `/tts` endpoint). ffmpeg is only needed for speech requests that change
-`speed`. Building needs a C compiler, pkg-config and libopus, because Opus
-output is encoded with libopus.
+its `/tts` endpoint). Building needs a C compiler, pkg-config and libopus,
+because Opus output is encoded with libopus.
 
 **1. Add the two models to your llama-swap config.** llama-server downloads them
 from Hugging Face on first start, around 4.5 GB in total.
@@ -154,7 +153,6 @@ Everything is set with environment variables. Only the default voice is required
 | `TTS_LANG` | `en` | Language passed to the speech model |
 | `TTS_MAXINPUTCHARS` | `4096` | Longest text accepted per request |
 | `ASR_PREFIXREGEX` | `^language \w+<asr_text>` | Removed from the start of each transcript |
-| `FFMPEG` | `ffmpeg` | ffmpeg binary, used only to change speech speed |
 | `REQUEST_TIMEOUT` | `2m` | Longest a speech or transcription request may take, streaming included. Every other endpoint gets 10 seconds |
 | `REQUEST_MAXCONCURRENT` | `4` | Requests handled at once; more get a 503 |
 | `LOG_LEVEL`, `LOG_FORMAT` | `info`, `json` | `debug`/`info`/`warn`/`error`; `json`/`console` |
@@ -172,11 +170,9 @@ On SIGTERM or SIGINT, readiness turns 503 and shutdown runs in three steps:
 
 1. **Grace**: keep serving while load balancers notice readiness.
 2. **Total**: stop accepting connections and let in-flight requests finish.
-3. **Hard**: if any are still running, cancel them, close every connection,
-   stop their ffmpeg processes and wait this long for them to wind down.
-   `SHUTDOWN_HARD` must be at least `1s`, the time ffmpeg gets between
-   SIGTERM and SIGKILL. If requests are still running after it, the service
-   logs an error and exits with status 1.
+3. **Hard**: if any are still running, cancel them, close every connection
+   and wait this long for them to wind down. If requests are still running
+   after it, the service logs an error and exits with status 1.
 
 ## API
 
@@ -184,7 +180,7 @@ Every path also works without the `/v1` prefix.
 
 | Endpoint | Does |
 |---|---|
-| `POST /v1/audio/speech` | Text to speech. JSON: `input`, `voice`, `response_format` (`mp3` default, `opus`, `wav`, `pcm`; `aac` and `flac` are a 400 `unsupported response_format`), `speed` (0.25 to 4) |
+| `POST /v1/audio/speech` | Text to speech. JSON: `input`, `voice`, `response_format` (`mp3` default, `opus`, `wav`, `pcm`; `aac` and `flac` are a 400 `unsupported response_format`), `speed` (0.25 to 4, see below) |
 | `POST /v1/audio/transcriptions` | Speech to text. Multipart `file` (up to 25 MB and 20 minutes) in WAV (16-bit, 24-bit or float), Ogg Opus or MP3, mono or stereo at 8 to 48 kHz, decoded in Go to 16 kHz mono before transcribing. Anything else, FLAC, M4A, WebM, AAC and chained Ogg included, is a 400 `could not decode audio: unsupported audio format`; a damaged or empty file is a 400 `could not decode audio: corrupted audio`, and audio over 20 minutes a 400 `audio is longer than 20 minutes`. `response_format` `json`, `verbose_json` or `text` |
 | `GET /v1/models`, `GET /v1/audio/voices` | What's available |
 | `GET /health`, `GET /internal/liveness`, `GET /internal/readiness` | Health checks; readiness turns 503 while shutting down |
@@ -192,6 +188,12 @@ Every path also works without the `/v1` prefix.
 `pcm` is raw 16-bit little-endian mono at 24 kHz, as in OpenAI's API. `mp3`
 is 128 kbit/s mono at 24 kHz and `opus` is Ogg Opus at 24 kbit/s mono. The
 `model` field is accepted and ignored; the models come from your config.
+
+`speed` is applied by a built-in time-stretch (WSOLA), so the voice keeps its
+pitch and the reply still streams: audio starts after a few tens of
+milliseconds of speech rather than at the end. At speed 1 the samples are
+untouched. At slow speeds a reply can end up to 50 ms short of the exact
+stretched length, and one shorter than 20 ms is returned unstretched.
 
 Errors, unknown paths and wrong methods included, come back as JSON:
 `{"error":{"message":"…"}}`. A transcript over 1 MiB from the model is a 502.
@@ -204,10 +206,10 @@ go test ./...                     # no GPU or models needed
 golangci-lint run ./...
 ```
 
-The tests use `opusinfo` and `opusdec` from opus-tools and ffmpeg to decode
-the encoded replies, and skip those checks when the tools are missing. With
-ffmpeg on `PATH` or in `LLAMA_SWAP_VOICE_FFMPEG`, they also check that real
-ffmpeg changes speed while streaming.
+The service itself runs no external programs. opus-tools and ffmpeg are
+optional test oracles: some tests use `opusinfo` and `opusdec` from
+opus-tools and ffmpeg to decode the encoded replies independently, and skip
+those checks when the tools are missing.
 
 ## Licence
 

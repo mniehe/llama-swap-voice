@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -31,12 +30,13 @@ const (
 	pausedAudioBytes = speechRate / 2 * bytesPerSample
 	streamTimeout    = 3 * time.Second
 
+	stretchedSpeed           = 1.5
+	stretchedLengthTolerance = 0.02
+
 	// More than the Opus header pages, so the test needs encoded audio, not
 	// just headers, to leave while the upstream is paused.
-	earlyBytes        = 512
-	durationTolerance = 20 * time.Millisecond
-	disconnectRounds  = 100
-	pollInterval      = 10 * time.Millisecond
+	earlyBytes       = 512
+	disconnectRounds = 100
 
 	// The fixture is cut where it is mid-word, so its last 44 ms is speech.
 	speechTailSamples = 33600
@@ -167,17 +167,39 @@ func TestServer_HandleSpeech_StreamsWhileUpstreamPaused(t *testing.T) {
 	}
 }
 
-func TestServer_HandleSpeech_OpusAtSpeedStreamsThroughRealFFmpeg(t *testing.T) {
-	ffmpeg := requireTool(t, "ffmpeg")
-	samples := fixtureSamples(t)
+func TestServer_HandleSpeech_OpusAtSpeedStreamsWhileUpstreamPaused(t *testing.T) {
 	release := make(chan struct{})
-	h := newHarness(t, servePaused(t, streamedSpeech(t, samples), release), func(cfg *Config) { cfg.FFmpeg = ffmpeg })
+	h := newHarness(t, servePaused(t, streamedSpeech(t, fixtureSamples(t)), release))
 
 	resp, ogg := requireStreamedWhilePaused(t, h, release, map[string]any{"input": "hi", "response_format": "opus", "speed": 1.15})
-	assert.Equal(t, contentTypeOgg, resp.Header.Get("Content-Type"))
 
-	stretched := time.Duration(float64(samplesDuration(samples)) / 1.15)
-	assert.InDelta(t, stretched, samplesDuration(opusdecSamples(t, ogg)), float64(durationTolerance))
+	assert.Equal(t, contentTypeOgg, resp.Header.Get("Content-Type"))
+	assert.True(t, bytes.HasPrefix(ogg, []byte("OggS")), "want an Ogg stream")
+}
+
+func TestServer_HandleSpeech_WAVAtSpeedHasStretchedLength(t *testing.T) {
+	samples := fixtureSamples(t)
+	h := newHarness(t, serveBody(t, streamedSpeech(t, samples)))
+
+	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "wav", "speed": stretchedSpeed})
+	body := readBody(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	got := len(decodeWAV(t, body)) / bytesPerSample
+	want := float64(samples) / stretchedSpeed
+	t.Logf("wav at %g: %d samples from %d, want %.0f", stretchedSpeed, got, samples, want)
+	assert.InDelta(t, want, float64(got), want*stretchedLengthTolerance)
+}
+
+func decodeWAV(t *testing.T, wav []byte) []byte {
+	t.Helper()
+
+	pcm, err := audio.NewWAVReader(bytes.NewReader(wav))
+	require.NoError(t, err)
+	data, err := io.ReadAll(pcm)
+	require.NoError(t, err)
+
+	return data
 }
 
 func requireTool(t *testing.T, name string) string {
@@ -230,10 +252,6 @@ func opusdecSamples(t *testing.T, ogg []byte) int {
 	require.NoError(t, err)
 
 	return len(data) / bytesPerSample
-}
-
-func samplesDuration(samples int) time.Duration {
-	return time.Duration(samples) * time.Second / speechRate
 }
 
 func TestServer_HandleSpeech_OpusPassesOpusTools(t *testing.T) {
@@ -424,11 +442,7 @@ func speechWithin(t *testing.T, h *harness, timeout time.Duration, body map[stri
 	return resp, err
 }
 
-func reaped(pid int) bool {
-	return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
-}
-
-func TestServer_HandleSpeech_EncoderPanicReleasesUpstreamAndFFmpeg(t *testing.T) {
+func TestServer_HandleSpeech_EncoderPanicReleasesUpstream(t *testing.T) {
 	for _, speed := range []float64{normalSpeed, 1.5} {
 		t.Run(strconv.FormatFloat(speed, 'f', -1, 64), func(t *testing.T) {
 			panicFirstEncoder(t)
@@ -439,12 +453,6 @@ func TestServer_HandleSpeech_EncoderPanicReleasesUpstreamAndFFmpeg(t *testing.T)
 			require.Equal(t, http.StatusOK, resp.StatusCode)
 			_, err := io.ReadAll(resp.Body)
 			require.Error(t, err, "the panicking stream ended cleanly")
-
-			if speed != normalSpeed {
-				pid, ok := h.ffmpeg.PID()
-				require.True(t, ok, "ffmpeg did not start")
-				assert.Eventually(t, func() bool { return reaped(pid) }, waitTimeout, pollInterval, "ffmpeg %d was never waited for", pid)
-			}
 
 			next, err := speechWithin(t, h, streamTimeout, map[string]any{"input": "hi", "response_format": "pcm"})
 			require.NoError(t, err, "the panicked request kept its TTS slot")

@@ -166,7 +166,6 @@ func TestServer_HandleTranscription_OpusBecomes16kMonoWAV(t *testing.T) {
 	resp := h.transcribe(map[string]string{"response_format": "text"}, readFixture(t, "speech.opus"))
 
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(readBody(t, resp)))
-	assert.Nil(t, h.ffmpeg.Args(), "ffmpeg ran for a transcription")
 
 	call := h.upstream.lastCall()
 	assert.Equal(t, transcodedName, call.names["file"])
@@ -182,7 +181,6 @@ func TestServer_HandleTranscription_ReencodesWAV(t *testing.T) {
 	resp := h.transcribe(map[string]string{"response_format": "text"}, []byte(streamedWAV))
 
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(readBody(t, resp)))
-	assert.Nil(t, h.ffmpeg.Args(), "ffmpeg ran for a transcription")
 
 	call := h.upstream.lastCall()
 	assert.Equal(t, transcodedName, call.names["file"], "want the normalised WAV, not the upload")

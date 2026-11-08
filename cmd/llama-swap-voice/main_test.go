@@ -8,36 +8,34 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/mniehe/llama-swap-voice/internal/fakeffmpeg"
 	"github.com/mniehe/llama-swap-voice/internal/server"
-	"github.com/mniehe/llama-swap-voice/internal/transcode"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
 const (
 	probeTimeout = 3 * time.Second
 	probeEvery   = 10 * time.Millisecond
-	slowAudio    = "RIFF\xff\xff\xff\xffWAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\xff\xff\xff\xffslow audio"
+	wavHeader    = "RIFF\xff\xff\xff\xffWAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\xff\xff\xff\xff"
+	slowAudio    = wavHeader + "slow audio"
 
 	forcedTotal   = 200 * time.Millisecond
+	cancelledHard = time.Second
 	shutdownSlack = 500 * time.Millisecond
-)
 
-func TestMain(m *testing.M) {
-	fakeffmpeg.RunIfRequested()
-	os.Exit(m.Run())
-}
+	sampleBytes       = 2
+	halfSecondSamples = 12000
+	stretchedSpeed    = 1.5
+	lengthTolerance   = 0.02
+)
 
 func freePort(t *testing.T) int {
 	t.Helper()
@@ -55,13 +53,19 @@ func freePort(t *testing.T) int {
 func newService(t *testing.T, respond http.HandlerFunc) *server.Server {
 	t.Helper()
 
+	cfg := validConfig(t)
+	return serviceFor(t, &cfg, respond, &http.Client{})
+}
+
+func serviceFor(t *testing.T, cfg *ServiceConfig, respond http.HandlerFunc, httpClient *http.Client) *server.Server {
+	t.Helper()
+
 	fake := httptest.NewServer(respond)
 	t.Cleanup(fake.Close)
 
-	client, err := upstream.New(fake.URL, "tts", "asr", &http.Client{})
+	client, err := upstream.New(fake.URL, "tts", "asr", httpClient)
 	require.NoError(t, err)
 
-	cfg := validConfig(t)
 	serverCfg := cfg.serverConfig(map[string]string{"alice": filepath.Join(cfg.Voices.Dir, "alice.mp3")})
 	service, err := server.New(&serverCfg, client, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
@@ -160,50 +164,46 @@ func TestServe_Signal_DrainsInFlightRequest(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
-// stuckSpeech starts a speech request whose upstream never finishes, slowed
-// down by a fake ffmpeg that ignores SIGTERM, and returns once ffmpeg is
-// running. Only a speed change runs ffmpeg.
-func stuckSpeech(t *testing.T, cfg *ServiceConfig) (cancel context.CancelFunc, done <-chan error, pid int) {
+// stuckSpeech starts a speech request through service and returns once the
+// upstream reply has paused mid-body.
+func stuckSpeech(t *testing.T, cfg *ServiceConfig, service *server.Server, paused <-chan struct{}) (cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
 
-	fake := fakeffmpeg.Install(t)
-	fake.Stubborn(t)
-	cfg.Port = freePort(t)
 	base := "http://" + net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-
-	service := newService(t, func(w http.ResponseWriter, r *http.Request) {
-		_, err := io.WriteString(w, slowAudio)
-		assert.NoError(t, err)
-		assert.NoError(t, http.NewResponseController(w).Flush())
-		<-r.Context().Done()
-	})
-
 	cancel, done = startServe(t, cfg, service)
 	waitReady(t, base)
 
 	go func() {
-		_, err := postSpeechBody(t.Context(), base, `{"input":"hi","response_format":"mp3","speed":1.5}`)
+		_, err := postSpeechBody(t.Context(), base, `{"input":"hi","response_format":"mp3"}`)
 		assert.Error(t, err, "a cancelled stream must not end cleanly")
 	}()
 
-	require.Eventually(t, func() bool {
-		var ok bool
-		pid, ok = fake.PID()
-		return ok
-	}, probeTimeout, probeEvery, "ffmpeg never started")
+	select {
+	case <-paused:
+	case <-time.After(probeTimeout):
+		require.FailNow(t, "the upstream reply never started")
+	}
 
-	return cancel, done, pid
+	return cancel, done
 }
 
-func processGone(pid int) bool {
-	return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
-}
-
-func TestServe_StuckRequest_CancelsAndReapsFFmpeg(t *testing.T) {
+func TestServe_StuckRequest_IsCancelledWithinHard(t *testing.T) {
 	cfg := validConfig(t)
-	cfg.ShutdownTiming = ShutdownTimingConfig{Total: forcedTotal, Hard: 3 * transcode.KillDelay / 2}
+	cfg.Port = freePort(t)
+	cfg.ShutdownTiming = ShutdownTimingConfig{Total: forcedTotal, Hard: cancelledHard}
 
-	cancel, done, pid := stuckSpeech(t, &cfg)
+	paused := make(chan struct{})
+	upstreamCancelled := make(chan struct{})
+	service := serviceFor(t, &cfg, func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.WriteString(w, slowAudio)
+		assert.NoError(t, err)
+		assert.NoError(t, http.NewResponseController(w).Flush())
+		close(paused)
+		<-r.Context().Done()
+		close(upstreamCancelled)
+	}, &http.Client{})
+
+	cancel, done := stuckSpeech(t, &cfg, service, paused)
 	signalled := time.Now()
 	cancel()
 
@@ -215,14 +215,74 @@ func TestServe_StuckRequest_CancelsAndReapsFFmpeg(t *testing.T) {
 	}
 
 	assert.Less(t, time.Since(signalled), cfg.ShutdownTiming.Total+cfg.ShutdownTiming.Hard+shutdownSlack)
-	assert.True(t, processGone(pid), "ffmpeg %d outlived serve", pid)
+	select {
+	case <-upstreamCancelled:
+	case <-time.After(probeTimeout):
+		assert.Fail(t, "the upstream request outlived serve")
+	}
+}
+
+// stubbornBody sends audio, then ignores cancellation until release closes,
+// standing in for an upstream read that will not return.
+type stubbornBody struct {
+	audio   []byte
+	paused  chan<- struct{}
+	release <-chan struct{}
+}
+
+func (b *stubbornBody) Read(p []byte) (int, error) {
+	if len(b.audio) > 0 {
+		n := copy(p, b.audio)
+		b.audio = b.audio[n:]
+		return n, nil
+	}
+
+	if b.paused != nil {
+		close(b.paused)
+		b.paused = nil
+	}
+	<-b.release
+
+	return 0, io.EOF
+}
+
+func (*stubbornBody) Close() error {
+	return nil
+}
+
+type stubbornTransport struct {
+	body *stubbornBody
+}
+
+func (s stubbornTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		return nil, err
+	}
+
+	if err := r.Body.Close(); err != nil {
+		return nil, err
+	}
+
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"audio/wav"}},
+		Body:       s.body,
+		Request:    r,
+	}, nil
 }
 
 func TestServe_HandlersOutliveHard_ReturnsError(t *testing.T) {
 	cfg := validConfig(t)
+	cfg.Port = freePort(t)
 	cfg.ShutdownTiming = ShutdownTimingConfig{Total: forcedTotal, Hard: forcedTotal}
 
-	cancel, done, pid := stuckSpeech(t, &cfg)
+	paused := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	body := &stubbornBody{audio: []byte(slowAudio), paused: paused, release: release}
+	service := serviceFor(t, &cfg, http.NotFound, &http.Client{Transport: stubbornTransport{body: body}})
+
+	cancel, done := stuckSpeech(t, &cfg, service, paused)
 	cancel()
 
 	select {
@@ -232,8 +292,34 @@ func TestServe_HandlersOutliveHard_ReturnsError(t *testing.T) {
 	case <-time.After(cfg.ShutdownTiming.Total + cfg.ShutdownTiming.Hard + shutdownSlack):
 		require.Fail(t, "serve did not return within total+hard")
 	}
+}
 
-	assert.Eventually(t, func() bool { return processGone(pid) }, probeTimeout, probeEvery, "ffmpeg %d was never killed", pid)
+func TestServe_EmptyPATH_StartsAndStretchesSpeech(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv(envPrefix+"VOICES_DIR", voicesDir(t, "alice.mp3"))
+	t.Setenv(envPrefix+"VOICES_DEFAULT", "alice")
+
+	cfg, err := loadConfig()
+	require.NoError(t, err, "nothing on PATH must be needed to start")
+	cfg.Port = freePort(t)
+	base := "http://" + net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+
+	silence := wavHeader + strings.Repeat("\x00", halfSecondSamples*sampleBytes)
+	service := serviceFor(t, &cfg, func(w http.ResponseWriter, _ *http.Request) {
+		_, writeErr := io.WriteString(w, silence)
+		assert.NoError(t, writeErr)
+	}, &http.Client{})
+
+	cancel, done := startServe(t, &cfg, service)
+	waitReady(t, base)
+
+	pcm, err := postSpeechBody(t.Context(), base, `{"input":"hi","response_format":"pcm","speed":1.5}`)
+	require.NoError(t, err)
+	want := halfSecondSamples / stretchedSpeed
+	assert.InDelta(t, want, float64(len(pcm)/sampleBytes), want*lengthTolerance)
+
+	cancel()
+	require.NoError(t, <-done)
 }
 
 func TestServe_PortInUse_ReturnsError(t *testing.T) {
