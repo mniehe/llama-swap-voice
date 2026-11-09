@@ -154,17 +154,21 @@ Everything is set with environment variables. Only the default voice is required
 | `TTS_MAXINPUTCHARS` | `4096` | Longest text accepted per request |
 | `ASR_PREFIXREGEX` | `^language \w+<asr_text>` | Removed from the start of each transcript |
 | `REQUEST_TIMEOUT` | `2m` | Longest a speech or transcription request may take, streaming included. Every other endpoint gets 10 seconds |
-| `REQUEST_MAXCONCURRENT` | `4` | Requests handled at once; more get a 503 |
+| `REQUEST_MAXCONCURRENT` | `4` | Transcriptions handled at once; more get a 503 |
+| `REQUEST_MAXCONCURRENTTTS` | `8` | Speech requests handled at once, queued ones included; more get a 503 |
 | `LOG_LEVEL`, `LOG_FORMAT` | `info`, `json` | `debug`/`info`/`warn`/`error`; `json`/`console` |
 | `SHUTDOWN_GRACE`, `SHUTDOWN_TOTAL`, `SHUTDOWN_HARD` | `0s`, `15s`, `3s` | How shutdown unfolds; see below |
 
 If anything is wrong at startup, it lists every problem at once and exits.
 
-**Concurrent requests.** Speech requests beyond `UPSTREAM_TTSCONCURRENCY`
-wait their turn in arrival order, for up to `REQUEST_TIMEOUT`, and still count
-towards `REQUEST_MAXCONCURRENT`. One that is still waiting when the timeout
-ends gets a 504. `UPSTREAM_TTSCONCURRENCY` must not exceed llama-swap's
-`concurrencyLimit` or llama-server's `-np` for the TTS model.
+**Concurrent requests.** Speech requests count against
+`REQUEST_MAXCONCURRENTTTS` and transcriptions against `REQUEST_MAXCONCURRENT`,
+so queued speech never turns a transcription away. Each gets a 503 beyond its
+own limit. An admitted speech request beyond `UPSTREAM_TTSCONCURRENCY` waits
+its turn in arrival order, for up to `REQUEST_TIMEOUT`, and keeps its
+`REQUEST_MAXCONCURRENTTTS` place while it waits. One that is still waiting
+when the timeout ends gets a 504. `UPSTREAM_TTSCONCURRENCY` must not exceed
+llama-swap's `concurrencyLimit` or llama-server's `-np` for the TTS model.
 
 On SIGTERM or SIGINT, readiness turns 503 and shutdown runs in three steps:
 

@@ -61,8 +61,9 @@ type ASRConfig struct {
 }
 
 type RequestConfig struct {
-	Timeout       time.Duration `koanf:"timeout"`
-	MaxConcurrent int           `koanf:"maxconcurrent"`
+	Timeout          time.Duration `koanf:"timeout"`
+	MaxConcurrent    int           `koanf:"maxconcurrent"`
+	MaxConcurrentTTS int           `koanf:"maxconcurrenttts"`
 }
 
 type LoggerConfig struct {
@@ -96,8 +97,9 @@ var defaultConfig = ServiceConfig{
 		PrefixRegex: `^language \w+<asr_text>`,
 	},
 	Request: RequestConfig{
-		Timeout:       2 * time.Minute,
-		MaxConcurrent: 4,
+		Timeout:          2 * time.Minute,
+		MaxConcurrent:    4,
+		MaxConcurrentTTS: 8,
 	},
 	Logger: LoggerConfig{
 		Level:  observability.LevelInfo,
@@ -181,6 +183,10 @@ func (c *ServiceConfig) validateLimits() error {
 		errs = append(errs, fmt.Errorf("request.maxconcurrent must be positive, got %d", c.Request.MaxConcurrent))
 	}
 
+	if c.Request.MaxConcurrentTTS <= 0 {
+		errs = append(errs, fmt.Errorf("request.maxconcurrenttts must be positive, got %d", c.Request.MaxConcurrentTTS))
+	}
+
 	if c.Request.Timeout <= 0 {
 		errs = append(errs, fmt.Errorf("request.timeout must be positive, got %s", c.Request.Timeout))
 	}
@@ -226,15 +232,16 @@ func (c *ServiceConfig) validateShutdown() error {
 
 func (c *ServiceConfig) serverConfig(voiceFiles map[string]string) server.Config {
 	return server.Config{
-		TTSModel:       c.Upstream.TTSModel,
-		ASRModel:       c.Upstream.ASRModel,
-		Voices:         voiceFiles,
-		DefaultVoice:   c.Voices.Default,
-		Lang:           c.TTS.Lang,
-		RequestTimeout: c.Request.Timeout,
-		MaxInputChars:  c.TTS.MaxInputChars,
-		MaxConcurrent:  c.Request.MaxConcurrent,
-		TTSConcurrency: c.Upstream.TTSConcurrency,
-		ASRPrefixRegex: c.ASR.PrefixRegex,
+		TTSModel:         c.Upstream.TTSModel,
+		ASRModel:         c.Upstream.ASRModel,
+		Voices:           voiceFiles,
+		DefaultVoice:     c.Voices.Default,
+		Lang:             c.TTS.Lang,
+		RequestTimeout:   c.Request.Timeout,
+		MaxInputChars:    c.TTS.MaxInputChars,
+		MaxConcurrent:    c.Request.MaxConcurrent,
+		MaxConcurrentTTS: c.Request.MaxConcurrentTTS,
+		TTSConcurrency:   c.Upstream.TTSConcurrency,
+		ASRPrefixRegex:   c.ASR.PrefixRegex,
 	}
 }

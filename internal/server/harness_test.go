@@ -106,6 +106,20 @@ func (f *fakeUpstream) lastCall() upstreamCall {
 	return f.calls[len(f.calls)-1]
 }
 
+func (f *fakeUpstream) callsTo(path string) []upstreamCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var matched []upstreamCall
+	for _, call := range f.calls {
+		if call.path == path {
+			matched = append(matched, call)
+		}
+	}
+
+	return matched
+}
+
 func (f *fakeUpstream) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -130,15 +144,16 @@ func newHarness(t *testing.T, respond http.HandlerFunc, tweak ...func(*Config)) 
 
 	h := &harness{t: t, upstream: newFakeUpstream(t, respond)}
 	h.cfg = Config{
-		TTSModel:       ttsModel,
-		ASRModel:       asrModel,
-		Voices:         map[string]string{"alice": alice, "bm_fable": alice, "narrator": narrator},
-		DefaultVoice:   "alice",
-		Lang:           "en",
-		RequestTimeout: harnessTimeout,
-		MaxInputChars:  harnessMaxChars,
-		MaxConcurrent:  4,
-		TTSConcurrency: 1,
+		TTSModel:         ttsModel,
+		ASRModel:         asrModel,
+		Voices:           map[string]string{"alice": alice, "bm_fable": alice, "narrator": narrator},
+		DefaultVoice:     "alice",
+		Lang:             "en",
+		RequestTimeout:   harnessTimeout,
+		MaxInputChars:    harnessMaxChars,
+		MaxConcurrent:    4,
+		MaxConcurrentTTS: 8,
+		TTSConcurrency:   1,
 	}
 
 	for _, apply := range tweak {
@@ -182,20 +197,28 @@ func (h *harness) speech(path string, body any) *http.Response {
 func (h *harness) transcribe(fields map[string]string, audio []byte) *http.Response {
 	h.t.Helper()
 
+	contentType, body := transcriptionForm(h.t, fields, audio)
+
+	return h.post(transcriptionPath, contentType, bytes.NewReader(body))
+}
+
+func transcriptionForm(t *testing.T, fields map[string]string, audio []byte) (contentType string, body []byte) {
+	t.Helper()
+
 	buf := &bytes.Buffer{}
 	form := multipart.NewWriter(buf)
 	part, err := form.CreateFormFile("file", "clip.wav")
-	require.NoError(h.t, err)
+	require.NoError(t, err)
 
 	_, err = part.Write(audio)
-	require.NoError(h.t, err)
+	require.NoError(t, err)
 
 	for key, value := range fields {
-		require.NoError(h.t, form.WriteField(key, value))
+		require.NoError(t, form.WriteField(key, value))
 	}
-	require.NoError(h.t, form.Close())
+	require.NoError(t, form.Close())
 
-	return h.post("/v1/audio/transcriptions", form.FormDataContentType(), buf)
+	return form.FormDataContentType(), buf.Bytes()
 }
 
 func (h *harness) post(path, contentType string, body io.Reader) *http.Response {

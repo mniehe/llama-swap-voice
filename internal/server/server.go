@@ -25,16 +25,17 @@ var routePrefixes = []string{"/v1", ""}
 var errBusy = errors.New("too many concurrent requests, retry shortly")
 
 type Config struct {
-	TTSModel       string
-	ASRModel       string
-	Voices         map[string]string
-	DefaultVoice   string
-	Lang           string
-	RequestTimeout time.Duration
-	MaxInputChars  int
-	MaxConcurrent  int
-	TTSConcurrency int
-	ASRPrefixRegex string
+	TTSModel         string
+	ASRModel         string
+	Voices           map[string]string
+	DefaultVoice     string
+	Lang             string
+	RequestTimeout   time.Duration
+	MaxInputChars    int
+	MaxConcurrent    int
+	MaxConcurrentTTS int
+	TTSConcurrency   int
+	ASRPrefixRegex   string
 }
 
 type Server struct {
@@ -43,6 +44,7 @@ type Server struct {
 	prefix         *regexp.Regexp
 	voices         []string
 	slots          chan struct{}
+	ttsSlots       chan struct{}
 	ttsGate        *ttsGate
 	log            *slog.Logger
 	shuttingDown   atomic.Bool
@@ -62,6 +64,7 @@ func New(cfg *Config, client *upstream.Client, log *slog.Logger) (*Server, error
 		prefix:         prefix,
 		voices:         voiceNames(cfg.Voices),
 		slots:          make(chan struct{}, cfg.MaxConcurrent),
+		ttsSlots:       make(chan struct{}, cfg.MaxConcurrentTTS),
 		ttsGate:        newTTSGate(cfg.TTSConcurrency),
 		log:            log,
 		controlTimeout: controlRequestTimeout,
@@ -81,8 +84,8 @@ func (s *Server) routes() []route {
 		{http.MethodGet, "/internal/readiness", s.handleReadiness},
 	}
 	api := []route{
-		{http.MethodPost, "/audio/speech", s.limited(s.handleSpeech)},
-		{http.MethodPost, "/audio/transcriptions", s.limited(s.handleTranscription)},
+		{http.MethodPost, "/audio/speech", s.limited(s.ttsSlots, s.handleSpeech)},
+		{http.MethodPost, "/audio/transcriptions", s.limited(s.slots, s.handleTranscription)},
 		{http.MethodGet, "/models", s.handleModels},
 		{http.MethodGet, "/audio/voices", s.handleVoices},
 	}
@@ -156,18 +159,18 @@ func (s *Server) bounded(next http.Handler) http.Handler {
 
 // The request context ends at deadline, so writes get responseWriteSlack
 // longer: otherwise the 504 a timeout produces never reaches the client.
-func (s *Server) limited(next http.HandlerFunc) http.HandlerFunc {
+func (s *Server) limited(slots chan struct{}, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		deadline := time.Now().Add(s.cfg.RequestTimeout)
 		s.setDeadlines(w, deadline, deadline.Add(responseWriteSlack))
 
 		select {
-		case s.slots <- struct{}{}:
+		case slots <- struct{}{}:
 		default:
 			s.reject(w, errBusy)
 			return
 		}
-		defer func() { <-s.slots }()
+		defer func() { <-slots }()
 
 		ctx, cancel := context.WithDeadline(r.Context(), deadline)
 		defer cancel()

@@ -104,24 +104,25 @@ func TestServiceConfig_Validate_EmptyPrefixRegexIsAllowed(t *testing.T) {
 
 func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 	env := map[string]string{
-		"HOST":                    "0.0.0.0",
-		"PORT":                    "9001",
-		"UPSTREAM_URL":            "https://llama.example:8443",
-		"UPSTREAM_TTSMODEL":       "tts-alt",
-		"UPSTREAM_ASRMODEL":       "asr-alt",
-		"UPSTREAM_TTSCONCURRENCY": "3",
-		"VOICES_DIR":              "/srv/voices",
-		"VOICES_DEFAULT":          "bm_fable",
-		"TTS_LANG":                "de",
-		"TTS_MAXINPUTCHARS":       "512",
-		"ASR_PREFIXREGEX":         "^x",
-		"REQUEST_TIMEOUT":         "45s",
-		"REQUEST_MAXCONCURRENT":   "2",
-		"LOG_LEVEL":               "debug",
-		"LOG_FORMAT":              "console",
-		"SHUTDOWN_TOTAL":          "20s",
-		"SHUTDOWN_GRACE":          "5s",
-		"SHUTDOWN_HARD":           "1s",
+		"HOST":                     "0.0.0.0",
+		"PORT":                     "9001",
+		"UPSTREAM_URL":             "https://llama.example:8443",
+		"UPSTREAM_TTSMODEL":        "tts-alt",
+		"UPSTREAM_ASRMODEL":        "asr-alt",
+		"UPSTREAM_TTSCONCURRENCY":  "3",
+		"VOICES_DIR":               "/srv/voices",
+		"VOICES_DEFAULT":           "bm_fable",
+		"TTS_LANG":                 "de",
+		"TTS_MAXINPUTCHARS":        "512",
+		"ASR_PREFIXREGEX":          "^x",
+		"REQUEST_TIMEOUT":          "45s",
+		"REQUEST_MAXCONCURRENT":    "2",
+		"REQUEST_MAXCONCURRENTTTS": "6",
+		"LOG_LEVEL":                "debug",
+		"LOG_FORMAT":               "console",
+		"SHUTDOWN_TOTAL":           "20s",
+		"SHUTDOWN_GRACE":           "5s",
+		"SHUTDOWN_HARD":            "1s",
 	}
 	for key, value := range env {
 		t.Setenv(envPrefix+key, value)
@@ -137,7 +138,7 @@ func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 		Voices:         VoicesConfig{Dir: "/srv/voices", Default: "bm_fable"},
 		TTS:            TTSConfig{Lang: "de", MaxInputChars: 512},
 		ASR:            ASRConfig{PrefixRegex: "^x"},
-		Request:        RequestConfig{Timeout: 45 * time.Second, MaxConcurrent: 2},
+		Request:        RequestConfig{Timeout: 45 * time.Second, MaxConcurrent: 2, MaxConcurrentTTS: 6},
 		Logger:         LoggerConfig{Level: "debug", Format: "console"},
 		ShutdownTiming: ShutdownTimingConfig{Total: 20 * time.Second, Grace: 5 * time.Second, Hard: time.Second},
 	}, cfg)
@@ -163,10 +164,27 @@ func TestLoadConfig_NoEnvironment_ReturnsDefaults(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, defaultConfig, cfg)
 	assert.Equal(t, 1, cfg.Upstream.TTSConcurrency)
+	assert.Equal(t, 8, cfg.Request.MaxConcurrentTTS)
+}
+
+func TestLoadConfig_NonPositiveMaxConcurrentTTS_FailsStartup(t *testing.T) {
+	for _, value := range []string{"0", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv(envPrefix+"VOICES_DIR", voicesDir(t, "alice.mp3"))
+			t.Setenv(envPrefix+"VOICES_DEFAULT", "alice")
+			t.Setenv(envPrefix+"REQUEST_MAXCONCURRENTTTS", value)
+
+			_, err := loadConfig()
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "request.maxconcurrenttts must be positive, got "+value)
+		})
+	}
 }
 
 func TestServiceConfig_ServerConfig_CopiesSettings(t *testing.T) {
 	cfg := validConfig(t)
+	cfg.Request.MaxConcurrentTTS = 6
 	voiceFiles := map[string]string{"alice": "/voices/alice.mp3"}
 
 	got := cfg.serverConfig(voiceFiles)
@@ -179,6 +197,7 @@ func TestServiceConfig_ServerConfig_CopiesSettings(t *testing.T) {
 	assert.Equal(t, cfg.Request.Timeout, got.RequestTimeout)
 	assert.Equal(t, cfg.TTS.MaxInputChars, got.MaxInputChars)
 	assert.Equal(t, cfg.Request.MaxConcurrent, got.MaxConcurrent)
+	assert.Equal(t, cfg.Request.MaxConcurrentTTS, got.MaxConcurrentTTS)
 	assert.Equal(t, cfg.Upstream.TTSConcurrency, got.TTSConcurrency)
 	assert.Equal(t, cfg.ASR.PrefixRegex, got.ASRPrefixRegex)
 }

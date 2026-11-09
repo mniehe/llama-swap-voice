@@ -1,12 +1,15 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +26,7 @@ const (
 	shortDeadline     = 300 * time.Millisecond
 	deadlineSlack     = 700 * time.Millisecond
 	stalledBodyLength = "100\r\n\r\n"
+	transcriptionPath = "/v1/audio/transcriptions"
 )
 
 func readUntilClosed(t *testing.T, conn net.Conn) (string, time.Duration) {
@@ -68,7 +72,7 @@ func postStatus(t *testing.T, url, body string) int {
 	return resp.StatusCode
 }
 
-func TestServer_Limited_MaxConcurrentIs503(t *testing.T) {
+func TestServer_Limited_MaxConcurrentTTSIs503(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
@@ -79,7 +83,7 @@ func TestServer_Limited_MaxConcurrentIs503(t *testing.T) {
 		case <-time.After(stuckTimeout):
 		}
 		serveWAV(t)(w, r)
-	}, func(cfg *Config) { cfg.MaxConcurrent = 1 })
+	}, func(cfg *Config) { cfg.MaxConcurrentTTS = 1 })
 
 	firstDone := make(chan int, 1)
 	go func() {
@@ -100,9 +104,164 @@ func TestServer_Limited_MaxConcurrentIs503(t *testing.T) {
 	assert.Equal(t, http.StatusOK, <-firstDone)
 }
 
+func requireBusy(t *testing.T, resp *http.Response) {
+	t.Helper()
+
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	assert.Equal(t, errBusy.Error(), errorMessage(t, resp))
+	assert.True(t, resp.Close, "want Connection: close on a rejected request")
+}
+
+// waitInGate fails with the reply of a speech request that ended instead of
+// reaching its place in the gate.
+func waitInGate(t *testing.T, placed func() bool, reply <-chan speechResult) {
+	t.Helper()
+
+	deadline := time.After(waitTimeout)
+	for !placed() {
+		select {
+		case got := <-reply:
+			require.FailNow(t, "a speech request ended before its gate turn", "status %d: %s", got.status, got.body)
+		case <-deadline:
+			require.FailNow(t, "a speech request never reached its place in the gate")
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func inputsOf(calls []upstreamCall) []string {
+	inputs := make([]string, 0, len(calls))
+	for _, call := range calls {
+		inputs = append(inputs, call.fields["input"])
+	}
+
+	return inputs
+}
+
+func TestServer_Limited_QueuedSpeechLeavesTranscriptionSlots(t *testing.T) {
+	const speechSlots = 8
+	release := make(chan struct{})
+	paused := servePaused(t, streamedSpeech(t, fixtureSamples(t)), release)
+	transcript := serveTranscript(t, transcriptText)
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == asrRoute {
+			transcript(w, r)
+			return
+		}
+		paused(w, r)
+	}, func(cfg *Config) { cfg.MaxConcurrentTTS = speechSlots })
+
+	var wg sync.WaitGroup
+	t.Cleanup(wg.Wait)
+	releaseAll := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseAll)
+
+	gate := h.service.ttsGate
+	inputs := make([]string, speechSlots)
+	replies := make([]chan speechResult, speechSlots)
+	for i := range speechSlots {
+		inputs[i] = fmt.Sprintf("sentence %d", i)
+		replies[i] = make(chan speechResult, 1)
+		wg.Go(func() { replies[i] <- sendSpeech(t, h, inputs[i], "wav") })
+
+		placed := func() bool { return gate.queued() == i }
+		if i == 0 {
+			placed = func() bool { return len(h.upstream.callsTo(ttsRoute)) == 1 }
+		}
+		waitInGate(t, placed, replies[i])
+	}
+
+	resp := h.transcribe(nil, []byte(streamedWAV))
+	body := string(readBody(t, resp))
+	require.Equal(t, http.StatusOK, resp.StatusCode, "a transcription was refused while speech waited: %s", body)
+	assert.Contains(t, body, transcriptText)
+
+	ninth := h.speech(speechPath, map[string]any{"input": "sentence 8", "response_format": "wav"})
+	requireBusy(t, ninth)
+	assert.Equal(t, speechSlots-1, gate.queued(), "the rejected speech request joined the gate")
+	assert.Len(t, h.upstream.callsTo(ttsRoute), 1, "the rejected speech request reached the upstream")
+
+	releaseAll()
+	for i, reply := range replies {
+		got := <-reply
+		require.NoError(t, got.err, inputs[i])
+		assert.Equal(t, http.StatusOK, got.status, "%s: %s", inputs[i], got.body)
+	}
+	assert.Equal(t, inputs, inputsOf(h.upstream.callsTo(ttsRoute)))
+	assert.Equal(t, 1, gate.available(), "a finished speech request kept its TTS slot")
+}
+
+// transcriptionStatus runs off the test goroutine, so it reports failures
+// without stopping the test.
+func transcriptionStatus(t *testing.T, h *harness, contentType string, body []byte) int {
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, h.server.URL+transcriptionPath, bytes.NewReader(body))
+	if !assert.NoError(t, err) {
+		return 0
+	}
+	req.Header.Set("Content-Type", contentType)
+
+	resp, err := http.DefaultClient.Do(req)
+	if !assert.NoError(t, err) {
+		return 0
+	}
+	closeQuietly(t, resp.Body)
+
+	return resp.StatusCode
+}
+
+func TestServer_Limited_HeldTranscriptionsLeaveSpeechSlots(t *testing.T) {
+	const transcriptionSlots = 4
+	release := make(chan struct{})
+	transcript := serveTranscript(t, transcriptText)
+	speech := serveWAV(t)
+	h := newHarness(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != asrRoute {
+			speech(w, r)
+			return
+		}
+
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		transcript(w, r)
+	}, func(cfg *Config) { cfg.MaxConcurrent = transcriptionSlots })
+
+	var wg sync.WaitGroup
+	t.Cleanup(wg.Wait)
+	releaseAll := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseAll)
+
+	contentType, form := transcriptionForm(t, nil, []byte(streamedWAV))
+	statuses := make(chan int, transcriptionSlots)
+	for range transcriptionSlots {
+		wg.Go(func() { statuses <- transcriptionStatus(t, h, contentType, form) })
+	}
+	require.Eventually(t, func() bool { return len(h.upstream.callsTo(asrRoute)) == transcriptionSlots }, waitTimeout, time.Millisecond,
+		"the transcriptions never all reached the upstream")
+
+	resp := h.speech(speechPath, map[string]any{"input": "hello", "response_format": "wav"})
+	require.Equal(t, http.StatusOK, resp.StatusCode, "a speech request was refused while transcriptions ran: %s", readBody(t, resp))
+
+	fifth := h.post(transcriptionPath, contentType, bytes.NewReader(form))
+	requireBusy(t, fifth)
+	assert.Len(t, h.upstream.callsTo(asrRoute), transcriptionSlots, "the rejected transcription reached the upstream")
+
+	releaseAll()
+	wg.Wait()
+	close(statuses)
+
+	var got []int
+	for status := range statuses {
+		got = append(got, status)
+	}
+	assert.Equal(t, slices.Repeat([]int{http.StatusOK}, transcriptionSlots), got)
+}
+
 func TestServer_Limited_StalledBodyReleasesSlot(t *testing.T) {
 	h := newHarness(t, serveWAV(t), func(cfg *Config) {
-		cfg.MaxConcurrent = 1
+		cfg.MaxConcurrentTTS = 1
 		cfg.RequestTimeout = 200 * time.Millisecond
 	})
 
@@ -130,7 +289,7 @@ func TestServer_Limited_NonReadingClientReleasesSlot(t *testing.T) {
 			}
 		}
 	}, func(cfg *Config) {
-		cfg.MaxConcurrent = 1
+		cfg.MaxConcurrentTTS = 1
 		cfg.RequestTimeout = 300 * time.Millisecond
 	})
 
@@ -152,7 +311,7 @@ func TestServer_Limited_BusyStalledBodyEndsAtDeadline(t *testing.T) {
 		once.Do(func() { close(started) })
 		<-r.Context().Done()
 	}, func(cfg *Config) {
-		cfg.MaxConcurrent = 1
+		cfg.MaxConcurrentTTS = 1
 		cfg.RequestTimeout = shortDeadline
 	})
 
