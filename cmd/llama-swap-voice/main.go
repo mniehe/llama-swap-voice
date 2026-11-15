@@ -66,7 +66,7 @@ func run(cfg *ServiceConfig, logger *slog.Logger) error {
 		return err
 	}
 
-	client, err := upstream.New(cfg.Upstream.URL, cfg.Upstream.TTSModel, cfg.Upstream.ASRModel, &http.Client{})
+	client, err := upstream.New(cfg.Upstream.URL, cfg.Upstream.TTSModel, cfg.Upstream.ASRModel, &http.Client{}, upstream.WithBackend(cfg.Upstream.TTSBackend))
 	if err != nil {
 		return err
 	}

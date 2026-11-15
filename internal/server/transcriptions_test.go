@@ -314,6 +314,16 @@ func TestServer_HandleTranscription_Upstream5xxIsJSONError(t *testing.T) {
 	assert.Contains(t, errorMessage(t, resp), "asr unavailable")
 }
 
+func TestServer_HandleTranscription_UpstreamRedirectIs502WithoutFollowing(t *testing.T) {
+	h := newHarness(t, redirectToSelf)
+
+	resp := h.transcribe(map[string]string{"response_format": "text"}, []byte(streamedWAV))
+
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	assert.Contains(t, errorMessage(t, resp), "upstream returned 307")
+	assert.Equal(t, 1, h.upstream.callCount())
+}
+
 func TestServer_HandleTranscription_RejectsBadRequests(t *testing.T) {
 	h := newHarness(t, serveTranscript(t, transcriptText))
 
@@ -363,17 +373,20 @@ func (b *logBuffer) find(t *testing.T, level slog.Level, requestID string) map[s
 	return nil
 }
 
-// logTo rebuilds the harness's service around a logger that writes to logs,
-// so a test can assert on what the server logged.
+// logTo points the harness's service at a logger that writes to logs, so a
+// test can assert on what the server logged.
 func (h *harness) logTo(logs *logBuffer) {
-	h.t.Helper()
+	h.service.log = slog.New(slog.NewJSONHandler(logs, nil))
+}
 
-	client, err := upstream.New(h.upstream.server.URL, ttsModel, asrModel, &http.Client{})
-	require.NoError(h.t, err)
+func TestHarness_LogTo_KeepsBackend(t *testing.T) {
+	h := newBackendHarness(t, upstream.QwenTTS, serveWAV(t))
+	h.logTo(&logBuffer{})
 
-	h.service, err = New(&h.cfg, client, slog.New(slog.NewJSONHandler(logs, nil)))
-	require.NoError(h.t, err)
+	resp := h.speech(speechPath, map[string]any{"voice": "alice", "input": "hello"})
 
-	h.server = httptest.NewServer(h.service.Handler())
-	h.t.Cleanup(h.server.Close)
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(readBody(t, resp)))
+	call := h.upstream.lastCall()
+	assert.Equal(t, qwenTTSRoute, call.path)
+	assert.Equal(t, contentTypeJSON, call.contentType)
 }

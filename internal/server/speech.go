@@ -75,7 +75,8 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	rec.voice = job.voice
 	rec.format = job.format
 
-	reply, err := s.synthesize(r.Context(), upstream.Speech{
+	reply, err := s.synthesize(r.Context(), &upstream.Speech{
+		Voice:      job.voice,
 		Input:      job.input,
 		Lang:       s.cfg.Lang,
 		SpeakerRef: job.voicePath,
@@ -87,10 +88,14 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	}
 	rec.upstreamStatus = reply.Status
 
+	if reply.Retried {
+		s.log.Info("upstream speech retried", slog.String("request_id", rec.id))
+	}
+
 	s.encoded(w, r, reply, &job)
 }
 
-func (s *Server) synthesize(ctx context.Context, speech upstream.Speech) (*upstream.Audio, error) {
+func (s *Server) synthesize(ctx context.Context, speech *upstream.Speech) (*upstream.Audio, error) {
 	if err := s.ttsGate.acquire(ctx); err != nil {
 		return nil, fmt.Errorf("waiting for a free TTS slot: %w", err)
 	}

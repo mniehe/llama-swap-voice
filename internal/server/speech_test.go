@@ -5,19 +5,25 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
 const (
 	upstreamHeaderBytes = len(upstreamHeader)
 	mp3FrameSync        = "\xff\xf3"
+	queueFull           = `{"error":{"message":"queue full"}}`
 )
 
 func TestServer_HandleSpeech_MapsVoiceToReferenceFile(t *testing.T) {
@@ -281,4 +287,173 @@ func TestSpeechPCM_SpeedOutsideStretcherRangeIsInternalError(t *testing.T) {
 	assert.Nil(t, pcm)
 	assert.Equal(t, http.StatusInternalServerError, status)
 	assert.Contains(t, err.Error(), "between 0.25 and 4")
+}
+
+func TestServer_HandleSpeech_QwenTTSSendsVoiceNameAsJSON(t *testing.T) {
+	h := newBackendHarness(t, upstream.QwenTTS, serveWAV(t), func(cfg *Config) {
+		cfg.Voices["robbie"] = filepath.Join(t.TempDir(), "never-created.wav")
+	})
+
+	resp := h.speech(speechPath, map[string]any{"voice": "robbie", "input": "hello"})
+	body := readBody(t, resp)
+
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	assert.True(t, strings.HasPrefix(string(body), mp3FrameSync), "want MP3 audio")
+	call := h.upstream.lastCall()
+	assert.Equal(t, qwenTTSRoute, call.path)
+	assert.Equal(t, contentTypeJSON, call.contentType)
+	assert.Equal(t, map[string]any{"voice": "robbie", "input": "hello", "response_format": "wav"}, call.json)
+	assert.Empty(t, call.fields, "want no multipart fields")
+	assert.Empty(t, call.files, "want no multipart files")
+}
+
+func answerEnvelope(t *testing.T, code int, retryAfter string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		if retryAfter != "" {
+			w.Header().Set(retryAfterHeader, retryAfter)
+		}
+		w.Header().Set("Content-Type", contentTypeJSON)
+		w.WriteHeader(code)
+		writeOrFail(t, w, queueFull)
+	}
+}
+
+func TestServer_HandleSpeech_UpstreamErrorEnvelopeIsDecoded(t *testing.T) {
+	tests := []struct {
+		code       int
+		retryAfter string
+	}{
+		{http.StatusServiceUnavailable, "5"},
+		{http.StatusBadRequest, ""},
+		{http.StatusRequestEntityTooLarge, ""},
+		{http.StatusInternalServerError, ""},
+	}
+
+	for _, backend := range []upstream.Backend{upstream.LlamaCPP, upstream.QwenTTS} {
+		for _, tt := range tests {
+			t.Run(string(backend)+"/"+strconv.Itoa(tt.code), func(t *testing.T) {
+				h := newBackendHarness(t, backend, answerEnvelope(t, tt.code, tt.retryAfter))
+
+				resp := h.speech(speechPath, map[string]any{"input": "hi"})
+
+				require.Equal(t, tt.code, resp.StatusCode)
+				assert.Equal(t, tt.retryAfter, resp.Header.Get(retryAfterHeader))
+				message := errorMessage(t, resp)
+				assert.Contains(t, message, "queue full")
+				assert.NotContains(t, message, `{"error"`)
+				assert.Equal(t, 1, h.upstream.callCount())
+			})
+		}
+	}
+}
+
+func dropConnection(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		conn, _, err := http.NewResponseController(w).Hijack()
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.NoError(t, conn.Close())
+	}
+}
+
+func answerStatus(code int) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, http.StatusText(code), code)
+	}
+}
+
+// inTurn answers the first request with first and every later one with rest.
+func inTurn(first, rest http.HandlerFunc) http.HandlerFunc {
+	var calls atomic.Int32
+	return func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			first(w, r)
+			return
+		}
+		rest(w, r)
+	}
+}
+
+func TestServer_HandleSpeech_RetriesOnceBeforeAudio(t *testing.T) {
+	tests := map[string]struct {
+		respond  func(t *testing.T) http.HandlerFunc
+		wantCode int
+	}{
+		"dropped connection then audio": {func(t *testing.T) http.HandlerFunc { return inTurn(dropConnection(t), serveWAV(t)) }, http.StatusOK},
+		"502 then audio":                {func(t *testing.T) http.HandlerFunc { return inTurn(answerStatus(http.StatusBadGateway), serveWAV(t)) }, http.StatusOK},
+		"502 twice":                     {func(*testing.T) http.HandlerFunc { return answerStatus(http.StatusBadGateway) }, http.StatusBadGateway},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, tt.respond(t))
+
+			resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "pcm"})
+			body := readBody(t, resp)
+
+			require.Equal(t, tt.wantCode, resp.StatusCode, string(body))
+			assert.Len(t, h.upstream.callsTo(ttsRoute), 2)
+			if tt.wantCode == http.StatusOK {
+				assert.Equal(t, upstreamAudio[upstreamHeaderBytes:], string(body))
+			}
+		})
+	}
+}
+
+func TestServer_HandleSpeech_RetryIsLoggedWithRequestID(t *testing.T) {
+	h := newHarness(t, inTurn(answerStatus(http.StatusBadGateway), serveWAV(t)))
+	logs := &logBuffer{}
+	h.logTo(logs)
+
+	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "pcm"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	readBody(t, resp)
+
+	line := logs.find(t, slog.LevelInfo, resp.Header.Get(requestIDHeader))
+	assert.Equal(t, "upstream speech retried", line["msg"])
+}
+
+func TestServer_HandleSpeech_StreamBrokenAfterAudioIsNotRetried(t *testing.T) {
+	const promisedBytes = 100000
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", contentTypeWAV)
+		w.Header().Set("Content-Length", strconv.Itoa(promisedBytes))
+		writeOrFail(t, w, upstreamAudio)
+	})
+	logs := &logBuffer{}
+	h.logTo(logs)
+
+	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "pcm"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	_, err := io.ReadAll(resp.Body)
+	assert.Error(t, err, "a broken upstream stream ended cleanly, want a transport error")
+	assert.Equal(t, 1, h.upstream.callCount())
+	logs.find(t, slog.LevelError, resp.Header.Get(requestIDHeader))
+}
+
+func TestServer_HandleSpeech_DeadlineDuringFirstAttemptIsNotRetried(t *testing.T) {
+	h := newHarness(t, func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}, func(cfg *Config) { cfg.RequestTimeout = shortDeadline })
+
+	resp := h.speech(speechPath, map[string]any{"input": "hi", "response_format": "pcm"})
+
+	assert.Equal(t, http.StatusGatewayTimeout, resp.StatusCode)
+	assert.Equal(t, 1, h.upstream.callCount())
+}
+
+func redirectToSelf(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, r.URL.Path, http.StatusTemporaryRedirect)
+}
+
+func TestServer_HandleSpeech_UpstreamRedirectIs502WithoutFollowing(t *testing.T) {
+	h := newHarness(t, redirectToSelf)
+
+	resp := h.speech(speechPath, map[string]any{"input": "hi"})
+
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	assert.Contains(t, errorMessage(t, resp), "upstream returned 307")
+	assert.Equal(t, 1, h.upstream.callCount())
 }

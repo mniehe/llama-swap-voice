@@ -28,6 +28,7 @@ const (
 	waitTimeout     = time.Second
 	stuckTimeout    = 3 * time.Second
 	ttsRoute        = "/upstream/" + ttsModel + "/tts"
+	qwenTTSRoute    = "/upstream/" + ttsModel + "/v1/tts"
 	asrRoute        = "/upstream/" + asrModel + "/v1/audio/transcriptions"
 	upstreamWAVs    = "RIFF\xff\xff\xff\xffWAVEfmt "
 	upstreamHeader  = upstreamWAVs + "\x10\x00\x00\x00\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00data\xff\xff\xff\xff"
@@ -39,10 +40,12 @@ const (
 )
 
 type upstreamCall struct {
-	path   string
-	fields map[string]string
-	files  map[string][]byte
-	names  map[string]string
+	path        string
+	contentType string
+	fields      map[string]string
+	files       map[string][]byte
+	names       map[string]string
+	json        map[string]any
 }
 
 type fakeUpstream struct {
@@ -61,13 +64,37 @@ func newFakeUpstream(t *testing.T, respond http.HandlerFunc) *fakeUpstream {
 }
 
 func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(fakeFormMemory); err != nil {
-		assert.NoError(f.t, err, "upstream got invalid multipart")
+	call := upstreamCall{
+		path:        r.URL.Path,
+		contentType: r.Header.Get("Content-Type"),
+		fields:      map[string]string{},
+		files:       map[string][]byte{},
+		names:       map[string]string{},
+	}
+
+	read := f.readMultipart
+	if call.contentType == contentTypeJSON {
+		read = readJSON
+	}
+
+	if err := read(r, &call); err != nil {
+		assert.NoError(f.t, err, "upstream got an invalid request")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	call := upstreamCall{path: r.URL.Path, fields: map[string]string{}, files: map[string][]byte{}, names: map[string]string{}}
+	f.mu.Lock()
+	f.calls = append(f.calls, call)
+	f.mu.Unlock()
+
+	f.respond(w, r)
+}
+
+func (f *fakeUpstream) readMultipart(r *http.Request, call *upstreamCall) error {
+	if err := r.ParseMultipartForm(fakeFormMemory); err != nil {
+		return err
+	}
+
 	for key, values := range r.MultipartForm.Value {
 		call.fields[key] = values[0]
 	}
@@ -77,11 +104,11 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		call.names[key] = headers[0].Filename
 	}
 
-	f.mu.Lock()
-	f.calls = append(f.calls, call)
-	f.mu.Unlock()
+	return nil
+}
 
-	f.respond(w, r)
+func readJSON(r *http.Request, call *upstreamCall) error {
+	return json.NewDecoder(r.Body).Decode(&call.json)
 }
 
 func readPart(t *testing.T, header *multipart.FileHeader) []byte {
@@ -138,6 +165,12 @@ type harness struct {
 func newHarness(t *testing.T, respond http.HandlerFunc, tweak ...func(*Config)) *harness {
 	t.Helper()
 
+	return newBackendHarness(t, upstream.LlamaCPP, respond, tweak...)
+}
+
+func newBackendHarness(t *testing.T, backend upstream.Backend, respond http.HandlerFunc, tweak ...func(*Config)) *harness {
+	t.Helper()
+
 	dir := t.TempDir()
 	alice := writeFile(t, dir, "alice.mp3", aliceRef)
 	narrator := writeFile(t, dir, "narrator.wav", narratorRef)
@@ -160,7 +193,7 @@ func newHarness(t *testing.T, respond http.HandlerFunc, tweak ...func(*Config)) 
 		apply(&h.cfg)
 	}
 
-	client, err := upstream.New(h.upstream.server.URL, ttsModel, asrModel, &http.Client{})
+	client, err := upstream.New(h.upstream.server.URL, ttsModel, asrModel, &http.Client{}, upstream.WithBackend(backend))
 	require.NoError(t, err)
 
 	h.service, err = New(&h.cfg, client, discardLogger())

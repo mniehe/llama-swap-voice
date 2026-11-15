@@ -10,6 +10,7 @@ import (
 
 	"github.com/mniehe/llama-swap-voice/internal/observability"
 	"github.com/mniehe/llama-swap-voice/internal/server"
+	"github.com/mniehe/llama-swap-voice/internal/upstream"
 	"github.com/mniehe/llama-swap-voice/internal/voices"
 )
 
@@ -40,10 +41,11 @@ type ServiceConfig struct {
 }
 
 type UpstreamConfig struct {
-	URL            string `koanf:"url"`
-	TTSModel       string `koanf:"ttsmodel"`
-	ASRModel       string `koanf:"asrmodel"`
-	TTSConcurrency int    `koanf:"ttsconcurrency"`
+	URL            string           `koanf:"url"`
+	TTSModel       string           `koanf:"ttsmodel"`
+	ASRModel       string           `koanf:"asrmodel"`
+	TTSBackend     upstream.Backend `koanf:"ttsbackend"`
+	TTSConcurrency int              `koanf:"ttsconcurrency"`
 }
 
 type VoicesConfig struct {
@@ -84,6 +86,7 @@ var defaultConfig = ServiceConfig{
 		URL:            "http://127.0.0.1:8080",
 		TTSModel:       "qwen3-tts",
 		ASRModel:       "qwen3-asr",
+		TTSBackend:     upstream.LlamaCPP,
 		TTSConcurrency: 1,
 	},
 	Voices: VoicesConfig{
@@ -150,6 +153,10 @@ func (c *ServiceConfig) validateUpstream() error {
 
 	if c.Upstream.ASRModel == "" {
 		errs = append(errs, errors.New("upstream.asrmodel must not be empty"))
+	}
+
+	if _, err := upstream.ParseBackend(string(c.Upstream.TTSBackend)); err != nil {
+		errs = append(errs, err)
 	}
 
 	if c.Upstream.TTSConcurrency < minTTSConcurrency {

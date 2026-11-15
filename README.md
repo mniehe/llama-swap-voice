@@ -147,6 +147,7 @@ Everything is set with environment variables. Only the default voice is required
 | `HOST`, `PORT` | `127.0.0.1`, `8920` | Where to listen |
 | `UPSTREAM_URL` | `http://127.0.0.1:8080` | Your llama-swap |
 | `UPSTREAM_TTSMODEL`, `UPSTREAM_ASRMODEL` | `qwen3-tts`, `qwen3-asr` | Model names in your llama-swap config |
+| `UPSTREAM_TTSBACKEND` | `llamacpp` | How speech requests reach the TTS model. `llamacpp` posts a multipart form to `/tts` with the voice's clip attached, for llama-server. `qwentts` posts JSON `{"voice","input","response_format":"wav"}` to `/v1/tts`, naming the voice and sending no clip, for a TTS server that holds the voices itself. Each voice still needs a clip in `VOICES_DIR` to be accepted |
 | `UPSTREAM_TTSCONCURRENCY` | `1` | Speech requests sent to the TTS model at once; see below |
 | `VOICES_DIR` | `/var/lib/llama-swap-voice/voices` | Where voice clips live |
 | `VOICES_DEFAULT` | *required* | Voice used when a request names none |
@@ -169,6 +170,14 @@ its turn in arrival order, for up to `REQUEST_TIMEOUT`, and keeps its
 `REQUEST_MAXCONCURRENTTTS` place while it waits. One that is still waiting
 when the timeout ends gets a 504. `UPSTREAM_TTSCONCURRENCY` must not exceed
 llama-swap's `concurrencyLimit` or llama-server's `-np` for the TTS model.
+
+**Retries.** When a speech request to the TTS model fails before any audio
+comes back, because the connection dropped or llama-swap answered 502 while
+the model was down, the service sends the same request once more, keeping its
+place in the TTS queue. It never retries once audio has started, never more
+than once, and never for a transcription, and it follows no upstream redirect.
+Any other upstream error reaches the client with the upstream's status and
+message, and its `Retry-After`, if any.
 
 On SIGTERM or SIGINT, readiness turns 503 and shutdown runs in three steps:
 

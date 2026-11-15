@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/mniehe/llama-swap-voice/internal/config"
+	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
 func voicesDir(t *testing.T, names ...string) string {
@@ -51,6 +52,8 @@ func TestServiceConfig_Validate_RejectsInvalidValues(t *testing.T) {
 		"tts model empty":       {func(c *ServiceConfig) { c.Upstream.TTSModel = "" }, "upstream.ttsmodel"},
 		"asr model empty":       {func(c *ServiceConfig) { c.Upstream.ASRModel = "" }, "upstream.asrmodel"},
 		"tts concurrency zero":  {func(c *ServiceConfig) { c.Upstream.TTSConcurrency = 0 }, "upstream.ttsconcurrency must be at least 1"},
+		"tts backend unknown":   {func(c *ServiceConfig) { c.Upstream.TTSBackend = "other" }, `upstream.ttsbackend must be llamacpp or qwentts, got "other"`},
+		"tts backend empty":     {func(c *ServiceConfig) { c.Upstream.TTSBackend = "" }, "upstream.ttsbackend"},
 		"default missing":       {func(c *ServiceConfig) { c.Voices.Default = "" }, "voices.default must name a voice"},
 		"default unknown":       {func(c *ServiceConfig) { c.Voices.Default = "alloy" }, `voices.default "alloy" is not a voice`},
 		"voices dir missing":    {func(c *ServiceConfig) { c.Voices.Dir = "/nonexistent/voices" }, "voices directory"},
@@ -109,6 +112,7 @@ func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 		"UPSTREAM_URL":             "https://llama.example:8443",
 		"UPSTREAM_TTSMODEL":        "tts-alt",
 		"UPSTREAM_ASRMODEL":        "asr-alt",
+		"UPSTREAM_TTSBACKEND":      "qwentts",
 		"UPSTREAM_TTSCONCURRENCY":  "3",
 		"VOICES_DIR":               "/srv/voices",
 		"VOICES_DEFAULT":           "bm_fable",
@@ -134,7 +138,7 @@ func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 	assert.Equal(t, ServiceConfig{
 		Host:           "0.0.0.0",
 		Port:           9001,
-		Upstream:       UpstreamConfig{URL: "https://llama.example:8443", TTSModel: "tts-alt", ASRModel: "asr-alt", TTSConcurrency: 3},
+		Upstream:       UpstreamConfig{URL: "https://llama.example:8443", TTSModel: "tts-alt", ASRModel: "asr-alt", TTSBackend: upstream.QwenTTS, TTSConcurrency: 3},
 		Voices:         VoicesConfig{Dir: "/srv/voices", Default: "bm_fable"},
 		TTS:            TTSConfig{Lang: "de", MaxInputChars: 512},
 		ASR:            ASRConfig{PrefixRegex: "^x"},
@@ -165,6 +169,19 @@ func TestLoadConfig_NoEnvironment_ReturnsDefaults(t *testing.T) {
 	assert.Equal(t, defaultConfig, cfg)
 	assert.Equal(t, 1, cfg.Upstream.TTSConcurrency)
 	assert.Equal(t, 8, cfg.Request.MaxConcurrentTTS)
+	assert.Equal(t, upstream.LlamaCPP, cfg.Upstream.TTSBackend)
+}
+
+func TestLoadConfig_UnknownTTSBackend_FailsStartup(t *testing.T) {
+	t.Setenv(envPrefix+"VOICES_DIR", voicesDir(t, "alice.mp3"))
+	t.Setenv(envPrefix+"VOICES_DEFAULT", "alice")
+	t.Setenv(envPrefix+"UPSTREAM_TTSBACKEND", "other")
+
+	_, err := loadConfig()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "llamacpp")
+	assert.Contains(t, err.Error(), "qwentts")
 }
 
 func TestLoadConfig_NonPositiveMaxConcurrentTTS_FailsStartup(t *testing.T) {

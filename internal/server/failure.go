@@ -8,10 +8,15 @@ import (
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
+const retryAfterHeader = "Retry-After"
+
 func (s *Server) upstreamFailure(w http.ResponseWriter, r *http.Request, err error) {
 	var statusErr *upstream.StatusError
 	if errors.As(err, &statusErr) {
 		record(r).upstreamStatus = statusErr.Code
+		if statusErr.RetryAfter != "" {
+			w.Header().Set(retryAfterHeader, statusErr.RetryAfter)
+		}
 		s.writeError(w, clientStatus(statusErr.Code), err)
 		return
 	}

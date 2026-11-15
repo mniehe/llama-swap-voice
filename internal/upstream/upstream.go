@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -19,10 +20,29 @@ type Format string
 
 const WAV Format = "wav"
 
+type Backend string
+
+const (
+	LlamaCPP Backend = "llamacpp"
+	QwenTTS  Backend = "qwentts"
+)
+
+func ParseBackend(name string) (Backend, error) {
+	backend := Backend(name)
+	if backend != LlamaCPP && backend != QwenTTS {
+		return "", fmt.Errorf("upstream.ttsbackend must be %s or %s, got %q", LlamaCPP, QwenTTS, name)
+	}
+
+	return backend, nil
+}
+
 const (
 	routePrefix        = "upstream"
 	ttsPath            = "tts"
+	qwenTTSPath        = "v1/tts"
 	transcriptionsPath = "v1/audio/transcriptions"
+	contentTypeJSON    = "application/json"
+	retryAfterHeader   = "Retry-After"
 	maxErrorBodyBytes  = 4096
 	maxTranscriptBytes = 1 << 20
 )
@@ -30,8 +50,9 @@ const (
 var errTranscriptTooLarge = fmt.Errorf("transcript is larger than %d MiB", maxTranscriptBytes>>20)
 
 type StatusError struct {
-	Code    int
-	Message string
+	Code       int
+	Message    string
+	RetryAfter string
 }
 
 func (e *StatusError) Error() string {
@@ -42,10 +63,17 @@ type Client struct {
 	base     *url.URL
 	ttsModel string
 	asrModel string
+	backend  Backend
 	http     *http.Client
 }
 
-func New(base, ttsModel, asrModel string, httpClient *http.Client) (*Client, error) {
+type Option func(*Client)
+
+func WithBackend(backend Backend) Option {
+	return func(c *Client) { c.backend = backend }
+}
+
+func New(base, ttsModel, asrModel string, httpClient *http.Client, opts ...Option) (*Client, error) {
 	parsed, err := url.Parse(base)
 	if err != nil {
 		return nil, fmt.Errorf("upstream url: %w", err)
@@ -55,10 +83,36 @@ func New(base, ttsModel, asrModel string, httpClient *http.Client) (*Client, err
 		return nil, fmt.Errorf("upstream url %q needs a scheme and host", base)
 	}
 
-	return &Client{base: parsed, ttsModel: ttsModel, asrModel: asrModel, http: httpClient}, nil
+	client := &Client{base: parsed, ttsModel: ttsModel, asrModel: asrModel, backend: LlamaCPP, http: withoutRedirects(httpClient)}
+	for _, apply := range opts {
+		apply(client)
+	}
+
+	if _, err := ParseBackend(string(client.backend)); err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+func withoutRedirects(httpClient *http.Client) *http.Client {
+	if httpClient == nil {
+		return nil
+	}
+
+	c := *httpClient
+	c.CheckRedirect = refuseRedirect
+
+	return &c
+}
+
+// refuseRedirect stops net/http replaying a POST on 307 or 308, up to ten times per attempt.
+func refuseRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 type Speech struct {
+	Voice      string
 	Input      string
 	Lang       string
 	SpeakerRef string
@@ -66,22 +120,69 @@ type Speech struct {
 }
 
 type Audio struct {
-	Body   io.ReadCloser
-	Status int
+	Body    io.ReadCloser
+	Status  int
+	Retried bool
 }
 
-func (c *Client) Synthesize(ctx context.Context, speech Speech) (*Audio, error) {
-	body, contentType, err := speechForm(ctx, speech)
+type speechRequest struct {
+	path        string
+	body        []byte
+	contentType string
+}
+
+// Synthesize builds the request body once, before any attempt, so a retry
+// sends the same bytes without reading the voice clip again.
+func (c *Client) Synthesize(ctx context.Context, speech *Speech) (*Audio, error) {
+	req, err := c.speechRequest(ctx, speech)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := c.post(ctx, c.ttsModel, ttsPath, body, contentType)
+	resp, err := c.postSpeech(ctx, req)
+	retried := retryable(ctx, err)
+	if retried {
+		resp, err = c.postSpeech(ctx, req)
+	}
+
+	if err != nil && retried {
+		return nil, fmt.Errorf("retried once: %w", err)
+	}
+
 	if err != nil {
 		return nil, err
 	}
 
-	return &Audio{Body: resp.Body, Status: resp.StatusCode}, nil
+	return &Audio{Body: resp.Body, Status: resp.StatusCode, Retried: retried}, nil
+}
+
+// retryable reports a failure that happened before any audio arrived, so
+// sending the same request again cannot duplicate output: a connection the
+// upstream dropped while the caller still waits, or the 502 llama-swap answers
+// while the model is down.
+func retryable(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+
+	var statusErr *StatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.Code == http.StatusBadGateway
+	}
+
+	return true
+}
+
+func (c *Client) speechRequest(ctx context.Context, speech *Speech) (speechRequest, error) {
+	if c.backend == QwenTTS {
+		return qwenSpeech(speech)
+	}
+
+	return llamaSpeech(ctx, speech)
+}
+
+func (c *Client) postSpeech(ctx context.Context, req speechRequest) (*http.Response, error) {
+	return c.post(ctx, c.ttsModel, req.path, bytes.NewReader(req.body), req.contentType)
 }
 
 type Recording struct {
@@ -127,19 +228,62 @@ func (c *Client) post(ctx context.Context, model, path string, body io.Reader, c
 
 func statusError(resp *http.Response) error {
 	text, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-	message := strings.TrimSpace(string(text))
-	if message == "" {
-		message = http.StatusText(resp.StatusCode)
-	}
+	message := errorMessage(text, resp.StatusCode)
 
 	if err != nil {
 		message = fmt.Sprintf("%s (reading the error body failed: %v)", message, err)
 	}
 
-	return &StatusError{Code: resp.StatusCode, Message: message}
+	return &StatusError{Code: resp.StatusCode, Message: message, RetryAfter: resp.Header.Get(retryAfterHeader)}
 }
 
-func speechForm(ctx context.Context, speech Speech) (io.Reader, string, error) {
+type errorEnvelope struct {
+	Error struct {
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+func errorMessage(text []byte, code int) string {
+	var envelope errorEnvelope
+	if json.Unmarshal(text, &envelope) == nil {
+		if message := strings.TrimSpace(envelope.Error.Message); message != "" {
+			return message
+		}
+	}
+
+	message := strings.TrimSpace(string(text))
+	if message == "" {
+		return http.StatusText(code)
+	}
+
+	return message
+}
+
+type qwenSpeechBody struct {
+	Voice          string `json:"voice"`
+	Input          string `json:"input"`
+	ResponseFormat Format `json:"response_format"`
+}
+
+func qwenSpeech(speech *Speech) (speechRequest, error) {
+	body, err := json.Marshal(qwenSpeechBody{Voice: speech.Voice, Input: speech.Input, ResponseFormat: speech.Format})
+	if err != nil {
+		return speechRequest{}, err
+	}
+
+	return speechRequest{path: qwenTTSPath, body: body, contentType: contentTypeJSON}, nil
+}
+
+func llamaSpeech(ctx context.Context, speech *Speech) (speechRequest, error) {
+	body, contentType, err := speechForm(ctx, speech)
+	if err != nil {
+		return speechRequest{}, err
+	}
+
+	return speechRequest{path: ttsPath, body: body, contentType: contentType}, nil
+}
+
+func speechForm(ctx context.Context, speech *Speech) (body []byte, contentType string, err error) {
 	buf := &bytes.Buffer{}
 	form := multipart.NewWriter(buf)
 
@@ -163,7 +307,7 @@ func speechForm(ctx context.Context, speech Speech) (io.Reader, string, error) {
 		return nil, "", err
 	}
 
-	return buf, form.FormDataContentType(), nil
+	return buf.Bytes(), form.FormDataContentType(), nil
 }
 
 func attachFile(ctx context.Context, form *multipart.Writer, field, path string) error {
