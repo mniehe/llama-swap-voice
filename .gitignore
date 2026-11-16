@@ -16,3 +16,6 @@ go.work
 # Editor and OS clutter
 *~
 .DS_Store
+
+# Review prep runs
+.claude/review-state/

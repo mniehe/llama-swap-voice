@@ -1,0 +1,55 @@
+# Every Go command runs inside the cgo nix-shell AGENTS.md names: gcc,
+# pkg-config and golangci-lint are not on PATH outside it, and the repository
+# has no flake for prep to enter on its own.
+tools:
+  fmt: nix-shell -p libopus pkg-config gcc opus-tools ffmpeg-headless golangci-lint --run 'unformatted=$(gofmt -l .) || exit; echo "$unformatted"; test -z "$unformatted"'
+  vet: nix-shell -p libopus pkg-config gcc opus-tools ffmpeg-headless golangci-lint --run 'go vet ./...'
+  lint: nix-shell -p libopus pkg-config gcc opus-tools ffmpeg-headless golangci-lint --run 'golangci-lint run ./...'
+  test: nix-shell -p libopus pkg-config gcc opus-tools ffmpeg-headless golangci-lint --run 'go test ./...'
+  race: nix-shell -p libopus pkg-config gcc opus-tools ffmpeg-headless golangci-lint --run 'go test -race ./...'
+
+tags:
+  audio: [internal/audio/**]
+  voices: [internal/voices/**]
+  upstream: [internal/upstream/**]
+  server: [internal/server/**]
+  runtime: [cmd/llama-swap-voice/**]
+  build: [go.mod, go.sum, .golangci.yaml, .claude/review/review.yaml]
+  llm: [AGENTS.md, CLAUDE.md, .claude/review/*.md, .claude/review/review.yaml]
+
+dimensions:
+  - name: correctness
+    criteria: correctness.md
+    always: true
+  - name: security
+    criteria: security.md
+    tags: [audio, voices, upstream, server, runtime, build]
+  - name: failure-paths
+    criteria: failure-path-review.md
+    signals: [packages_touched>0]
+  - name: qa
+    criteria: qa.md
+    signals: [code_without_tests, tests_changed]
+  - name: design
+    criteria: design.md
+    signals: [packages_touched>=2, new_exported>0]
+  - name: prompt
+    criteria: prompt.md
+    tags: [llm]
+
+max_dimensions: 4
+
+verify_notes: |
+  Run every Go command inside
+  `nix-shell -p libopus pkg-config gcc opus-tools ffmpeg-headless golangci-lint`;
+  outside it cgo fails with "could not import C". Tests need no GPU, model or
+  running llama-swap: server tests drive the real handlers against the fake
+  upstream in internal/server/harness_test.go. opus-tools (opusinfo, opusdec)
+  and ffmpeg are test oracles in internal/audio/oracle_test.go and
+  internal/server/speech_encoding_test.go whose checks skip silently when the
+  tools are missing, so run with them present and use -v to confirm they ran.
+  tools/race.txt covers every package; internal/audio takes about 100 s.
+  A verifier works read-only on tracked files, which is stricter than what
+  AGENTS.md allows a builder: do not replace, regenerate or delete a file
+  under internal/audio/testdata/, delete a fuzz seed, edit .golangci.yaml,
+  run go get, or push. To inspect module tidiness use `go mod tidy -diff`.

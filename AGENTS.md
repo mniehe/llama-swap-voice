@@ -1,0 +1,180 @@
+# Project Context
+
+llama-swap-voice is a Go HTTP service that puts OpenAI's audio API
+(`/v1/audio/speech`, `/v1/audio/transcriptions`) in front of llama-swap. It
+decodes uploads, encodes replies (mp3, opus, wav, pcm) and changes speech speed
+in-process; it runs no external programs. `README.md` is the user-facing
+contract: endpoints, status codes, limits and every environment variable.
+
+Your closing summary names every file you changed and every behaviour change,
+including ones nobody asked for, because reviewers read the summary before the
+diff.
+
+## Working
+
+Finishing work applies when a person reads this session directly. An agent
+working from a brief follows its role prompt there instead: it stops the way
+that prompt says and returns its packet with nothing around it. What needs
+confirmation applies to every agent.
+
+### Finishing work
+Please avoid stopping while you still owe work the user asked for. Be persistent and do not stop unless needed.
+
+While status notes are welcome, as is clarifying with the user on open decisions, carry on with work that does not depend on the user's answer without unnecessary stops.
+
+If you notice yourself inviting the user to redirect you or offering to wait, instead proceed on the next part of the task. You may meet ordinary obstacles like errors, timeouts, locked files, empty results or failing tools. Diagnose them first, and when they are not real blockers, work through them with the access you have (wait and retry, fix the request, use another tool or source) rather than stopping unnecessarily.
+
+If someone clearly decided something is a hard blocker, such as a file marked not to be touched, access that was intentionally withheld, or a safety guardrail, leave it alone, say plainly what you found, and look for another safe way to finish the task. Stopping before the task is complete is very rarely merited, as in when the task can't move forward without user input, or where the blocker is deliberate and should not be worked past. This does not override the need for confirmation on risky or destructive actions.
+
+Before you start, say in a line what you're about to do; brief updates while you work help the user follow along. Close with a short recap that stands on its own (what you found, what you did, and what's next), so a reader who only sees the last message has the full picture.
+
+### What needs confirmation
+
+Commit on a branch other than `main`. Ask first, naming the exact action,
+before:
+
+- pushing, merging, or anything that lands on `main`;
+- adding, upgrading or replacing a dependency in `go.mod`. A binary carries
+  each dependency's licence (`README.md` § Licence), and the audio decoders
+  parse untrusted uploads;
+- adding a call that runs an external program from non-test code, since the
+  service was moved off ffmpeg on purpose;
+- loosening `.golangci.yaml`, deleting tests or fuzz seeds, or skipping a
+  Verification command whose condition applies to the change;
+- replacing a file under `internal/audio/testdata/`. Tests pin exact frame
+  counts for the WAV and Opus clips, a bounded padding for the MP3 and a
+  rejection for the M4A, and `testdata/README.md` records the command that
+  made each one.
+
+Routine and needs no confirmation: every command under Verification, entering
+the nix-shell, running the service against a local llama-swap, adding tests
+and fixtures, and editing any other file inside the worktree. An action in
+the list above needs confirmation even when it is only a file edit.
+
+## Structure
+
+```
+/cmd/llama-swap-voice   # Entry point: config.go (service config), main.go (wiring, signals, three-step shutdown)
+/internal
+  /audio          # Decode untrusted uploads to 16 kHz mono WAV; encode replies (wav, pcm, mp3, Ogg Opus via cgo libopus); resample; WSOLA time-stretch
+    /testdata     # Reference clips and the commands that produced them
+  /config         # Generic koanf loading from LLAMA_SWAP_VOICE_* environment variables
+  /observability  # slog logger construction (json or console)
+  /server         # HTTP handlers, admission pools, the TTS queue, panic recovery, request log, JSON errors
+  /upstream       # llama-swap client: TTS backends (llamacpp, qwentts), transcription, one retry, no redirects
+  /voices         # Finds and checks voice clips at startup; the llamacpp backend reopens the clip on each request
+```
+
+## Development
+
+The build needs cgo, a C compiler, pkg-config and libopus. There is no flake
+yet, so every Go command runs inside this shell:
+
+```bash
+nix-shell -p libopus pkg-config gcc opus-tools ffmpeg-headless golangci-lint
+```
+
+`opus-tools` and `ffmpeg` are test oracles: tests decode the service's own
+output with them and skip those checks when the tools are missing. Run with
+them present, or a broken encoder passes.
+
+Tests need no GPU, model or running llama-swap. Server tests drive the real
+handlers against the fake upstream in `internal/server/harness_test.go`.
+
+## Rules
+
+`.golangci.yaml` is the source of truth; do not loosen it to make a change
+pass. Its choices that change how code is written:
+
+- `gocritic` enables every check, `hugeParam` and `rangeValCopy` included, so large structs travel by pointer.
+- `gosec` G115 is on, so a narrowing conversion is bounded first and says so.
+- `govet` `shadow` is on, so inner `err` declarations get distinct names.
+- `errcheck` checks blank assignments and type assertions, so `_ = fallible()` and a bare `x.(T)` fail lint.
+- `misspell` uses the UK locale.
+
+A suppression names the linter and states why.
+
+- Return errors wrapped with `%w`. `os.Exit` belongs to `main` alone, and the
+  only panics outside tests are the `http.ErrAbortHandler` re-panics in
+  `internal/server`, which abort a response that has already started.
+- Everything a client or the upstream sends is read through a bound: body
+  size, decoded duration, transcript size, input characters. A new input
+  gets a named limit and a test at the limit.
+- A third-party call that parses untrusted compressed audio runs under
+  `guarded` in `internal/audio/audio.go`, so a decoder panic becomes a 400
+  and not a crashed request. Decoder setup from validated values and plain
+  accessors run outside it.
+- Replies stream. Encode and write as audio arrives; do not buffer a whole
+  reply to simplify a code path.
+- Error responses are JSON `{"error":{"message":"…"}}`, written with
+  `writeError` in `internal/server/respond.go`. Two exceptions: the readiness
+  probe answers a plain-text 503 while shutting down, and a failure after the
+  response is committed aborts the transfer, because JSON appended to audio
+  corrupts it. Writing the Opus headers commits the response before the
+  encoder constructor returns.
+- Packages log through the `*slog.Logger` they were constructed with. Only
+  `main` touches the default logger.
+- A change to an endpoint, status code, limit or environment variable updates
+  `README.md` in the same change.
+- Values from a spec or shared across call sites are named constants.
+
+## Verification
+
+A task is complete only when the commands below have run in this session,
+inside the nix-shell, and their output shows success. Report the commands and
+results in the closing summary; "should pass" is not a result. There is no CI.
+
+```bash
+gofmt -l . && go vet ./... && golangci-lint run ./...   # gofmt -l must print nothing
+go test ./...
+go test -race ./...                  # when the change touches goroutines, channels, locks or internal/server
+go test -run '^$' -fuzz '^FuzzNormaliseUpload$' -fuzztime 30s ./internal/audio   # when the change touches a parser or the time-stretch
+```
+
+Run the fuzz target that reaches the changed code: `FuzzNormaliseUpload` for
+upload decoding, `FuzzOpusPacket` for Opus packets, `FuzzStretcher` for WSOLA.
+A passing target that does not reach the change is not coverage. No target
+reaches `NewWAVReader` in `wavreader.go`; a change to its header parsing adds
+one.
+
+Also exercise the changed path once for real when a llama-swap is reachable:
+run the service and send the `curl` requests from `README.md` § Quick start.
+Say so in the summary when none was reachable.
+
+Review every change to code or prompts before it is done and resolve every
+Must Fix. What changed sets the depth, unless a Researcher brief's REVIEW line
+says otherwise:
+
+| Change | Review |
+|---|---|
+| Only `README.md`, `LICENSE` or other documentation | None |
+| Only prompt files, none of them a critical path | `/pantheon:review --dimension prompt`: one reviewer |
+| Under 200 source lines, no critical path | `/pantheon:review --dimension correctness`: one reviewer, enough for a diff one agent can hold |
+| 200 to 1000 source lines, or a critical path at any size | `/pantheon:review`: the manifest selects the dimensions |
+| Over 1000 source lines | Split into ranges of at most 1000 and review each; one review cannot cover more |
+
+Take the line count from the source-lines figure, S, on the
+`Files: N files, M changed lines, S source lines` line that
+`pantheon-cli review prep` prints. Prep measures the diff the review covers,
+uncommitted work included. A `pantheon-cli` older than the source-lines
+change prints no S; use M then, and say so in the summary.
+
+Source lines do not count prompt files. A change that touches a prompt file
+together with code gets the review its size calls for and then, unless that
+run's `Dimensions:` line already lists `prompt`, a second run of
+`/pantheon:review --dimension prompt` on the same range. Do not add the flag
+to the first run: `--dimension` replaces the manifest's selection.
+
+Prompt files are what an agent reads as instructions: `AGENTS.md`, `CLAUDE.md`
+(a symlink to it), `.claude/review/*.md` and `.claude/review/review.yaml`,
+whose `verify_notes` every verifier reads.
+
+Critical paths, where a small mistake is a memory-safety or denial-of-service
+hole, or silently corrupts audio:
+
+- `internal/audio/**`: parses untrusted uploads and calls libopus through cgo
+- `internal/voices/**`: reads operator files and follows symlinks
+- `internal/upstream/**`: retry, redirect refusal and response bounds
+- `internal/server/**`: request bounds, the admission pools, the TTS queue, response commitment, panic recovery
+- `cmd/llama-swap-voice/**`: limit validation, connection deadlines, the three-step shutdown
+- `go.mod`, `go.sum`, `.golangci.yaml` and `.claude/review/review.yaml`, which holds shell commands that review prep runs
