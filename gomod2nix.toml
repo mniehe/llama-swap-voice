@@ -1,0 +1,58 @@
+schema = 3
+
+[mod]
+  [mod.'github.com/braheezy/shine-mp3']
+    version = 'v0.2.0'
+    hash = 'sha256-VKB86Zjn0IoDabrudKc/lgwyeCafWYm5lLrxxPxk+tA='
+
+  [mod.'github.com/fatih/structs']
+    version = 'v1.1.0'
+    hash = 'sha256-OCmubTLF1anwNnkvFZDYHnF6hFlX0WDoe/9+dDlaMPM='
+
+  [mod.'github.com/go-viper/mapstructure/v2']
+    version = 'v2.5.0'
+    hash = 'sha256-LbrCBANBprVI84M0CWrXc7rriJL5ac5VKbh58LBTw7U='
+
+  [mod.'github.com/hajimehoshi/go-mp3']
+    version = 'v0.3.4'
+    hash = 'sha256-h6l0PuIS0h1zdB8MEqHTTgg8dE6nL6PSOt583ymaPnA='
+
+  [mod.'github.com/knadh/koanf/maps']
+    version = 'v0.1.2'
+    hash = 'sha256-GTugwBFQunWr5pzhZR7lLr4q367zX32D/hS2KNcrxFs='
+
+  [mod.'github.com/knadh/koanf/providers/env']
+    version = 'v1.1.0'
+    hash = 'sha256-N8Or9o0Hm99HzuEn6/kJnWQ6wzyv3otIAYPIpbR2IdI='
+
+  [mod.'github.com/knadh/koanf/providers/structs']
+    version = 'v1.0.1'
+    hash = 'sha256-A9bFtKk228kHeom7rAeFHe03T0txm8DMVBd0U0FoioA='
+
+  [mod.'github.com/knadh/koanf/v2']
+    version = 'v2.4.1'
+    hash = 'sha256-zRSJniezbCZKr4kmxqGDqyDlajv6EkEKYE9qJGMMvz0='
+
+  [mod.'github.com/lmittmann/tint']
+    version = 'v1.2.1'
+    hash = 'sha256-crJTQAzHbG650e1V52l/jmFVbWndOW68kX9feWvZMN4='
+
+  [mod.'github.com/mitchellh/copystructure']
+    version = 'v1.2.0'
+    hash = 'sha256-VR9cPZvyW62IHXgmMw8ee+hBDThzd2vftgPksQYR/Mc='
+
+  [mod.'github.com/mitchellh/reflectwalk']
+    version = 'v1.0.2'
+    hash = 'sha256-VX9DPqChm7jPnyrA3RAYgxAFrAhj7TRKIWD/qR9Zr9s='
+
+  [mod.'github.com/pion/opus']
+    version = 'v0.1.1-0.20261026214112-e7b8aa55508c'
+    hash = 'sha256-HiNzv+DzVFJXF4YHw4gPNDXGcb+IJzcOIvB4u3dit/8='
+
+  [mod.'github.com/stretchr/testify']
+    version = 'v1.12.1'
+    hash = 'sha256-9MTDdVjZMh1MJ5EH3HmAFrm24YqZayeMBgKwtaURZCc='
+
+  [mod.'go.yaml.in/yaml/v3']
+    version = 'v3.0.5'
+    hash = 'sha256-ygho+GU5kE7vPMx+dZYyNfCaeMjNxj66XmrcVf3afFE='

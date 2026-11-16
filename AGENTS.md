@@ -36,7 +36,10 @@ before:
 - pushing, merging, or anything that lands on `main`;
 - adding, upgrading or replacing a dependency in `go.mod`. A binary carries
   each dependency's licence (`README.md` § Licence), and the audio decoders
-  parse untrusted uploads;
+  parse untrusted uploads. `gomod2nix.toml` is regenerated in the same change:
+  `nix develop -c gomod2nix generate`. Updating `flake.lock` (`nix flake
+  update`) needs the same confirmation, because it changes the libopus the
+  binary links and the Go toolchain;
 - adding a call that runs an external program from non-test code, since the
   service was moved off ffmpeg on purpose;
 - loosening `.golangci.yaml`, deleting tests or fuzz seeds, or skipping a
@@ -47,7 +50,7 @@ before:
   made each one.
 
 Routine and needs no confirmation: every command under Verification, entering
-the nix-shell, running the service against a local llama-swap, adding tests
+the dev shell, running the service against a local llama-swap, adding tests
 and fixtures, and editing any other file inside the worktree. An action in
 the list above needs confirmation even when it is only a file edit.
 
@@ -63,15 +66,20 @@ the list above needs confirmation even when it is only a file edit.
   /server         # HTTP handlers, admission pools, the TTS queue, panic recovery, request log, JSON errors
   /upstream       # llama-swap client: TTS backends (llamacpp, qwentts), transcription, one retry, no redirects
   /voices         # Finds and checks voice clips at startup; the llamacpp backend reopens the clip on each request
+/nix                    # packages.nix (the build), checks.nix (what nix flake check runs), devshells.nix (nix develop)
+flake.nix               # Package, dev shell and checks; flake.lock pins the inputs
+gomod2nix.toml          # Hash of every Go module for the Nix build; regenerated with go.mod
+.version                # Version stamped into the binary; cocogitto (.cog.toml) writes it on a bump
 ```
 
 ## Development
 
-The build needs cgo, a C compiler, pkg-config and libopus. There is no flake
-yet, so every Go command runs inside this shell:
+The build needs cgo, a C compiler, pkg-config and libopus. The flake's dev
+shell provides them, so every Go command runs inside it:
 
 ```bash
-nix-shell -p libopus pkg-config gcc opus-tools ffmpeg-headless golangci-lint
+nix develop                    # an interactive shell
+nix develop -c go test ./...   # one command
 ```
 
 `opus-tools` and `ffmpeg` are test oracles: tests decode the service's own
@@ -121,14 +129,17 @@ A suppression names the linter and states why.
 ## Verification
 
 A task is complete only when the commands below have run in this session,
-inside the nix-shell, and their output shows success. Report the commands and
-results in the closing summary; "should pass" is not a result. There is no CI.
+inside the dev shell, and their output shows success. Report the commands and
+results in the closing summary; "should pass" is not a result. There is no
+hosted CI and no push hook: run `nix flake check` yourself before every push.
+`cog bump` also runs it.
 
 ```bash
 gofmt -l . && go vet ./... && golangci-lint run ./...   # gofmt -l must print nothing
 go test ./...
 go test -race ./...                  # when the change touches goroutines, channels, locks or internal/server
 go test -run '^$' -fuzz '^FuzzNormaliseUpload$' -fuzztime 30s ./internal/audio   # when the change touches a parser or the time-stretch
+nix flake check                      # before a push: race tests, lint, gofmt, alejandra, Opus conformance, package version, gomod2nix sync
 ```
 
 Run the fuzz target that reaches the changed code: `FuzzNormaliseUpload` for
@@ -178,3 +189,15 @@ hole, or silently corrupts audio:
 - `internal/server/**`: request bounds, the admission pools, the TTS queue, response commitment, panic recovery
 - `cmd/llama-swap-voice/**`: limit validation, connection deadlines, the three-step shutdown
 - `go.mod`, `go.sum`, `.golangci.yaml` and `.claude/review/review.yaml`, which holds shell commands that review prep runs
+- `flake.nix`, `flake.lock`, `gomod2nix.toml` and `nix/**`: the toolchain, the build and the checks that gate a push
+- `.cog.toml`: it holds shell commands that `cog bump` runs
+
+### Definition of Done
+
+A change is done when everything this Verification section requires of it has
+run and passed, review included. Four rules apply on top of that:
+
+- `nix flake check` passes before a push, on Linux, because the flake defines no checks on Darwin.
+- A behaviour change carries a test that failed before the change and passes after it, so the test is known to detect the fault.
+- Each commit is SSH-signed with a single-line conventional subject, `type(scope): subject`, because the history is the changelog cocogitto reads.
+- No commit, comment, code or document carries AI attribution, because the owner publishes the work as his own.

@@ -1,0 +1,10 @@
+# Cocogitto: conventional commits and version bumps.
+# https://docs.cocogitto.io/
+#
+# A bump runs the flake checks first, then writes the new version into
+# .version, which the Nix build reads. Pushing stays a manual step.
+
+pre_bump_hooks = [
+    "nix flake check",
+    "echo '{{version}}' > .version",
+]

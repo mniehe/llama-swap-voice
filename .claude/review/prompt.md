@@ -23,8 +23,8 @@ code, `README.md`, test fixtures and code comments are out of scope.
 ## What must agree
 
 - Commands under AGENTS.md "Verification" and "Development" run as written
-  inside the nix-shell it names, and match the `tools` in
-  `.claude/review/review.yaml`.
+  inside the flake dev shell it names (`nix develop`), and match the `tools`
+  in `.claude/review/review.yaml`.
 - Every critical path in AGENTS.md, `review.yaml` included, falls under a
   tag the `security` dimension in `review.yaml` selects on (`runtime` for
   `cmd/llama-swap-voice`, `build` for `review.yaml`); the prompt files

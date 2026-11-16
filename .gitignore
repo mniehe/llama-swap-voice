@@ -19,3 +19,7 @@ go.work
 
 # Review prep runs
 .claude/review-state/
+
+# Nix build output links
+result
+result-*
