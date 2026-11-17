@@ -18,8 +18,9 @@ streams, so trace across files rather than reading hunks alone.
 - `internal/audio` decodes uploads into a `normaliser` and encodes replies
   through `NewEncoder`; `libopus.go` is the only cgo file.
 - `internal/upstream/upstream.go` talks to llama-swap; `Synthesize` retries once.
-- `README.md` is the contract for endpoints, status codes, limits and
-  environment variables.
+- `docs/api.md` is the contract for endpoints, status codes and limits, and
+  `docs/options.md` for environment variables and module options;
+  `README.md` repeats some values.
 
 ## Concurrency: open these together
 
@@ -69,7 +70,8 @@ streams, so trace across files rather than reading hunks alone.
    `opusEncoder.Close`); `streamEncoded` closes the encoder after a failed
    write; `removeUploads` after `ParseMultipartForm`; slots in `limited`.
 6. Contracts: an endpoint, status, limit or environment variable changed
-   without `README.md`; an error body not written through `writeError` in
+   without the page that documents it (`docs/api.md`, `docs/options.md`,
+   `docs/qwen-tts-server.md`); an error body not written through `writeError` in
    `respond.go`, except the readiness probe's plain-text 503 while shutting
    down (`writeText`) and a failure after commitment, which aborts.
 

@@ -3,8 +3,12 @@
 llama-swap-voice is a Go HTTP service that puts OpenAI's audio API
 (`/v1/audio/speech`, `/v1/audio/transcriptions`) in front of llama-swap. It
 decodes uploads, encodes replies (mp3, opus, wav, pcm) and changes speech speed
-in-process; it runs no external programs. `README.md` is the user-facing
-contract: endpoints, status codes, limits and every environment variable.
+in-process; it runs no external programs. `README.md` and the three pages
+under `docs/` are the user-facing contract. `README.md` holds the quick start,
+voices, the common options and the licences. `docs/options.md` holds every
+module option and every environment variable. `docs/api.md` holds the
+endpoints, status codes, formats, limits and shutdown. `docs/qwen-tts-server.md`
+holds the Python server's configuration keys, endpoints and errors.
 
 `python/` holds a second program, `qwen-tts-server`: the Python
 faster-qwen3-tts server that the `qwentts` backend calls on a GPU. Its
@@ -80,6 +84,7 @@ the list above needs confirmation even when it is only a file edit.
 /python                 # qwen-tts-server: the faster-qwen3-tts HTTP server the qwentts backend calls; pyproject.toml and uv.lock pin its environment
   /qwen_tts_server      # app.py (endpoints), config.py, engine.py (the model), worker.py (the one CUDA thread), text.py, wav.py
   /tests                # GPU-free tests with a fake engine; test_tokenizer.py alone needs torch
+/docs                   # Reference pages of the user-facing contract: options.md (module options, environment variables), api.md (endpoints, status codes, limits), qwen-tts-server.md (the Python server)
 flake.nix               # Package, dev shell and checks; flake.lock pins the inputs
 gomod2nix.toml          # Hash of every Go module for the Nix build; regenerated with go.mod
 .version                # Version stamped into the binary; cocogitto (.cog.toml) writes it on a bump
@@ -152,10 +157,13 @@ A suppression names the linter and states why.
 - Packages log through the `*slog.Logger` they were constructed with. Only
   `main` touches the default logger.
 - A change to an endpoint, status code, limit or environment variable updates
-  `README.md` in the same change, and `nix/module.nix` with
-  `nix/tests/eval.nix` when the variable has a module option, because the
-  module names each variable by hand and no test compares it with
-  `config.go`.
+  the page that documents it in the same change: `docs/api.md` for an
+  endpoint, status code or limit, `docs/options.md` for an environment
+  variable or module option, `docs/qwen-tts-server.md` for the Python server,
+  and `README.md` where it repeats the value. The change also updates
+  `nix/module.nix` with `nix/tests/eval.nix` when the variable has a module
+  option, because the module names each variable by hand and no test compares
+  it with `config.go`.
 - Values from a spec or shared across call sites are named constants.
 
 The Python server under `python/` follows three of these rules too: every
@@ -198,7 +206,7 @@ says otherwise:
 
 | Change | Review |
 |---|---|
-| Only `README.md`, `LICENSE` or other documentation | None |
+| Only `README.md`, `docs/**`, `LICENSE` or other documentation | None |
 | Only prompt files, none of them a critical path | `/pantheon:review --dimension prompt`: one reviewer |
 | Under 200 source lines, no critical path | `/pantheon:review --dimension correctness`: one reviewer, enough for a diff one agent can hold |
 | 200 to 1000 source lines, or a critical path at any size | `/pantheon:review`: the manifest selects the dimensions |

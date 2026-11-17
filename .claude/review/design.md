@@ -59,7 +59,7 @@ a bug it prevents or a test it enables.
 - A sentinel error exported when a caller in another package needs
   `errors.Is`, as `audio.ErrCorrupt` is for `decodeFailure`.
 - A new configuration value threaded through `ServiceConfig`, its owning
-  component and `README.md` together; only server settings go through
+  component and `docs/options.md` together; only server settings go through
   `serverConfig` (`main` reads host, port, logging and shutdown itself).
 - A named constant for a value from a spec or shared between call sites.
 

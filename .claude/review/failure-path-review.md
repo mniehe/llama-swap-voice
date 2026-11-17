@@ -17,7 +17,7 @@ termination owner.
 
 ## Project shape
 
-Go only. Intended outcomes, from the code and `README.md`:
+Go only. Intended outcomes, from the code and `docs/api.md`:
 
 - Before the response is committed (`committed`) a failure is a JSON error
   through `writeError` (`internal/server/respond.go`); the readiness

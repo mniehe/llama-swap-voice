@@ -45,7 +45,7 @@ frames.
 2. Limits and rejections: each bound tested at the limit and one past it;
    each rejected format or field has a test beside the accepted ones.
 3. Status and error text: the client sees the status and message
-   `README.md` promises, including 503 busy, 504 on timeout and the 400
+   `docs/api.md` promises, including 503 busy, 504 on timeout and the 400
    wording for undecodable audio.
 4. Concurrency: TTS queue order, slot release on every path
    (`TestServer_Limited_StalledBodyReleasesSlot` is the shape), shutdown

@@ -4,7 +4,7 @@ Review the text agents read as instructions in this repository: `AGENTS.md`
 (`CLAUDE.md` is a symlink to it), the review criteria under
 `.claude/review/*.md` and `.claude/review/review.yaml`, whose `verify_notes`
 every verifier reads. The service itself sends no prompts to a model, so Go
-code, `README.md`, test fixtures and code comments are out of scope.
+code, `README.md`, `docs/`, test fixtures and code comments are out of scope.
 
 ## Two kinds of finding
 

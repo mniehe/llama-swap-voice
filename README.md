@@ -1,217 +1,321 @@
 # llama-swap-voice
 
-Local speech-to-text and text-to-speech for Home Assistant Voice, Hermes and
-any OpenAI-compatible client, on the
+llama-swap-voice adds speech to the
 [llama-swap](https://github.com/mostlygeek/llama-swap) you already run.
+llama-swap is a proxy that starts and stops local model servers on demand.
+This service puts OpenAI's audio API in front of it. Any client that can talk
+to OpenAI can then listen and speak through your own machine.
 
-Clients talk to it as they would to OpenAI's audio API. Behind it two small
-Qwen3 models do the work on your own hardware: one listens, and one speaks in
-a voice cloned from a short clip you provide. The repository is a Nix flake:
-its NixOS module runs the service, adds both models to your llama-swap and
-wires the two together.
+Two Qwen3 models do the work. One turns speech into text (automatic speech
+recognition, ASR). The other turns text into speech (TTS) in a voice that it
+copies from a short recording you supply. This is voice cloning.
+
+You get:
+
+- one HTTP service with `/v1/audio/speech` and `/v1/audio/transcriptions`;
+- a NixOS module that runs the service, adds both models to llama-swap and
+  connects the two;
+- replies that stream as MP3, Opus, WAV or PCM, at any speed from 0.25 to 4;
+- a choice of two TTS backends: llama.cpp on any hardware, or a Python server
+  on an NVIDIA GPU that also keeps the speaker's accent.
 
 ## Quick start
 
-You need NixOS with flakes enabled and a voice clip. Paste this into
-`flake.nix` beside the `configuration.nix` that `nixos-generate-config`
-wrote, or add the input and the module to your own flake:
+You need a NixOS machine with flakes enabled. These steps run the models on
+the CPU. [Options](#options) shows how to use a GPU.
 
-```nix
-{
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    llama-swap-voice.url = "github:mniehe/llama-swap-voice";
-  };
+1. Put this `flake.nix` beside your `configuration.nix`. If you already have
+   a flake, add the input, the module and the settings to it. `voicebox` is
+   an example name for the system.
 
-  outputs = {
-    nixpkgs,
-    llama-swap-voice,
-    ...
-  }: {
-    nixosConfigurations.voicebox = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [
-        ./configuration.nix
-        llama-swap-voice.nixosModules.default
-        {
-          services.llama-swap.enable = true;
+   ```nix
+   {
+     inputs = {
+       nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+       llama-swap-voice.url = "github:mniehe/llama-swap-voice";
+     };
 
-          services.llama-swap-voice = {
-            enable = true;
-            defaultVoice = "sample";
-            voices.sample.clip = "/srv/voices/sample.wav";
-          };
-        }
-      ];
-    };
-  };
-}
-```
+     outputs = {
+       nixpkgs,
+       llama-swap-voice,
+       ...
+     }: {
+       nixosConfigurations.voicebox = nixpkgs.lib.nixosSystem {
+         system = "x86_64-linux";
+         modules = [
+           ./configuration.nix
+           llama-swap-voice.nixosModules.default
+           {
+             services.llama-swap.enable = true;
 
-Fetch a clip to try it with, the sample from Qwen's own documentation, then
-switch:
+             services.llama-swap-voice = {
+               enable = true;
+               defaultVoice = "sample";
+               voices.sample.clip = "/srv/voices/sample.wav";
+             };
+           }
+         ];
+       };
+     };
+   }
+   ```
 
-```sh
-sudo mkdir -p /srv/voices
-sudo curl -L -o /srv/voices/sample.wav \
-  https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav
-sudo nixos-rebuild switch --flake .#voicebox
-```
+2. Download a recording to clone. This one is the sample from Qwen's
+   documentation.
 
-The first build downloads the pinned Qwen3 ASR and TTS GGUFs, about 4.8 GB.
-llama-swap loads both at start. Then:
+   ```sh
+   sudo mkdir -p /srv/voices
+   sudo curl -L -o /srv/voices/sample.wav \
+     https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav
+   ```
 
-```sh
-curl -s localhost:8920/v1/audio/speech \
-  -H 'Content-Type: application/json' \
-  -d '{"input": "The kitchen lights are off.", "response_format": "mp3"}' \
-  -o hello.mp3
+3. Build and activate the system. The first build downloads four model
+   files, about 4.8 GB. llama-swap loads both models when it starts.
 
-curl -s localhost:8920/v1/audio/transcriptions -F file=@hello.mp3
-# {"text":"The kitchen lights are off."}
-```
+   ```sh
+   sudo nixos-rebuild switch --flake .#voicebox
+   ```
 
-llama.cpp runs on the CPU by default. For an NVIDIA GPU, set
-`services.llama-swap-voice.llamaCpp.backend = "cuda";` (`vulkan` and `rocm`
-work too). The module needs `services.llama-swap.enable = true` and refuses
-`services.llama-swap.settings.apiKeys`, because the service cannot send a key.
-When llama-swap runs on another host, set `llamaSwap.enable = false` and
-`upstreamURL` instead.
+4. Ask the service to speak.
+
+   ```sh
+   curl -s localhost:8920/v1/audio/speech \
+     -H 'Content-Type: application/json' \
+     -d '{"input": "The kitchen lights are off.", "response_format": "mp3"}' \
+     -o hello.mp3
+   ```
+
+   Play `hello.mp3`. You hear the sentence in the sample voice.
+
+5. Send the recording back to be transcribed.
+
+   ```sh
+   curl -s localhost:8920/v1/audio/transcriptions -F file=@hello.mp3
+   # {"text":"The kitchen lights are off."}
+   ```
+
+From here, [use your own voice](#voices), [move the models to a
+GPU](#options) or [connect Home Assistant](#connecting-clients).
 
 ## How it works
 
+Clients talk only to the service. The service talks only to llama-swap, and
+llama-swap runs one server process for each model.
+
 ```mermaid
 flowchart LR
-  ha["Home Assistant<br/>(wyoming_openai bridge)"] --> svc
-  hermes[Hermes] --> svc
-  app[any OpenAI client] --> svc
-  svc["llama-swap-voice<br/>decodes uploads, encodes replies,<br/>changes speed"] --> swap[llama-swap]
-  swap --> asr["qwen3-asr<br/>llama-server"]
-  swap -->|tts.backend = llamacpp| ttsl["qwen3-tts<br/>llama-server /tts"]
-  swap -->|tts.backend = qwentts| ttsq["qwen3-tts<br/>qwen-tts-server /v1/tts"]
+  ha[Home Assistant] -->|Wyoming, TCP 10300| bridge[wyoming_openai bridge]
+  bridge -->|HTTP 8920| svc
+  hermes[Hermes] -->|HTTP 8920| svc
+  other[Other OpenAI clients] -->|HTTP 8920| svc
+  svc[llama-swap-voice service] -->|HTTP 8080| swap[llama-swap]
+  swap -->|HTTP| asr[ASR model in llama-server]
+  swap -->|HTTP, llamacpp backend| ttsl[TTS model in llama-server]
+  swap -->|HTTP, qwentts backend| ttsq[TTS model in Qwen TTS server]
+  clips[(Clips)] -.->|read| svc
+  clips -.->|read under qwentts| ttsq
 ```
 
-1. A client sends audio to `/v1/audio/transcriptions` or text to
-   `/v1/audio/speech`.
-2. llama-swap-voice turns that request into the one the model server expects.
-   It decodes uploads to 16 kHz mono WAV in-process, and for speech it
-   attaches the voice's clip (`llamacpp`) or names the voice (`qwentts`).
-3. llama-swap starts the model if it is not running and passes the request on.
-4. The reply is encoded into the format the client asked for as it arrives,
-   so playback starts before the whole sentence is ready.
+Clients use OpenAI's audio API on port 8920. The ports in the diagram are
+the defaults, and llama-swap gives each model server its own port. Only one
+of the two TTS servers runs: the `tts.backend` option selects it.
+`llama-server` is the HTTP server from llama.cpp, and the Qwen TTS server is
+a Python program. Home Assistant speaks its own voice protocol, Wyoming, so
+it connects through a bridge.
 
-The service runs no external programs: no ffmpeg, no sox.
+**A speech request**
+
+1. A client posts text to `/v1/audio/speech` and can name a voice.
+2. The service checks the text and the voice. It then waits its turn, because
+   it sends one speech request to the TTS model at a time.
+3. The service posts the request to llama-swap. Under the `llamacpp` backend
+   it attaches the clip of the voice. Under the `qwentts` backend it sends
+   only the name of the voice.
+4. llama-swap starts the TTS model if it is not running, then passes the
+   request on.
+5. The model returns audio as it generates it. The service changes the speed
+   if you asked for that, encodes the audio and sends it on immediately.
+   Playback can start before the sentence is complete.
+
+**A transcription**
+
+1. A client uploads an audio file to `/v1/audio/transcriptions`.
+2. The service decodes the upload to 16 kHz mono WAV, the format the ASR
+   model expects.
+3. The service posts the WAV to llama-swap, which passes it to the ASR model.
+4. The service removes the model's language marker from the transcript and
+   returns the text.
+
+The service decodes and encodes all audio itself. It runs no external
+program such as ffmpeg.
 
 ## Voices
 
-A voice is a recording of the speaker, named after its file. Declare each one
-in the module:
+A voice is a name plus a clip: a short recording of one speaker. The TTS
+model copies the speaker from the clip each time it speaks.
+
+### Declare a voice
+
+Give each voice a name and the path of its clip:
 
 ```nix
-services.llama-swap-voice.voices.narrator = {
-  clip = "/srv/voices/narrator.wav";
-  transcript = "The exact words spoken in the clip.";
+services.llama-swap-voice = {
+  defaultVoice = "narrator";
+  voices.narrator = {
+    clip = "/srv/voices/narrator.wav";
+    transcript = "The exact words spoken in the clip.";
+  };
 };
 ```
 
-The module links each clip into `<stateDir>/voices` as `<name>.<extension>`.
-Every `.wav` or `.mp3` in that directory is a voice, so a clip copied there
-by hand counts too, and a symlink is an alias: `alloy.mp3 -> sample.wav`
-lets a client that asks for OpenAI's `alloy` hear `sample`. Requests that name
-no voice get `defaultVoice`. The service reads voices at startup; restart it
-after adding one. A clip over 10 MiB is a startup error.
+A request selects a voice by name. A request that names no voice gets
+`defaultVoice`.
 
-Clips stay where they are and never enter the Nix store. Keep them outside
-`/home`, which neither the service nor llama-swap can read. The voices
-directory is trusted operator configuration: symlinks in it are followed
-wherever they point. Only use recordings you have the right to clone.
+The clip stays where it is and never enters the Nix store. Four rules
+apply:
 
-### Two TTS backends
+- Keep clips outside `/home`. Neither the service nor llama-swap can read it.
+- A clip is a `.wav` or `.mp3` file of at most 10 MiB.
+- Restart the service after you add a voice.
+- Use only recordings that you have the right to clone.
 
-`tts.backend` picks the server that speaks:
+[The voices directory](docs/options.md#the-voices-directory) explains
+aliases, clips that you add by hand and how to remove a voice.
+
+### Choose a TTS backend
+
+The `tts.backend` option selects the server that speaks.
 
 | | `llamacpp` (default) | `qwentts` |
 |---|---|---|
-| Server | llama.cpp's `llama-server`, `/tts` | `qwen-tts-server` from `python/`, which runs [faster-qwen3-tts](https://pypi.org/project/faster-qwen3-tts/), `/v1/tts` |
-| Cloning | From a speaker embedding of the clip only | In context from the clip plus its exact transcript, which keeps accents |
-| Request | Multipart form with the text, `TTS_LANG` and the clip | JSON with the text and the voice's name; no clip |
-| A voice needs | A `.wav` or `.mp3` clip | A `.wav` clip that the module's group can read, and its exact `transcript`. A `null` transcript falls back to embedding-only cloning, which keeps the voice but loses its accent. `instruct` and the sampling settings are optional |
-| Hardware | CPU, or a GPU through `llamaCpp.backend` | An NVIDIA GPU on x86_64 Linux |
-| Built | llama.cpp from nixpkgs and the pinned GGUFs | The CUDA Python environment (several GB of wheels) and the Qwen3-TTS weights (about 4.5 GB) |
+| Server | `llama-server` from llama.cpp | The Qwen TTS server, which runs [faster-qwen3-tts](https://pypi.org/project/faster-qwen3-tts/) |
+| How it clones | From a speaker embedding of the clip only | In context, from the clip plus its exact transcript |
+| Result | The voice, without its accent | The voice and its accent |
+| Hardware | A CPU, or a GPU that `llamaCpp.backend` selects | An NVIDIA GPU on x86_64 Linux |
+| A voice needs | A `.wav` or `.mp3` clip | A `.wav` clip that the group `llama-swap-voice` can read, and a `transcript` |
+| Extra download | None | The CUDA Python environment, several GB, and the weights, about 4.5 GB |
 
-Keep `llamacpp` for a CPU or a non-NVIDIA GPU, or when the voice's accent
-does not matter. Pick `qwentts` on an NVIDIA GPU to keep accents:
+A speaker embedding is a numeric summary of how a voice sounds. Keep
+`llamacpp` on a CPU or a non-NVIDIA GPU, or when the accent does not
+matter. Select `qwentts` on an NVIDIA GPU to keep the accent:
 
 ```nix
 services.llama-swap-voice.tts.backend = "qwentts";
 ```
 
-Both are built on demand: the build of a system that selects the backend
-fetches what it needs. `nix flake check` builds neither the CUDA environment
-nor the weights; it runs the Python server's tests against a fake engine and
-checks the weights pin at evaluation.
+Under `qwentts`, three more things apply:
 
-Under `qwentts` the service sends only the voice's name, so each voice needs
-a clip on both sides; the module writes the server's configuration from the
-same registry. Transcripts and instructs land in the world-readable Nix
-store, so they are not secret.
+- A voice with a `null` transcript falls back to embedding-only cloning. That
+  keeps the voice but loses its accent.
+- The Qwen TTS server reads each clip itself, as llama-swap's user. Make each
+  clip readable by the service's group, for example mode `0640` and group
+  `llama-swap-voice`. An unreadable clip stops the server at startup, and the
+  error appears in llama-swap's upstream log.
+- Transcripts and style instructions go into the Nix store, which every user
+  can read. Do not put secrets in them.
 
-### Preparing a voice
+Nix builds the CUDA environment and the weights only for a system that
+selects `qwentts`. `nix flake check` builds neither.
 
-llama-swap-voice and `qwen-tts-server` pass a clip on as it is, so prepare
-each clip once:
+### Prepare a clip
 
-1. Cut about 30 seconds of clean speech, starting and ending on a sentence
+Neither TTS server changes a clip, so prepare each clip once. You need
+ffmpeg for this step only.
+
+1. Cut about 30 seconds of clean speech. Start and end on a sentence
    boundary.
-2. Normalise it to -22 LUFS integrated and -1.5 dBTP true peak with ffmpeg's
-   `loudnorm` in two passes, writing mono 24 kHz 16-bit WAV. The first pass
-   measures:
+2. Measure the loudness of the source.
 
    ```sh
    ffmpeg -hide_banner -nostats -i source.wav \
      -af loudnorm=I=-22:TP=-1.5:LRA=11:print_format=json -f null -
    ```
 
-   The second feeds the measured `input_i`, `input_tp`, `input_lra` and
-   `input_thresh` back as `measured_I`, `measured_TP`, `measured_LRA` and
-   `measured_thresh`, and `target_offset` as `offset`, so a single gain is
-   applied:
+3. Normalise the clip with the measured values. Copy `input_i`, `input_tp`,
+   `input_lra`, `input_thresh` and `target_offset` from the output of step 2
+   into shell variables of the same names. The result is mono, 24 kHz,
+   16-bit WAV at -22 LUFS with a true peak of -1.5 dBTP.
 
    ```sh
    ffmpeg -hide_banner -i source.wav \
      -af loudnorm=I=-22:TP=-1.5:LRA=11:measured_I=$input_i:measured_TP=$input_tp:measured_LRA=$input_lra:measured_thresh=$input_thresh:offset=$target_offset:linear=true:print_format=summary \
-     -ac 1 -ar 24000 -sample_fmt s16 robbie.wav
+     -ac 1 -ar 24000 -sample_fmt s16 narrator.wav
    ```
 
-3. Check that the gain really was one gain. `loudnorm` drops to dynamic mode
-   silently when the gain would push the true peak over the ceiling, and
-   dynamic mode reshapes the voice. The check is a scalar-gain null test:
-   measure the integrated loudness of `robbie.wav` as in the first pass, scale
-   the source by the difference and subtract it from the clip. What remains
-   should be tens of dB below the clip's own level; a residual within a few dB
-   of it means the gain varied.
+4. Under `qwentts`, write the exact words of the clip into the `transcript`
+   of the voice. The server cannot tell a wrong transcript from a right one,
+   and a wrong one ruins the voice.
 
-   ```sh
-   # output_i: input_i printed by the first-pass command run on robbie.wav
-   gain=$(echo "$output_i - ($input_i)" | bc)
-   ffmpeg -hide_banner -i source.wav -af volume=${gain}dB -ac 1 -ar 24000 -sample_fmt s16 scaled.wav
-   ffmpeg -hide_banner -nostats -i robbie.wav -i scaled.wav -filter_complex \
-     '[0][1]amerge=inputs=2,pan=mono|c0=c0-c1,astats=measure_perchannel=none:measure_overall=RMS_level' -f null -
-   ffmpeg -hide_banner -nostats -i robbie.wav \
-     -af astats=measure_perchannel=none:measure_overall=RMS_level -f null -
-   ```
+`loudnorm` can change the character of a voice without a warning.
+[Check that a clip has one constant gain](docs/options.md#check-that-a-clip-has-one-constant-gain)
+shows how to test for that.
 
-   If the clip went dynamic, lower its peaks or choose a quieter target, and
-   normalise again.
-4. Under `qwentts`, write the exact transcript of the clip, word for word,
-   into the voice's `transcript`. The server cannot tell a wrong transcript
-   from a right one: a placeholder passes validation and ruins the voice.
+## Options
 
-ffmpeg is needed only for this preparation; nothing here runs it.
+All options are under `services.llama-swap-voice`.
+[Module options](docs/options.md) lists every option with its type, default
+and effect.
 
-## Connect your apps
+### How the options fit together
 
-**Hermes** speaks the OpenAI audio API (`~/.hermes/config.yaml`):
+Enable the module, declare one voice and name it as `defaultVoice`. The
+module then does the rest:
+
+1. It runs the service on `127.0.0.1:8920` as a sandboxed systemd unit.
+2. It downloads the ASR model and the TTS model, each pinned by hash.
+3. It adds one entry for each model to `services.llama-swap.settings`, beside
+   your own models. An entry is llama-swap's description of one model: its
+   name and the command that serves it.
+4. It puts both entries in a llama-swap group that keeps them loaded. Set
+   `llamaSwap.group.sharing = "takeTurns"` when one GPU cannot also hold a
+   chat model.
+5. It points the service at that llama-swap.
+
+Besides the voices, most people change only a few options. This example
+shows them:
+
+```nix
+services.llama-swap-voice = {
+  enable = true;
+
+  # Run llama.cpp on an NVIDIA GPU. "vulkan" and "rocm" also work.
+  llamaCpp.backend = "cuda";
+
+  # Keep the speaker's accent. This needs an NVIDIA GPU.
+  tts.backend = "qwentts";
+
+  # Accept clients from the local network. The service asks for no API key.
+  host = "0.0.0.0";
+  ipAddressAllow = ["192.168.1.0/24"];
+};
+```
+
+These are the options in the example, and two related ones:
+
+| Option | Default | Effect |
+|---|---|---|
+| `tts.backend` | `"llamacpp"` | Selects the TTS server: `"llamacpp"` or `"qwentts"`. |
+| `llamaCpp.backend` | `"cpu"` | Selects the hardware for llama.cpp: `"cpu"`, `"cuda"`, `"vulkan"` or `"rocm"`. |
+| `host` | `"127.0.0.1"` | The address the service listens on. |
+| `ipAddressAllow` | `[]` | Addresses, besides loopback, that the service can exchange packets with. |
+| `upstreamURL` | your `services.llama-swap` | The base URL of llama-swap. Set it when llama-swap runs on another machine. |
+| `llamaSwap.group.sharing` | `"pinned"` | Selects whether the voice models stay loaded or take turns with your other models. |
+
+Two settings stop evaluation most often. `services.llama-swap.enable` must
+be on. And `services.llama-swap.settings.apiKeys` must be unset, because the
+service cannot send an API key.
+
+## Connecting clients
+
+Any client of OpenAI's audio API works. Give it the base URL
+`http://<host>:8920/v1`, the model names `qwen3-asr` and `qwen3-tts`, and the
+name of a voice. The service needs no API key and ignores one if a client
+sends it.
+
+### Hermes
+
+Hermes, an AI agent with a voice mode, speaks the OpenAI audio API. Put
+this in `~/.hermes/config.yaml`:
 
 ```yaml
 stt:
@@ -229,596 +333,89 @@ tts:
     voice: sample
 ```
 
-The key is a placeholder: Hermes wants one, and llama-swap-voice ignores it.
+### Home Assistant
 
-**Home Assistant** speaks Wyoming, and llama-swap-voice has no Wyoming
-listener. Run the [wyoming_openai](https://github.com/roryeckel/wyoming_openai)
-bridge in front of it:
+Home Assistant speaks the Wyoming protocol, which the service does not. Run
+the [wyoming_openai](https://github.com/roryeckel/wyoming_openai) bridge
+between them.
 
-```sh
-STT_BACKEND=OPENAI  STT_OPENAI_URL=http://localhost:8920/v1  STT_MODELS=qwen3-asr
-TTS_BACKEND=OPENAI  TTS_OPENAI_URL=http://localhost:8920/v1  TTS_MODELS=qwen3-tts
-TTS_VOICES=sample
-```
+1. Start the bridge with these environment variables:
 
-Then add a Wyoming integration in Home Assistant that points at the bridge.
+   ```sh
+   STT_BACKEND=OPENAI  STT_OPENAI_URL=http://localhost:8920/v1  STT_MODELS=qwen3-asr
+   TTS_BACKEND=OPENAI  TTS_OPENAI_URL=http://localhost:8920/v1  TTS_MODELS=qwen3-tts
+   TTS_VOICES=sample
+   ```
 
-## Configuration
+2. In Home Assistant, add a Wyoming integration that points at the bridge.
+   Port 10300 is the bridge's own default.
 
-### Module options
+## Reference
 
-Every option sits under `services.llama-swap-voice`. A name such as
-`shutdown.{grace,total,hard}` stands for one option per name in the braces.
-
-**The service**
-
-| Option | Default | What it does |
-|---|---|---|
-| `enable` | `false` | Run the service as a systemd unit |
-| `package` | this flake's package | The build to run |
-| `user`, `group` | `"llama-swap-voice"` | Account the service runs as. The module creates them only under the default name; a custom user or group must already exist. Under `qwentts` llama-swap's user joins `group` and gains all its access, so do not pick a group other services share |
-| `stateDir` | `"/var/lib/llama-swap-voice"` | Directory the module owns; the service reads voices from `<stateDir>/voices`. An absolute path without a trailing slash or `%`. It must belong to this module alone, because tmpfiles sets its owner and mode |
-| `defaultVoice` | `null`, must be set | `VOICES_DEFAULT`; one of `voiceNames` |
-| `host`, `port` | `"127.0.0.1"`, `8920` | `HOST`, `PORT` |
-| `upstreamURL` | llama-swap's address, or `"http://127.0.0.1:8080"` when `llamaSwap.enable` is false | `UPSTREAM_URL`. A wildcard listen address (`""`, `0.0.0.0`, `[::]`) becomes loopback, and `services.llama-swap.tls.enable` selects `https`; the certificate must then cover the derived host (`localhost` by default) or you set this by hand. Evaluation checks only for `http://` or `https://`, a host and no whitespace; the service parses the URL fully at startup |
-| `ipAddressAllow` | `[]` | Addresses besides loopback the service may exchange packets with, in systemd's `IPAddressAllow=` syntax |
-| `tts.backend` | `"llamacpp"` | `UPSTREAM_TTSBACKEND`: `llamacpp` or `qwentts` |
-| `tts.maxInputChars` | `null` | `TTS_MAXINPUTCHARS` |
-| `upstream.ttsConcurrency` | `1` | `UPSTREAM_TTSCONCURRENCY`; see [Concurrency](#concurrency) |
-| `request.timeout` | `null` | `REQUEST_TIMEOUT`, a positive Go duration |
-| `request.maxConcurrent`, `request.maxConcurrentTTS` | `null` | `REQUEST_MAXCONCURRENT`, `REQUEST_MAXCONCURRENTTTS` |
-| `shutdown.{grace,total,hard}` | `null` | `SHUTDOWN_GRACE` (a Go duration), `SHUTDOWN_TOTAL` and `SHUTDOWN_HARD` (positive Go durations) |
-| `extraEnvironment` | `{}` | Extra variables by full name; they win over the generated ones. See below |
-
-A limit left `null` leaves its variable unset, so the service's own default
-applies. Durations use Go's syntax, such as `1m30s`, without a leading `+` or
-`-`; evaluation reads them exactly as the service does and refuses any above
-Go's maximum of about 292 years.
-
-The module reads six variables itself after `extraEnvironment` is merged:
-`SHUTDOWN_GRACE`, `SHUTDOWN_TOTAL` and `SHUTDOWN_HARD` set `TimeoutStopSec`,
-and `TTS_MAXINPUTCHARS`, `UPSTREAM_TTSCONCURRENCY` and `REQUEST_MAXCONCURRENT`
-feed the llama-swap entries. A value set through `extraEnvironment` counts
-instead of the option it overrides, and evaluation fails, naming the
-variable, if it is not a value the option would accept: a Go duration, or a
-positive decimal integer without a sign or leading zero. `TimeoutStopSec` is
-the sum of the shutdown durations you set plus 30 seconds for those you leave
-unset, and at least 90 seconds.
-
-**Voices**
-
-| Option | Default | What it does |
-|---|---|---|
-| `voices` | `{}` | The voice registry, by name. A name starts with a letter, digit or `_` and holds only letters, digits, `.`, `_` and `-` |
-| `voices.<name>.clip` | must be set | Absolute path to the recording, as a string so it stays out of the store. `.wav` or `.mp3`, and `.wav` under `qwentts` |
-| `voices.<name>.transcript` | `null` | What the clip says, for `qwentts`. Null selects embedding-only cloning, which keeps the voice but not its accent |
-| `voices.<name>.instruct` | `null` | Style instruction, for `qwentts`; needs a transcript |
-| `voices.<name>.{temperature,topK,topP,repetitionPenalty}` | `0.7`, `50`, `1.0`, `1.05` | Sampling settings, for `qwentts` |
-| `voiceNames` | the declared names | Read-only: the declared voice names, sorted, since Nix attribute sets keep no order |
-
-The `llamacpp` backend uses only the clip and ignores the rest. Evaluation
-fails, naming the option, when `defaultVoice` is missing or undeclared, a clip
-path is relative or has another extension, or a `qwentts` voice has an
-`instruct` without a transcript or a transcript of only whitespace, as
-Python's `str.strip` counts it.
-
-If a declared link in `<stateDir>/voices` points somewhere other than its
-clip, for example after you change the clip's path, the service refuses to
-start until you delete the link and run `systemd-tmpfiles --create`. The
-module never removes links: after you delete a voice, or change a clip's
-extension (case included), delete the old link by hand; otherwise the service
-refuses to start with `voice "<name>" is provided by both`.
-
-**llama-swap and the llama.cpp entries**
-
-| Option | Default | What it does |
-|---|---|---|
-| `llamaSwap.enable` | `true` | Add the entries to `services.llama-swap.settings` and derive `upstreamURL`. Off, the module leaves `services.llama-swap` untouched |
-| `llamaSwap.group.enable` | `true` | Put both entries in a group, so loading one never stops the other; see [When the models unload](#when-the-models-unload) |
-| `llamaSwap.group.sharing` | `"pinned"` | `pinned` keeps both entries loaded when other models load. `takeTurns` lets a model from an exclusive group, such as an ungrouped chat model, stop both, and makes loading either entry stop your models in groups that are not `persistent`; see [When the models unload](#when-the-models-unload) |
-| `llamaSwap.group.name` | `"voice"` | The group's name |
-| `llamaSwap.group.location` | `"legacy"` | `legacy` writes top-level `groups`; `routing` writes `routing.router.settings.groups`. llama-swap refuses a configuration with both layouts, so match yours |
-| `llamaCpp.backend` | `"cpu"` | `cpu`, `cuda`, `vulkan` or `rocm`. Picks the default package and, for `cuda`, relaxes llama-swap's unit |
-| `llamaCpp.package` | `pkgs.llama-cpp` built for `llamaCpp.backend` alone | The llama.cpp providing `llama-server`, 0.8.0 or newer. The default sets every backend flag, so `nixpkgs.config.cudaSupport` cannot add CUDA to a `cpu` build. A package you set must match `llamaCpp.backend`. The check reads the package's version, so a version that is a build number passes unchecked |
-| `models.{asr,tts}.name` | `"qwen3-asr"`, `"qwen3-tts"` | Entry names, not empty and not equal. `models.tts` is used only under `llamacpp` |
-| `models.{asr,tts}.artifacts.{model,mmproj}` | the pinned GGUF | The model and its multimodal projector, each with `url`, `hash` and `path` |
-| `models.{asr,tts}.artifacts.{model,mmproj}.{url,hash}` | pinned Hugging Face revision and SRI hash | Where the file comes from |
-| `models.{asr,tts}.artifacts.{model,mmproj}.path` | `pkgs.fetchurl { inherit url hash; }` | The file on disk. Set it to a local file, as a string, to skip the download; a Nix path literal would copy the file into the store |
-| `models.{asr,tts}.device` | `null` | `--device`, such as `CUDA0`; null leaves it out, which a CPU build needs |
-| `models.{asr,tts}.{gpuLayers,contextSize,parallel}` | `99`, `4096`, `1` | `-ngl`, `-c`, `-np` |
-| `models.{asr,tts}.concurrencyLimit` | ASR: the service's transcription limit (4 unless changed); TTS: `5` | llama-swap's `concurrencyLimit`. llama-swap answers 429 beyond it; within it, `llama-server` queues requests beyond its `parallel` slots |
-| `models.{asr,tts}.ttl` | `0` | Seconds idle before llama-swap unloads the entry; 0 never unloads it for idleness. See [When the models unload](#when-the-models-unload) |
-| `models.{asr,tts}.preload` | `true` | Load the entry when llama-swap starts |
-| `models.{asr,tts}.extraArgs` | `[]` | Appended to the `llama-server` command |
-
-The commands are
-`llama-server --port ${PORT} -m <model> --mmproj <mmproj> [--device <device>] -ngl 99 -c 4096 -np 1 --flash-attn on --no-webui`,
-with `--temp 0` before `--flash-attn` for the ASR entry. Both check `/health`.
-
-**The `qwentts` entry**
-
-| Option | Default | What it does |
-|---|---|---|
-| `tts.qwentts.package` | this flake's `qwen-tts-server` | The server; the flake builds it for x86_64 Linux only |
-| `tts.qwentts.model` | this flake's `qwen3-tts-model` | The weights directory. A local copy works; give it as a string, because a Nix path literal copies it into the store |
-| `tts.qwentts.modelName` | `"qwen3-tts"` | Entry name, not empty |
-| `tts.qwentts.{language,chunkSize,queueSize,queueWaitSeconds,maxSegmentChars,maxNewTokens}` | `"English"`, `12`, `8`, `60`, `400`, `600` | The server's `language`, `chunk_size`, `queue_size`, `queue_wait_seconds`, `max_segment_chars` and `max_new_tokens`; see [Config](#config) |
-| `tts.qwentts.concurrencyLimit` | `queueSize` | llama-swap's `concurrencyLimit`; llama-swap answers 429 beyond it |
-| `tts.qwentts.{ttl,preload}` | `0`, `true` | As for the llama.cpp entries |
-| `tts.qwentts.cudaDevice` | `"0"` | `CUDA_VISIBLE_DEVICES`, in PCI bus order |
-| `tts.qwentts.extraArgs` | `[]` | Appended to the `qwen-tts-server` command |
-
-The entry runs `qwen-tts-server --port ${PORT} --config <generated JSON>` and
-checks `/health`. The generated configuration takes `max_input_chars` from the
-effective `TTS_MAXINPUTCHARS`, so the server and the service refuse the same
-inputs, and each voice's `clip` is its link in `<stateDir>/voices`.
-`nix flake check` loads a generated file with the server's own parser.
-
-### What the module adds to llama-swap
-
-With `llamaSwap.enable` on, the module merges into
-`services.llama-swap.settings`, beside your own models:
-
-- the ASR entry, `models.asr.name`, running `llama-server` on the pinned
-  Qwen3-ASR-1.7B Q8_0 GGUF and its projector;
-- exactly one TTS entry: under `llamacpp`, `models.tts.name` running
-  `llama-server` on the pinned Qwen3-TTS-12Hz-1.7B-Base Q8_0 GGUFs; under
-  `qwentts`, `tts.qwentts.modelName` running `qwen-tts-server`;
-- the preloaded entries in `hooks.on_startup.preload`, beside yours;
-- with `llamaSwap.group.enable`, the group that holds both entries.
-
-It sets no top-level llama-swap value such as `healthCheckTimeout`, and it
-sets `UPSTREAM_TTSMODEL` and `UPSTREAM_ASRMODEL` to the two entries' names.
-
-#### When the models unload
-
-llama-swap stops running models when it loads another one, by group. A model
-in no group joins llama-swap's implicit default group, which has `swap` and
-`exclusive` on: loading one of its models stops the others in it, and stops
-the models of every other group that is not `persistent`. A `ttl` above 0
-also unloads an idle model, and llama-swap's `/unload` endpoint stops them
-all. The voice group is written with `swap = false`, so the ASR and TTS
-entries never stop each other. `llamaSwap.group.sharing` sets the rest:
-`pinned` writes `exclusive = false` and `persistent = true`; `takeTurns`
-writes `exclusive = true` and `persistent = false`.
-
-| `llamaSwap.group` | The ASR and TTS entries | Loading an ungrouped model, such as a chat model | Loading the ASR or TTS entry |
-|---|---|---|---|
-| `enable = true`, `sharing = "pinned"` (the default) | Stay loaded together | Leaves both loaded; only their `ttl` unloads them | Stops no other model |
-| `enable = true`, `sharing = "takeTurns"` | Stay loaded together | Stops both, as does a model from any other exclusive group | Stops every running model of every group that is not `persistent`, the default group and your non-exclusive groups included |
-| `enable = false` | Loading one stops the other, so a transcription followed by speech reloads both | Stops both, as does a model from any other exclusive group | Stops the other voice entry, the default group's other models and every running model of every group that is not `persistent` |
-
-The default suits a GPU with room for the voice models beside your others.
-On a single GPU that cannot hold a large chat model and the voice models at
-once, set `sharing = "takeTurns"`: the chat model stops the pair, and the
-next voice request stops the chat model and loads its entry again. llama-swap
-preloads in order, so under `takeTurns` a voice preload stops any model of a
-non-persistent group preloaded before it. Loading a model from a group of
-yours with `exclusive = false` never stops the voice entries.
-
-#### Checks at evaluation
-
-With `llamaSwap.enable` on, evaluation fails, naming the option, when:
-
-- `services.llama-swap.enable` is false;
-- the TTS entry's `concurrencyLimit` is below the effective
-  `UPSTREAM_TTSCONCURRENCY`, or `models.asr.concurrencyLimit` is below the
-  effective `REQUEST_MAXCONCURRENT`;
-- `services.llama-swap.settings.apiKeys` is set;
-- `services.llama-swap.listenAddress` is an IPv6 address without brackets,
-  such as `::1`, which llama-swap refuses, or carries a zone such as `%eth0`;
-- `llamaCpp.package` is older than llama.cpp 0.8.0;
-- an entry name is empty, or the ASR and TTS entries share a name;
-- the group's layout clashes with yours: `legacy` fails when your settings
-  have a `routing.router` engine or a top-level `matrix`; `routing` fails when
-  they have top-level `groups` or `matrix`, or a `routing.router.use` other
-  than `group`. Set `llamaSwap.group.location` to match, or turn the group
-  off.
-
-#### Sandboxing
-
-The service's unit can write only to its private `/tmp`, where large uploads
-spool, cannot read home directories, and can exchange packets only with
-loopback. Put a non-loopback upstream, its DNS resolver, or the clients of a
-non-loopback `host` in `ipAddressAllow`. That includes llama-swap listening
-on a specific non-loopback address of this host.
-
-nixpkgs' llama-swap unit runs as a dynamic user with a read-only file system
-and no access to `/home`, so put GGUFs and clips elsewhere. The module
-changes that unit only as follows:
-
-- `cuda`, or `qwentts` whatever `llamaCpp.backend` is (torch uses CUDA):
-  `MemoryDenyWriteExecute = false`, `DeviceAllow` for `char-nvidia` and
-  `char-nvidia-uvm`, and `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so a device index
-  means the same card as in `nvidia-smi`. A `DeviceAllow` list closes every
-  other device, so this affects every model llama-swap runs; with `vulkan` or
-  `rocm` the module adds `char-drm` (and `/dev/kfd` for `rocm`) back. An older
-  NVIDIA driver that names its device `nvidia-frontend` in `/proc/devices`
-  needs that added to `DeviceAllow`.
-- `qwentts`: llama-swap's user joins the module's group, because the server
-  reads each clip through `<stateDir>/voices`, and a start step creates the
-  server's cache root, `${XDG_CACHE_HOME:-/var/cache/llama-swap}/qwen-tts-server`.
-  The module cannot change your clips' permissions: under `qwentts` each clip
-  must be readable by the module's group, for example mode `0640` and group
-  `llama-swap-voice`. Nothing checks this before llama-swap starts the server;
-  an unreadable clip stops the server at startup, with the error in
-  llama-swap's upstream log.
-- `vulkan` and `rocm` under `llamacpp`, and `cpu`, leave the unit as nixpkgs
-  ships it.
-
-As a sizing guide, measured once on a 16 GB RTX A4000: the TTS server took
-5864 MiB and the llama.cpp ASR 3332 MiB, and the server's `/health` answered
-about 16 seconds after start. llama-swap waits
-`services.llama-swap.settings.healthCheckTimeout` (120 seconds by default)
-for an entry's `/health`; it must cover loading the model and, for the TTS
-server, warming up every voice. Set it yourself if it does not.
-
-### Environment variables
-
-The module writes these for you. Run by hand, the service takes all of its
-configuration from them; only the default voice is required.
-
-| Variable (`LLAMA_SWAP_VOICE_…`) | Default | What it does |
-|---|---|---|
-| `HOST`, `PORT` | `127.0.0.1`, `8920` | Where to listen |
-| `UPSTREAM_URL` | `http://127.0.0.1:8080` | Your llama-swap |
-| `UPSTREAM_TTSMODEL`, `UPSTREAM_ASRMODEL` | `qwen3-tts`, `qwen3-asr` | Model names in your llama-swap configuration |
-| `UPSTREAM_TTSBACKEND` | `llamacpp` | `llamacpp` posts a multipart form to `/tts` with the voice's clip attached. `qwentts` posts JSON `{"voice","input","response_format":"wav"}` to `/v1/tts`, naming the voice and sending no clip. Each voice still needs a clip in `VOICES_DIR` to be accepted |
-| `UPSTREAM_TTSCONCURRENCY` | `1` | Speech requests sent to the TTS model at once; see [Concurrency](#concurrency) |
-| `VOICES_DIR` | `/var/lib/llama-swap-voice/voices` | Where voice clips live |
-| `VOICES_DEFAULT` | *required* | Voice used when a request names none |
-| `TTS_LANG` | `en` | Language sent by the `llamacpp` backend. `qwentts` does not send it; the server takes `language` from its own configuration |
-| `TTS_MAXINPUTCHARS` | `4096` | Longest text accepted per request, in characters |
-| `ASR_PREFIXREGEX` | `^language \w+<asr_text>` | Removed from the start of each transcript |
-| `REQUEST_TIMEOUT` | `2m` | Longest a speech or transcription request may take, streaming included. Every other endpoint gets 10 seconds |
-| `REQUEST_MAXCONCURRENT` | `4` | Transcriptions handled at once; more get a 503 |
-| `REQUEST_MAXCONCURRENTTTS` | `8` | Speech requests handled at once, waiting ones included; more get a 503 |
-| `LOG_LEVEL`, `LOG_FORMAT` | `info`, `json` | `debug`, `info`, `warn` or `error`; `json` or `console` |
-| `SHUTDOWN_GRACE`, `SHUTDOWN_TOTAL`, `SHUTDOWN_HARD` | `0s`, `15s`, `3s` | How shutdown unfolds; see below |
-
-If anything is wrong at startup, the service lists every problem at once and
-exits.
-
-On SIGTERM or SIGINT, readiness turns 503 and shutdown runs in three steps:
-
-1. **Grace**: keep serving while load balancers notice readiness.
-2. **Total**: stop accepting connections and let in-flight requests finish.
-3. **Hard**: cancel any still running, close every connection and wait this
-   long for them to wind down. If requests are still running after it, the
-   service logs an error and exits with status 1.
-
-## Concurrency
-
-Speech and transcriptions are admitted separately, so waiting speech never
-turns a transcription away:
-
-```mermaid
-flowchart LR
-  speech[speech request] --> tts_admit["REQUEST_MAXCONCURRENTTTS (8)<br/>full: 503"]
-  tts_admit --> gate["arrival-order gate<br/>UPSTREAM_TTSCONCURRENCY (1) at once"]
-  gate --> tts_swap["llama-swap<br/>TTS concurrencyLimit<br/>over it: 429"]
-  tts_swap --> tts_server["llama-server -np slots,<br/>or qwen-tts-server's queue"]
-  asr[transcription] --> asr_admit["REQUEST_MAXCONCURRENT (4)<br/>full: 503"]
-  asr_admit --> asr_swap["llama-swap<br/>ASR concurrencyLimit<br/>over it: 429"]
-  asr_swap --> asr_server["llama-server -np slots"]
-```
-
-- A speech request beyond `REQUEST_MAXCONCURRENTTTS`, or a transcription
-  beyond `REQUEST_MAXCONCURRENT`, gets an immediate 503.
-- An admitted speech request beyond `UPSTREAM_TTSCONCURRENCY` waits at the
-  gate in arrival order, for up to `REQUEST_TIMEOUT`, and keeps its admission
-  place while it waits; one still waiting at the timeout gets a 504. The gate
-  keeps sentences in order and frees a place when the upstream reply has been
-  read to its end, not when the client finishes playing it, so the default
-  of 1 costs little under either backend.
-- llama-swap does not queue: it answers 429 to requests beyond an entry's
-  `concurrencyLimit`. So `UPSTREAM_TTSCONCURRENCY` must not exceed the TTS
-  entry's `concurrencyLimit`, nor `REQUEST_MAXCONCURRENT` the ASR entry's.
-  The module checks both.
-- Under `llamacpp`, `llama-server` runs `-np` (`parallel`) requests at once
-  and queues the rest in order. Raising `UPSTREAM_TTSCONCURRENCY` above `-np`
-  only moves the waiting from the service's gate into `llama-server`.
-- Under `qwentts`, the server generates one request at a time and holds up
-  to `queue_size` more; more get a 503 `queue full`, and one that waits longer
-  than `queue_wait_seconds` gets a 503. Its `concurrencyLimit` defaults to
-  `queueSize`.
-
-**Retries.** When a speech request fails before any audio comes back, because
-the connection dropped or llama-swap answered 502 while the model was down,
-the service sends it once more, keeping its place at the gate. It never
-retries once audio has started, never more than once, and never for a
-transcription, and it follows no upstream redirect. Any other upstream error
-reaches the client with the upstream's status, message and `Retry-After`.
-
-## API
-
-Every path also works without the `/v1` prefix.
-
-| Endpoint | Does |
+| Page | Contents |
 |---|---|
-| `POST /v1/audio/speech` | Text to speech. JSON body up to 1 MiB: `input` (required, up to `TTS_MAXINPUTCHARS` characters), `voice`, `response_format` (`mp3` default, `opus`, `wav`, `pcm`), `speed` (0.25 to 4). `model` and `instructions` are accepted and ignored |
-| `POST /v1/audio/transcriptions` | Speech to text. Multipart `file` up to 25 MiB and 20 minutes, decoded to 16 kHz mono before transcribing. `response_format` `json` (default), `verbose_json` or `text` |
-| `GET /v1/models`, `GET /v1/audio/voices` | The two model names; the voice names |
-| `GET /health`, `GET /internal/liveness`, `GET /internal/readiness` | Health checks; readiness turns a plain-text 503 while shutting down |
+| [Module options](docs/options.md) | Every option; what the module refuses and what it adds to llama-swap; when the models unload; concurrency; the sandbox and the GPU; the environment variables |
+| [The HTTP API](docs/api.md) | Endpoints, audio formats, errors and status codes, limits and shutdown |
+| [The Qwen TTS server](docs/qwen-tts-server.md) | The Python server of the `qwentts` backend: startup and exit, behaviour under llama-swap, the configuration file, endpoints and errors |
 
-`verbose_json` returns the same `{"text": "…"}` as `json`: text only, with no
-segments, words or timestamps. The model names come from the configuration,
-not the request.
+## Running without Nix
 
-### Formats
+The service is one Go binary. To build it you need cgo, a C compiler,
+pkg-config and libopus.
 
-| Upload format | Accepted |
-|---|---|
-| WAV | 16-bit or 24-bit PCM, or 32-bit float; mono or stereo; 8 to 48 kHz |
-| Ogg Opus | Mono or stereo, one stream. Chained or multiplexed Ogg is refused |
-| MP3 | MPEG-1 or MPEG-2 Layer III (16 to 48 kHz), mono or stereo. MPEG-2.5 (8 to 12 kHz) is refused |
-| M4A/AAC, FLAC, WebM, Ogg Vorbis, anything else | Refused |
+1. Install the service.
 
-The service decodes every upload in-process and runs no external program
-such as ffmpeg. It carries no AAC or MP4 decoder, and its FLAC decoder was
-removed after review found defects in it on malformed files. Convert such
-uploads to WAV, Opus or MP3 first; Hermes does so itself when it sees the
-400.
+   ```sh
+   go install github.com/mniehe/llama-swap-voice/cmd/llama-swap-voice@latest
+   ```
 
-| Reply format | Encoding |
-|---|---|
-| `mp3` (default) | 128 kbit/s mono, 24 kHz |
-| `opus` | Ogg Opus, 24 kbit/s mono |
-| `wav` | 16-bit mono, 24 kHz, streamed: the header's sizes are unknown |
-| `pcm` | Raw 16-bit little-endian mono at 24 kHz, as in OpenAI's API |
+2. Add the two models to your llama-swap configuration. Copy
+   [the same entries in YAML](docs/options.md#the-same-entries-in-yaml).
 
-`aac` and `flac` replies are a 400 `unsupported response_format`.
+3. Put a clip named `sample.wav` in `~/voices` and start the service.
 
-`speed` is applied by a built-in time-stretch (WSOLA), so the voice keeps its
-pitch and the reply still streams: audio starts after a few tens of
-milliseconds of speech, not at the end. At speed 1 the samples are untouched.
-At slow speeds a reply can end up to 50 ms short of the exact stretched
-length, and one shorter than 20 ms is returned unstretched.
+   ```sh
+   LLAMA_SWAP_VOICE_VOICES_DIR=~/voices \
+   LLAMA_SWAP_VOICE_VOICES_DEFAULT=sample \
+   LLAMA_SWAP_VOICE_UPSTREAM_URL=http://127.0.0.1:8080 \
+   llama-swap-voice
+   ```
 
-### Errors
-
-Errors, unknown paths and wrong methods included, come back as JSON
-`{"error":{"message":"…"}}`. Once audio has started the status is final, and
-a later failure aborts the transfer.
-
-| Status | When |
-|---|---|
-| 400 | A malformed body, empty or too long `input`, an unknown voice or format, `speed` out of range, or a missing `file`. Uploads: `could not decode audio: unsupported audio format`, `could not decode audio: corrupted audio` for a damaged or empty file, and `audio is longer than 20 minutes` |
-| 404, 405 | Unknown path; wrong method |
-| 429 and others | Passed on from llama-swap or the model server, with `Retry-After` |
-| 502 | The upstream failed, sent no audio, or sent a transcript over 1 MiB |
-| 503 | Over an admission limit, or shutting down (readiness only) |
-| 504 | `REQUEST_TIMEOUT` ran out, waiting at the gate included |
-
-## The Qwen TTS server
-
-`qwen-tts-server` is a separate Python program in `python/` that serves
-Qwen3-TTS with faster-qwen3-tts on an NVIDIA GPU. It is the `qwentts`
-backend's server: it holds its voices itself, and llama-swap-voice sends it
-only the voice name, the stem of the voice's clip in `VOICES_DIR`.
-
-The flake builds it for x86_64 Linux only, from prebuilt PyPI wheels: torch
-2.15.0 for CUDA 13.2, faster-qwen3-tts 0.5.4, transformers 5.15.1. A system
-with `tts.backend = "qwentts"` and `llamaSwap.enable` builds both outputs; by
-hand:
-
-```sh
-nix build .#qwen-tts-server    # the server; downloads several GB of CUDA wheels
-nix build .#qwen3-tts-model    # Qwen/Qwen3-TTS-12Hz-1.7B-Base, about 4.5 GB
-```
-
-The weights are pinned to revision `fd4b254389122332181a7c3db7f27e918eec64e3`
-with a hash per file.
-
-### Running it
-
-```sh
-qwen-tts-server --port 8930 --config qwen-tts-server.json [--host 127.0.0.1]
-```
-
-The launcher sets everything else, so the server runs the same under any
-supervisor. It keeps its caches under
-`${XDG_CACHE_HOME:-/var/cache/llama-swap}/qwen-tts-server`, which must exist
-and be writable by the server's user, runs offline (`HF_HUB_OFFLINE=1`), and
-finds the GPU driver in `/run/opengl-driver/lib`. The only variable to set per
-deployment is `CUDA_VISIBLE_DEVICES`.
-
-It exits 2 when the configuration is invalid, naming the problem, and 1 when
-the model or a voice fails to load. After a fatal GPU error, such as running
-out of GPU memory, the request that hit it gets its 500 and the server exits
-3; it waits at most 2 seconds for that answer to go out.
-
-### Config
-
-A JSON file, which the module generates from `tts.qwentts` and the voice
-registry:
-
-```json
-{
-  "model_dir": "/nix/store/…-qwen3-tts-12hz-1.7b-base",
-  "language": "English",
-  "chunk_size": 12,
-  "queue_size": 8,
-  "queue_wait_seconds": 60,
-  "max_input_chars": 4096,
-  "max_segment_chars": 400,
-  "max_new_tokens": 600,
-  "voices": {
-    "robbie": {
-      "clip": "/var/lib/voices/robbie.wav",
-      "transcript": "I sat me down and stared at the house of Shaws. …",
-      "instruct": null,
-      "temperature": 0.7, "top_k": 50, "top_p": 1.0, "repetition_penalty": 1.05
-    },
-    "stefan": {
-      "clip": "/var/lib/voices/stefan.wav",
-      "transcript": null,
-      "instruct": null,
-      "temperature": 0.7, "top_k": 50, "top_p": 1.0, "repetition_penalty": 1.05
-    }
-  }
-}
-```
-
-| Key | What it does |
-|---|---|
-| `model_dir` | The weights directory, `nix build .#qwen3-tts-model` |
-| `language` | Language of every reply |
-| `chunk_size` | Codec steps per streamed chunk; 12 steps is about one second of audio |
-| `queue_size` | Requests allowed besides the one generating. A request counts from its arrival until its reply has been fully sent or abandoned, including a finished reply that a slow client is still reading, so the server holds at most `queue_size` + 1 replies; more get a 503 `queue full` |
-| `queue_wait_seconds` | Longest a request waits for its turn before a 503, in seconds; fractions are allowed |
-| `max_input_chars` | Longest text accepted; more is a 413 |
-| `max_segment_chars` | Text is split at sentence ends into segments of at most this many characters, generated one after another |
-| `max_new_tokens` | Codec steps allowed per segment; a segment that reaches it fails the request |
-| `voices` | Every voice by name. Every key is required, and a value of the wrong type stops the server at startup, naming the key. `chunk_size`, `queue_size`, `max_input_chars`, `max_segment_chars` and `max_new_tokens` are positive integers |
-| `voices.*.clip` | The reference clip; see [Preparing a voice](#preparing-a-voice) |
-| `voices.*.transcript` | The clip's exact words. `null` clones from the speaker embedding alone, which loses the accent. An empty string is an error |
-| `voices.*.instruct` | A speaking-style instruction, or `null`. Needs a transcript: a voice with `instruct` and a `null` transcript stops the server at startup |
-| `voices.*.temperature`, `top_k`, `top_p`, `repetition_penalty` | Sampling settings for the voice |
-
-At startup the server loads the model, builds every voice's prompt and
-speaks a warm-up sentence with it. A voice whose prompt and `max_new_tokens`
-together would not fit the model's context is a startup error.
-
-### Endpoints
-
-| Endpoint | Does |
-|---|---|
-| `POST /v1/tts` | JSON `{"voice": "robbie", "input": "…", "response_format": "wav"}`. `response_format` is `wav` (the default) or `pcm`. Streams 24 kHz mono 16-bit audio as it is generated; `wav` starts with a 44-byte header whose sizes are `0xFFFFFFFF`, meaning "until the end of the stream". A player that trusts that header shows a wrong duration and ffmpeg may warn, but the audio decodes correctly |
-| `GET /health` | 200 `{"status":"ready","voices":[…]}` once the model is loaded, every voice prompt is built and the worker is running; until then 503 `{"status":"loading"}` with `Retry-After: 5` |
-| `GET /v1/voices` | 200 `{"voices":[…]}`, the configured voices, also while loading |
-
-Errors come before any audio, as JSON `{"error":{"message":"…"}}`: 400 for an
-unknown voice, empty input, an unsupported format or a malformed body; 413 for
-input over `max_input_chars` or a body over 1 MiB; 415 for a body that is not
-`application/json`, such as the multipart form llama-server's `/tts` takes;
-503 with `Retry-After` while loading or when the worker has stopped (5 s) or
-when the queue is full (2 s), and 503 when the queue wait runs out; 500
-`generation failed` when the first segment fails, with the cause in the
-server's log only. A message that quotes the client's voice or format quotes
-at most 64 characters of it. Unknown paths and wrong methods answer 404 and
-405 in the same envelope, 405 with its `Allow` header. Once audio has started
-the status is final, and a later failure closes the connection.
-
-One worker owns the GPU and serves one request at a time, in arrival order.
-A client that disconnects while queued is skipped, and one that disconnects
-during generation stops it within one chunk.
-
-### Under llama-swap
-
-The entry the module writes, in llama-swap's YAML:
-
-```yaml
-models:
-  qwen3-tts:
-    cmd: qwen-tts-server --port ${PORT} --config /etc/qwen-tts-server.json
-    env: ["CUDA_VISIBLE_DEVICES=0"]
-    checkEndpoint: /health
-    concurrencyLimit: 8
-    ttl: 0
-hooks:
-  on_startup:
-    preload: ["qwen3-tts"]
-```
-
-Three things llama-swap v268 does that look like faults but are not, or that
-an operator needs to know:
-
-- After a preload whose health check passed, llama-swap logs
-  `failed to preload model ...: status 404`. It is cosmetic; the model is
-  loaded.
-- The server's own output, such as its per-voice startup lines, is read from
-  llama-swap's `GET /logs/stream/upstream`, not from journald.
-- A model that exited with a fatal error, such as the server's exit 3, is
-  restarted only by the next request for it, which then waits about 16
-  seconds until `/health` is ready. Nothing restarts it unattended; only a
-  startup preload loads it without a request.
-
-## Without Nix
-
-The service is one Go binary. Building it needs cgo, a C compiler,
-pkg-config and libopus, because Opus replies are encoded with libopus:
-
-```sh
-go install github.com/mniehe/llama-swap-voice/cmd/llama-swap-voice@latest
-```
-
-Add the two models to your llama-swap configuration by hand. This mirrors
-what the module writes, with llama.cpp 0.8.0 or later; `-hf` downloads the
-GGUFs from Hugging Face on first start:
-
-```yaml
-models:
-  qwen3-asr:
-    cmd: llama-server --port ${PORT} -hf ggml-org/Qwen3-ASR-1.7B-GGUF:Q8_0 -ngl 99 -c 4096 -np 1 --temp 0 --flash-attn on --no-webui
-    checkEndpoint: /health
-    concurrencyLimit: 4
-    ttl: 0
-  qwen3-tts:
-    cmd: llama-server --port ${PORT} -hf ggml-org/Qwen3-TTS-12Hz-1.7B-Base-GGUF:Q8_0 -ngl 99 -c 4096 -np 1 --flash-attn on --no-webui
-    checkEndpoint: /health
-    concurrencyLimit: 5
-    ttl: 0
-groups:
-  voice:
-    swap: false
-    exclusive: false
-    persistent: true
-    members: [qwen3-asr, qwen3-tts]
-hooks:
-  on_startup:
-    preload: [qwen3-asr, qwen3-tts]
-```
-
-Drop `-ngl 99` to run on the CPU. For the module's `takeTurns`, set
-`exclusive: true` and `persistent: false`; see
-[When the models unload](#when-the-models-unload). Then put a clip in a
-voices directory and run the service:
-
-```sh
-LLAMA_SWAP_VOICE_VOICES_DIR=~/voices \
-LLAMA_SWAP_VOICE_VOICES_DEFAULT=sample \
-LLAMA_SWAP_VOICE_UPSTREAM_URL=http://127.0.0.1:8080 \
-llama-swap-voice
-```
-
-The Qwen TTS server is built only through the flake.
+[Environment variables](docs/options.md#environment-variables) lists every
+setting. Only the flake builds the Qwen TTS server.
 
 ## Development
 
-The flake's dev shell provides Go, cgo's toolchain, libopus, the linters and
-the test oracles:
+The flake's development shell supplies the toolchain and the test tools.
 
 ```sh
 nix develop                    # an interactive shell
-nix develop -c go test ./...   # one command; no GPU, models or llama-swap needed
-nix develop -c golangci-lint run ./...
-nix flake check                # everything that gates a push, VM tests included
+nix develop -c go test ./...   # the Go tests; no GPU, model or llama-swap needed
+nix flake check                # every check that gates a push, VM tests included
+nix build -L .#checks.x86_64-linux.qwen-tts-server-tests   # the Python tests; no GPU or torch needed
 ```
 
-The tests decode the service's own output with `opusinfo` and `opusdec` from
-opus-tools and with ffmpeg, which the dev shell provides, and skip those
-checks when the tools are missing. The Python server's tests run without a
-GPU or torch:
-
-```sh
-nix build -L .#checks.x86_64-linux.qwen-tts-server-tests
-```
-
-`AGENTS.md` lists every verification step.
+The Go tests decode the service's own output with opus-tools and ffmpeg.
+They skip those checks when the tools are missing, so run them inside the
+development shell. `AGENTS.md` lists every verification step.
 
 ## Licence
 
-MIT. Binaries built from it also include
-[shine-mp3](https://github.com/braheezy/shine-mp3), which is LGPL-2.0, and
-link [libopus](https://opus-codec.org), which is BSD-3-Clause. The Qwen3
-models are Apache-2.0, published by the Qwen team and converted to GGUF by
-[ggml-org](https://huggingface.co/ggml-org).
+The repository is MIT, and so is the Qwen TTS server's own code.
 
-The Qwen TTS server's own code is MIT too. The weights it loads,
-Qwen/Qwen3-TTS-12Hz-1.7B-Base at the pinned revision, are Apache-2.0 by their
-model card. Its Python environment holds these licences, as each resolved
-package declares them in its metadata:
+A binary of the service also includes
+[shine-mp3](https://github.com/braheezy/shine-mp3), which is LGPL-2.0, and
+links [libopus](https://opus-codec.org), which is BSD-3-Clause.
+
+The Qwen3 models are Apache-2.0. The Qwen team publishes them, and
+[ggml-org](https://huggingface.co/ggml-org) converts them to GGUF. The
+weights that the Qwen TTS server loads, Qwen/Qwen3-TTS-12Hz-1.7B-Base at the
+pinned revision, are Apache-2.0 by their model card.
+
+<details>
+<summary>Licences in the Qwen TTS server's Python environment</summary>
+
+Each resolved package declares these licences in its metadata:
 
 - **NVIDIA proprietary** (`LicenseRef-NVIDIA-Proprietary`; cusparselt says
   "NVIDIA Proprietary Software"): the CUDA runtime libraries nvidia-cublas,
@@ -849,3 +446,5 @@ package declares them in its metadata:
 pytest, iniconfig and pluggy (MIT) are used by the tests only. The launcher
 also puts the SoX program (GPL-2.0-or-later) on the path, and soundfile loads
 libsndfile (LGPL-2.0-or-later), both from nixpkgs.
+
+</details>
