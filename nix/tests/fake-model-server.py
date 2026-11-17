@@ -9,15 +9,20 @@ a fixed transcript. qwen-tts-server loads its configuration with the real
 server's config.py, reads every voice clip as the real engine does, and
 answers JSON /v1/tts with a fixed WAV. Its record goes in the cache root the
 module must create; it never creates that directory itself.
+
+A request body goes to its own file, named by its SHA-256, in the directory
+`<record>.bodies`, and the record holds only the digest. The test driver
+reads guest output over a console that drops bytes when the host is slow,
+so a record carrying the clips would arrive damaged under load.
 """
 
 import argparse
-import base64
 import hashlib
 import importlib.util
 import json
 import os
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TRANSCRIPT = "language English<asr_text>The kitchen lights are off."
@@ -38,11 +43,26 @@ class Recorder:
     def __init__(self, path, model):
         self.path = path
         self.model = model
+        self.bodies = f"{path}.bodies"
 
     def write(self, entry):
         entry["model"] = self.model
         with open(self.path, "a") as record:
             record.write(json.dumps(entry) + "\n")
+
+    def keep_body(self, body):
+        # mkdir, not makedirs: a missing cache root must stay an error.
+        try:
+            os.mkdir(self.bodies)
+        except FileExistsError:
+            pass
+        digest = hashlib.sha256(body).hexdigest()
+        path = os.path.join(self.bodies, digest)
+        partial = f"{path}.{threading.get_ident()}"
+        with open(partial, "wb") as file:
+            file.write(body)
+        os.replace(partial, path)
+        return digest
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -56,11 +76,12 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
         content_type = self.headers.get("Content-Type", "")
-        self.server.recorder.write({
+        recorder = self.server.recorder
+        recorder.write({
             "event": "request",
             "path": self.path,
             "content_type": content_type,
-            "body": base64.b64encode(body).decode(),
+            "body_sha256": recorder.keep_body(body),
         })
         route = self.server.routes.get(self.path)
         if route is None:

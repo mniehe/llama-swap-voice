@@ -124,6 +124,7 @@ in
 
     testScript = ''
       import base64
+      import hashlib
       import json
       import re
 
@@ -147,6 +148,13 @@ in
       def requests(machine):
           lines = machine.succeed(f"cat {RECORD}").splitlines()
           return [json.loads(line) for line in lines]
+
+
+      def request_body(machine, request):
+          digest = request["body_sha256"]
+          raw = base64.b64decode(machine.succeed(f"base64 -w 0 {RECORD}.bodies/{digest}"))
+          assert hashlib.sha256(raw).hexdigest() == digest, f"body {digest} arrived damaged: {len(raw)} bytes"
+          return raw
 
 
       def voices(machine):
@@ -193,7 +201,7 @@ in
               # The recorded body is checked before the status, so a
               # multipart upload fails on what was sent, not on the reply.
               request = requests(qwentts)[-1]
-              raw = base64.b64decode(request["body"])
+              raw = request_body(qwentts, request)
               assert b"Content-Disposition" not in raw and b"RIFF" not in raw, f"file part sent: {raw[:300]!r}"
               assert json.loads(raw) == {
                   "voice": "sample",

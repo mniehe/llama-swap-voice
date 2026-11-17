@@ -63,6 +63,7 @@ in
       models = node: node.services.llama-swap.settings.models;
     in ''
       import base64
+      import hashlib
       import json
       import re
 
@@ -79,6 +80,13 @@ in
 
       def records(machine, path):
           return [json.loads(line) for line in machine.succeed(f"cat {path}").splitlines()]
+
+
+      def request_body(machine, path, request):
+          digest = request["body_sha256"]
+          raw = base64.b64decode(machine.succeed(f"base64 -w 0 {path}.bodies/{digest}"))
+          assert hashlib.sha256(raw).hexdigest() == digest, f"body {digest} arrived damaged: {len(raw)} bytes"
+          return raw
 
 
       def speech(machine, out):
@@ -165,7 +173,7 @@ in
           status = speech(qwentts, "/tmp/out.wav")
           request = [r for r in records(qwentts, QWEN_RECORD) if r["event"] == "request"]
           assert len(request) == 1, request
-          raw = base64.b64decode(request[0]["body"])
+          raw = request_body(qwentts, QWEN_RECORD, request[0])
           assert b"RIFF" not in raw and b"Content-Disposition" not in raw, raw[:300]
           assert json.loads(raw) == {"voice": "sample", "input": TRANSCRIPT, "response_format": "wav"}, raw
           assert request[0]["path"] == "/v1/tts", request[0]["path"]

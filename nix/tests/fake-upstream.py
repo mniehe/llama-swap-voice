@@ -4,14 +4,21 @@ It accepts only the requests the service's internal/upstream package sends:
 speech for the chosen backend, answered with a fixed WAV, and transcriptions,
 answered with a fixed transcript. Every request is appended to a JSON-lines
 record; all but transcriptions keep their raw body for the test to inspect.
+
+A body goes to its own file, named by its SHA-256, in the directory
+`<record>.bodies`, and the record holds only the digest. The test driver
+reads guest output over a console that drops bytes when the host is slow,
+so a record carrying the clips would arrive damaged under load.
 """
 
 import argparse
-import base64
 import email.parser
 import email.policy
+import hashlib
 import io
 import json
+import os
+import threading
 import wave
 import socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -103,6 +110,16 @@ def asr_problems(args, content_type, body):
 CHECKS = {"llamacpp": llamacpp_problems, "qwentts": qwentts_problems}
 
 
+def keep_body(bodies, body):
+    digest = hashlib.sha256(body).hexdigest()
+    path = os.path.join(bodies, digest)
+    partial = f"{path}.{threading.get_ident()}"
+    with open(partial, "wb") as file:
+        file.write(body)
+    os.replace(partial, path)
+    return digest
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
@@ -122,11 +139,11 @@ class Handler(BaseHTTPRequestHandler):
             reply = ("application/json", json.dumps({"text": TRANSCRIPT}).encode())
         elif self.path == ROUTES[args.backend].format(model=args.model):
             problems = CHECKS[args.backend](args, content_type, body)
-            entry["body"] = base64.b64encode(body).decode()
+            entry["body_sha256"] = keep_body(args.bodies, body)
             reply = ("audio/wav", args.reply_bytes)
         else:
             problems = [f"no route {self.path}"]
-            entry["body"] = base64.b64encode(body).decode()
+            entry["body_sha256"] = keep_body(args.bodies, body)
             reply = None
 
         entry["problems"] = problems
@@ -167,6 +184,8 @@ def main():
         args.clip_bytes = clip.read()
     with open(args.reply, "rb") as reply:
         args.reply_bytes = reply.read()
+    args.bodies = f"{args.record}.bodies"
+    os.makedirs(args.bodies, exist_ok=True)
 
     family = socket.AF_INET6 if ":" in args.bind else socket.AF_INET
     server_class = type("Server", (ThreadingHTTPServer,), {"address_family": family})
