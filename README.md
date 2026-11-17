@@ -151,7 +151,7 @@ Everything is set with environment variables. Only the default voice is required
 | `UPSTREAM_TTSCONCURRENCY` | `1` | Speech requests sent to the TTS model at once; see below |
 | `VOICES_DIR` | `/var/lib/llama-swap-voice/voices` | Where voice clips live |
 | `VOICES_DEFAULT` | *required* | Voice used when a request names none |
-| `TTS_LANG` | `en` | Language passed to the speech model |
+| `TTS_LANG` | `en` | Language passed to the speech model by the `llamacpp` backend. The `qwentts` backend does not send it; the Qwen TTS server takes `language` from its own config |
 | `TTS_MAXINPUTCHARS` | `4096` | Longest text accepted per request |
 | `ASR_PREFIXREGEX` | `^language \w+<asr_text>` | Removed from the start of each transcript |
 | `REQUEST_TIMEOUT` | `2m` | Longest a speech or transcription request may take, streaming included. Every other endpoint gets 10 seconds |
@@ -290,6 +290,206 @@ stretched length, and one shorter than 20 ms is returned unstretched.
 Errors, unknown paths and wrong methods included, come back as JSON:
 `{"error":{"message":"…"}}`. A transcript over 1 MiB from the model is a 502.
 
+## The Qwen TTS server
+
+`qwen-tts-server` is a separate Python program in `python/` that serves
+Qwen3-TTS with [faster-qwen3-tts](https://pypi.org/project/faster-qwen3-tts/)
+on an NVIDIA GPU. It clones each voice in context from a reference clip and
+its transcript, which keeps accents that llama.cpp's speaker-embedding cloning
+loses. It holds its voices itself, so llama-swap-voice talks to it with
+`UPSTREAM_TTSBACKEND=qwentts` and sends only the voice name: the stem of the
+voice's clip in `VOICES_DIR`. A voice therefore needs a clip on both sides,
+with the same name.
+
+The flake builds it for x86_64 Linux only, from prebuilt PyPI wheels: torch
+2.15.0 for CUDA 13.2, faster-qwen3-tts 0.5.4, transformers 5.15.1.
+
+```sh
+nix build .#qwen-tts-server    # the server; downloads several GB of CUDA wheels
+nix build .#qwen3-tts-model    # Qwen/Qwen3-TTS-12Hz-1.7B-Base, about 4.5 GB
+```
+
+The weights are pinned to revision `fd4b254389122332181a7c3db7f27e918eec64e3`
+with a hash per file. `nix flake check` builds neither: it runs the server's
+tests with a fake engine and no torch, and checks the pin at evaluation.
+
+### Running it
+
+```sh
+qwen-tts-server --port 8930 --config qwen-tts-server.json [--host 127.0.0.1]
+```
+
+The launcher sets everything else, so the server runs the same under any
+supervisor. It keeps its caches under
+`${XDG_CACHE_HOME:-/var/cache/llama-swap}/qwen-tts-server`, runs offline
+(`HF_HUB_OFFLINE=1`), and finds the GPU driver in `/run/opengl-driver/lib`.
+The only variable to set per deployment is `CUDA_VISIBLE_DEVICES`. The
+default cache directory, `/var/cache/llama-swap/qwen-tts-server`, must exist
+and be writable by the user the server runs as; elsewhere, set
+`XDG_CACHE_HOME`.
+
+It exits 2 when the config is invalid, naming the problem, and 1 when the
+model or a voice fails to load. After a fatal GPU error, such as running out
+of GPU memory, the request that hit it gets its 500 and the server then exits
+3; it waits at most 2 seconds for that answer to go out.
+
+### Config
+
+A JSON file:
+
+```json
+{
+  "model_dir": "/nix/store/…-qwen3-tts-12hz-1.7b-base",
+  "language": "English",
+  "chunk_size": 12,
+  "queue_size": 8,
+  "queue_wait_seconds": 60,
+  "max_input_chars": 4096,
+  "max_segment_chars": 400,
+  "max_new_tokens": 600,
+  "voices": {
+    "robbie": {
+      "clip": "/var/lib/voices/robbie.wav",
+      "transcript": "I sat me down and stared at the house of Shaws. …",
+      "instruct": null,
+      "temperature": 0.7, "top_k": 50, "top_p": 1.0, "repetition_penalty": 1.05
+    },
+    "stefan": {
+      "clip": "/var/lib/voices/stefan.wav",
+      "transcript": null,
+      "instruct": null,
+      "temperature": 0.7, "top_k": 50, "top_p": 1.0, "repetition_penalty": 1.05
+    }
+  }
+}
+```
+
+| Key | What it does |
+|---|---|
+| `model_dir` | The weights directory, `nix build .#qwen3-tts-model` |
+| `language` | Language of every reply |
+| `chunk_size` | Codec steps per streamed chunk; 12 steps is about one second of audio |
+| `queue_size` | Requests allowed besides the one generating, a positive integer. A request counts from its arrival until its reply has been fully sent or abandoned, including a finished reply that a slow client is still reading, so the server holds at most `queue_size` + 1 replies; more get a 503 `queue full` |
+| `queue_wait_seconds` | Longest a request waits for its turn before a 503, in seconds; fractions are allowed |
+| `max_input_chars` | Longest text accepted; more is a 413 |
+| `max_segment_chars` | Text is split at sentence ends into segments of at most this many characters, generated one after another |
+| `max_new_tokens` | Codec steps allowed per segment; a segment that reaches it fails the request |
+| `voices` | Every voice by name. Every key is required, and a value of the wrong type stops the server at startup naming the key. `chunk_size`, `queue_size`, `max_input_chars`, `max_segment_chars` and `max_new_tokens` are positive integers |
+| `voices.*.clip` | The reference clip; see below |
+| `voices.*.transcript` | The clip's exact words. `null` clones from the speaker embedding alone, without the transcript, which loses accent. An empty string is an error |
+| `voices.*.instruct` | A speaking-style instruction, or `null`. Needs a transcript: a voice with `instruct` and a `null` transcript stops the server at startup |
+| `voices.*.temperature`, `top_k`, `top_p`, `repetition_penalty` | Sampling settings for the voice |
+
+At startup the server loads the model, builds every voice's prompt and
+speaks a warm-up sentence with it. A voice whose prompt and `max_new_tokens`
+together would not fit the model's context is a startup error.
+
+### Endpoints
+
+| Endpoint | Does |
+|---|---|
+| `POST /v1/tts` | JSON `{"voice": "robbie", "input": "…", "response_format": "wav"}`. `response_format` is `wav` (the default) or `pcm`. Streams 24 kHz mono 16-bit audio as it is generated; `wav` starts with a 44-byte header whose sizes are `0xFFFFFFFF`, meaning "until the end of the stream". That header declares the maximum length, so a player that trusts it shows a wrong duration and ffmpeg may warn, but the audio decodes correctly |
+| `GET /health` | 200 `{"status":"ready","voices":[…]}` once the model is loaded, every voice prompt is built and the worker is running; until then 503 `{"status":"loading"}` with `Retry-After: 5` |
+| `GET /v1/voices` | 200 `{"voices":[…]}`, the configured voices, also while loading |
+
+Errors come before any audio, as JSON `{"error":{"message":"…"}}`: 400 for an
+unknown voice, empty input, an unsupported format or a malformed body; 413 for
+input over `max_input_chars` or a body over 1 MiB; 415 for a body that is not
+`application/json`, such as the multipart form llama-server's `/tts` takes;
+503 with `Retry-After` while loading or when the worker has stopped (5 s) or
+when the queue is full (2 s), and 503 when the queue wait runs out; 500
+`generation failed` when the first segment fails, with the cause in the
+server's log only. A message that quotes the client's voice or format quotes
+at most 64 characters of it. Unknown paths and wrong methods answer 404 and
+405 in the same envelope, 405 with its `Allow` header. Once audio has started
+the status is final, and a later failure closes the connection.
+
+One worker owns the GPU and serves one request at a time, in arrival order.
+A client that disconnects while queued is skipped, and one that disconnects
+during generation stops it within one chunk.
+
+### Preparing a voice
+
+The server does not change a clip's loudness, so prepare each clip once:
+
+1. Cut about 30 seconds of clean speech, starting and ending on a sentence
+   boundary.
+2. Normalise it to -22 LUFS integrated and -1.5 dBTP true peak with ffmpeg's
+   `loudnorm` in two passes, writing mono 24 kHz 16-bit WAV. The first pass
+   measures:
+
+   ```sh
+   ffmpeg -hide_banner -nostats -i source.wav \
+     -af loudnorm=I=-22:TP=-1.5:LRA=11:print_format=json -f null -
+   ```
+
+   The second feeds the measured `input_i`, `input_tp`, `input_lra` and
+   `input_thresh` back as `measured_I`, `measured_TP`, `measured_LRA` and
+   `measured_thresh`, and `target_offset` as `offset`, so a single gain is
+   applied:
+
+   ```sh
+   ffmpeg -hide_banner -i source.wav \
+     -af loudnorm=I=-22:TP=-1.5:LRA=11:measured_I=$input_i:measured_TP=$input_tp:measured_LRA=$input_lra:measured_thresh=$input_thresh:offset=$target_offset:linear=true:print_format=summary \
+     -ac 1 -ar 24000 -sample_fmt s16 robbie.wav
+   ```
+
+3. Check that the gain really was one gain. `loudnorm` drops to dynamic mode
+   silently when the gain would push the true peak over the ceiling, and
+   dynamic mode reshapes the voice. The check is a scalar-gain null test:
+   measure the integrated loudness of `robbie.wav` as in the first pass, scale
+   the source by the difference and subtract it from the clip. What remains
+   should be tens of dB below the clip's own level; a residual within a few dB
+   of it means the gain varied.
+
+   ```sh
+   # output_i: input_i printed by the first-pass command run on robbie.wav
+   gain=$(echo "$output_i - ($input_i)" | bc)
+   ffmpeg -hide_banner -i source.wav -af volume=${gain}dB -ac 1 -ar 24000 -sample_fmt s16 scaled.wav
+   ffmpeg -hide_banner -nostats -i robbie.wav -i scaled.wav -filter_complex \
+     '[0][1]amerge=inputs=2,pan=mono|c0=c0-c1,astats=measure_perchannel=none:measure_overall=RMS_level' -f null -
+   ffmpeg -hide_banner -nostats -i robbie.wav \
+     -af astats=measure_perchannel=none:measure_overall=RMS_level -f null -
+   ```
+
+   If the clip went dynamic, lower its peaks or choose a quieter target, and
+   normalise again.
+4. Write the exact transcript of the clip, word for word, into the voice's
+   `transcript`. The server cannot tell a wrong transcript from a right one:
+   a placeholder passes validation and ruins the voice.
+
+ffmpeg is only needed for this preparation; neither the server nor
+llama-swap-voice runs it.
+
+### Under llama-swap
+
+A llama-swap model entry for the server:
+
+```yaml
+models:
+  qwen3-tts:
+    cmd: qwen-tts-server --port ${PORT} --config /etc/qwen-tts-server.json
+    env: ["CUDA_VISIBLE_DEVICES=0"]
+    checkEndpoint: /health
+    ttl: 0
+hooks:
+  on_startup:
+    preload: ["qwen3-tts"]
+```
+
+Three things llama-swap v268 does that look like faults but are not, or that
+an operator needs to know:
+
+- After a preload whose health check passed, llama-swap logs
+  `failed to preload model ...: status 404`. It is cosmetic; the model is
+  loaded.
+- The server's own output, such as its per-voice startup lines, is read from
+  llama-swap's `GET /logs/stream/upstream`, not from journald.
+- A model that exited with a fatal error, such as the server's exit 3, is
+  restarted only by the next request for it, which then waits about 16
+  seconds until `/health` is ready. Nothing restarts it unattended; only a
+  startup preload loads it without a request.
+
 ## Development
 
 ```sh
@@ -310,3 +510,38 @@ MIT. Binaries built from it also include
 link [libopus](https://opus-codec.org), which is BSD-3-Clause. The Qwen3
 models are Apache-2.0, published by the Qwen team and converted to GGUF by
 [ggml-org](https://huggingface.co/ggml-org).
+
+The Qwen TTS server's own code is MIT too. The weights it loads,
+Qwen/Qwen3-TTS-12Hz-1.7B-Base at the pinned revision, are Apache-2.0 by their
+model card. Its Python environment holds these licences, as each resolved
+package declares them in its metadata:
+
+- **NVIDIA proprietary** (`LicenseRef-NVIDIA-Proprietary`; cusparselt says
+  "NVIDIA Proprietary Software"): the CUDA runtime libraries nvidia-cublas,
+  -cuda-cccl, -cuda-cupti, -cuda-nvrtc, -cuda-runtime, -cudnn-cu13, -cufft,
+  -cufile, -cusolver, -cusparse, -cusparselt-cu13, -nccl-cu13, -nvjitlink,
+  -nvshmem-cu13 and -nvtx. The cuda-toolkit metapackage declares no licence
+  and installs only its metadata.
+- **LGPL-2.1-or-later**: soxr.
+- **MPL-2.0**: certifi; tqdm is MPL-2.0 AND MIT.
+- **Apache-2.0**: qwen-tts-hf, transformers, accelerate, cuda-bindings,
+  cuda-pathfinder, flatbuffers, hf-xet, huggingface-hub, msgpack, requests,
+  safetensors and tokenizers; packaging is Apache-2.0 OR BSD-2-Clause and
+  regex Apache-2.0 AND CNRI-Python.
+- **Compound**: torch is Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND
+  BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND ISC AND MIT AND Zlib; numpy is
+  BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0; llvmlite is BSD-2-Clause
+  AND Apache-2.0 WITH LLVM-exception.
+- **BSD**: starlette, uvicorn, soundfile, sox, torchaudio, numba, scipy,
+  scikit-learn, httpx, httpcore, click, cloudpickle, fsspec, idna, jinja2,
+  joblib, lazy-loader, markupsafe, mpmath, networkx, pooch, protobuf, psutil,
+  pycparser, pygments, decorator, sympy and threadpoolctl.
+- **ISC**: librosa and shellingham.
+- **MIT**: faster-qwen3-tts, triton, onnxruntime, annotated-doc, anyio,
+  charset-normalizer, einops, filelock, h11, markdown-it-py, mdurl, narwhals,
+  platformdirs, pyyaml, rich, setuptools, typer and urllib3; cffi is MIT-0.
+- **PSF-2.0**: typing-extensions.
+
+pytest, iniconfig and pluggy (MIT) are used by the tests only. The launcher
+also puts the SoX program (GPL-2.0-or-later) on the path, and soundfile loads
+libsndfile (LGPL-2.0-or-later), both from nixpkgs.

@@ -6,6 +6,10 @@ decodes uploads, encodes replies (mp3, opus, wav, pcm) and changes speech speed
 in-process; it runs no external programs. `README.md` is the user-facing
 contract: endpoints, status codes, limits and every environment variable.
 
+`python/` holds a second program, `qwen-tts-server`: the Python
+faster-qwen3-tts server that the `qwentts` backend calls on a GPU. Its
+launcher, not the Go service, puts `sox` on `PATH`.
+
 Your closing summary names every file you changed and every behaviour change,
 including ones nobody asked for, because reviewers read the summary before the
 diff.
@@ -40,6 +44,10 @@ before:
   `nix develop -c gomod2nix generate`. Updating `flake.lock` (`nix flake
   update`) needs the same confirmation, because it changes the libopus the
   binary links and the Go toolchain;
+- adding, upgrading or replacing a dependency in `python/pyproject.toml`, or
+  re-locking `python/uv.lock`. The server's environment carries each
+  dependency's licence (`README.md` § Licence), and a CUDA wheel change can
+  build, import and pass every check here yet fail only on the GPU;
 - adding a call that runs an external program from non-test code, since the
   service was moved off ffmpeg on purpose;
 - loosening `.golangci.yaml`, deleting tests or fuzz seeds, or skipping a
@@ -68,6 +76,10 @@ the list above needs confirmation even when it is only a file edit.
   /voices         # Finds and checks voice clips at startup; the llamacpp backend reopens the clip on each request
 /nix                    # packages.nix (the build), checks.nix (what nix flake check runs), devshells.nix (nix develop), module.nix (nixosModules.default)
   /tests                # NixOS module checks: default.nix (the module-eval, module-vm and duration-corpus checks), eval.nix (assertions, generated environment), vm.nix (VM test), fake-upstream.py (strict fake TTS and ASR upstream), duration-corpus.nix with durations.nix and testdata/parse-duration.go (durations compared with Go)
+  /qwen-tts-server      # The TTS server's CUDA environment (uv2nix), wheel overrides, weights pin, tests and launcher
+/python                 # qwen-tts-server: the faster-qwen3-tts HTTP server the qwentts backend calls; pyproject.toml and uv.lock pin its environment
+  /qwen_tts_server      # app.py (endpoints), config.py, engine.py (the model), worker.py (the one CUDA thread), text.py, wav.py
+  /tests                # GPU-free tests with a fake engine; test_tokenizer.py alone needs torch
 flake.nix               # Package, dev shell and checks; flake.lock pins the inputs
 gomod2nix.toml          # Hash of every Go module for the Nix build; regenerated with go.mod
 .version                # Version stamped into the binary; cocogitto (.cog.toml) writes it on a bump
@@ -87,8 +99,24 @@ nix develop -c go test ./...   # one command
 output with them and skip those checks when the tools are missing. Run with
 them present, or a broken encoder passes.
 
-Tests need no GPU, model or running llama-swap. Server tests drive the real
-handlers against the fake upstream in `internal/server/harness_test.go`.
+The Go tests and the GPU-free Python suite need no GPU, model or running
+llama-swap; the Python tokenizer test, which needs torch, is the one exception.
+Server tests drive the real handlers against the fake upstream in
+`internal/server/harness_test.go`.
+
+The Python server under `python/` is built and tested through the flake, on
+x86_64 Linux only. Its tests run without torch against a fake engine; the
+CUDA environment and the weights build only when asked for:
+
+```bash
+nix build -L .#checks.x86_64-linux.qwen-tts-server-tests   # GPU-free tests, no torch
+nix build -L .#qwen-tts-server.tokenizer-test              # the one test that needs torch; builds the CUDA environment
+nix build .#qwen-tts-server.env                            # the CUDA environment and its install check
+```
+
+After a confirmed change to `python/pyproject.toml`, re-lock in `python/` with this
+flake's nixpkgs, `nix shell --inputs-from .. nixpkgs#uv nixpkgs#python312 -c uv
+lock`, and compare the resolved versions before and after.
 
 ## Rules
 
@@ -130,6 +158,11 @@ A suppression names the linter and states why.
   `config.go`.
 - Values from a spec or shared across call sites are named constants.
 
+The Python server under `python/` follows three of these rules too: every
+client input is read through a named bound with a test at the limit, every
+error before audio is the JSON envelope `{"error":{"message":"…"}}`, and
+values from a spec or shared across call sites are named constants.
+
 ## Verification
 
 A task is complete only when the commands below have run in this session,
@@ -142,8 +175,10 @@ hosted CI and no push hook: run `nix flake check` yourself before every push.
 gofmt -l . && go vet ./... && golangci-lint run ./...   # gofmt -l must print nothing
 go test ./...
 go test -race ./...                  # when the change touches goroutines, channels, locks or internal/server
-go test -run '^$' -fuzz '^FuzzNormaliseUpload$' -fuzztime 30s ./internal/audio   # when the change touches a parser or the time-stretch
-nix flake check                      # before a push: race tests, lint, gofmt, alejandra, Opus conformance, package version, gomod2nix sync, NixOS module eval and VM tests, duration corpus
+go test -run '^$' -fuzz '^FuzzNormaliseUpload$' -fuzztime 30s ./internal/audio   # when the change touches a Go parser or the time-stretch
+nix flake check                      # before a push: race tests, lint, gofmt, alejandra, Opus conformance, package version, gomod2nix sync, NixOS module eval and VM tests, duration corpus, the Python server's tests and weights pin
+nix build -L .#checks.x86_64-linux.qwen-tts-server-tests   # when the change touches python/ or nix/qwen-tts-server/
+nix build .#qwen-tts-server.env .#qwen-tts-server.tokenizer-test   # when the change touches python/pyproject.toml, python/uv.lock, nix/qwen-tts-server/overrides.nix, python/tests/test_tokenizer.py or python/qwen_tts_server/engine.py
 ```
 
 Run the fuzz target that reaches the changed code: `FuzzNormaliseUpload` for
@@ -195,6 +230,8 @@ hole, or silently corrupts audio:
 - `go.mod`, `go.sum`, `.golangci.yaml` and `.claude/review/review.yaml`, which holds shell commands that review prep runs
 - `flake.nix`, `flake.lock`, `gomod2nix.toml` and `nix/**`: the toolchain, the build and the checks that gate a push
 - `.cog.toml`: it holds shell commands that `cog bump` runs
+- `python/qwen_tts_server/**`: request bounds and JSON parsing, the single CUDA worker and its queue, cancellation, and an exit on fatal CUDA errors
+- `nix/qwen-tts-server/**`, `python/pyproject.toml`, `python/uv.lock`: the CUDA wheels' RUNPATHs and the weights' hashes; a missing `$ORIGIN` builds and imports yet fails at CUDA-graph warm-up on the GPU
 
 ### Definition of Done
 

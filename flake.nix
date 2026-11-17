@@ -10,12 +10,31 @@
     inputs.flake-utils.follows = "flake-utils";
   };
 
+  inputs.pyproject-nix = {
+    url = "github:pyproject-nix/pyproject.nix";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  inputs.uv2nix = {
+    url = "github:pyproject-nix/uv2nix";
+    inputs.pyproject-nix.follows = "pyproject-nix";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  inputs.pyproject-build-systems = {
+    url = "github:pyproject-nix/build-system-pkgs";
+    inputs.pyproject-nix.follows = "pyproject-nix";
+    inputs.uv2nix.follows = "uv2nix";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
+
   outputs = {
     self,
     nixpkgs,
     flake-utils,
     gomod2nix,
-  }:
+    ...
+  } @ inputs:
     flake-utils.lib.eachSystem ["x86_64-linux" "aarch64-linux" "aarch64-darwin"] (
       system: let
         pkgs = import nixpkgs {
@@ -25,7 +44,7 @@
 
         version = pkgs.lib.trim (builtins.readFile ./.version);
 
-        packages = import ./nix/packages.nix {inherit pkgs version;};
+        packages = import ./nix/packages.nix {inherit pkgs version inputs;};
         go = packages.default.go;
       in {
         formatter = pkgs.alejandra;
@@ -39,6 +58,7 @@
             package = packages.default;
             module = self.nixosModules.default;
           }
+          // packages.qwen-tts-server.passthru.checks or {}
         );
       }
     )

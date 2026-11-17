@@ -1,7 +1,9 @@
 {
   pkgs,
   version,
-}: {
+  inputs,
+}:
+{
   default = pkgs.buildGoApplication {
     pname = "llama-swap-voice";
     inherit version;
@@ -25,4 +27,9 @@
       mainProgram = "llama-swap-voice";
     };
   };
+}
+# The TTS server's lock resolves CUDA wheels for x86_64 Linux only.
+// pkgs.lib.optionalAttrs (pkgs.stdenv.hostPlatform.system == "x86_64-linux") rec {
+  qwen-tts-server = pkgs.callPackage ./qwen-tts-server {inherit inputs;};
+  qwen3-tts-model = qwen-tts-server.model;
 }

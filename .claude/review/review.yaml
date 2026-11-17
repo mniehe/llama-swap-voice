@@ -6,6 +6,7 @@ tools:
   lint: nix develop -c golangci-lint run ./...
   test: nix develop -c go test ./...
   race: nix develop -c go test -race ./...
+  pytest: nix build -L --no-link .#checks.x86_64-linux.qwen-tts-server-tests
 
 tags:
   audio: [internal/audio/**]
@@ -13,6 +14,7 @@ tags:
   upstream: [internal/upstream/**]
   server: [internal/server/**]
   runtime: [cmd/llama-swap-voice/**]
+  tts-server: [python/**, nix/qwen-tts-server/**]
   build: [go.mod, go.sum, .golangci.yaml, .claude/review/review.yaml, flake.nix, flake.lock, gomod2nix.toml, nix/**, .cog.toml]
   llm: [AGENTS.md, CLAUDE.md, .claude/review/*.md, .claude/review/review.yaml]
 
@@ -22,7 +24,7 @@ dimensions:
     always: true
   - name: security
     criteria: security.md
-    tags: [audio, voices, upstream, server, runtime, build]
+    tags: [audio, voices, upstream, server, runtime, build, tts-server]
   - name: failure-paths
     criteria: failure-path-review.md
     signals: [packages_touched>0]
@@ -52,3 +54,13 @@ verify_notes: |
   AGENTS.md allows a builder: do not replace, regenerate or delete a file
   under internal/audio/testdata/, delete a fuzz seed, edit .golangci.yaml,
   run go get, or push. To inspect module tidiness use `go mod tidy -diff`.
+  The dev shell provides no Python for the server under python/; a python3
+  on PATH comes from outside it and lacks the server's dependencies. The whole
+  GPU-free suite is
+  `nix build -L --no-link .#checks.x86_64-linux.qwen-tts-server-tests`.
+  For one test, `env=$(nix build --no-link --print-out-paths .#qwen-tts-server.testEnv)`
+  and then, from python/,
+  `$env/bin/python -B -m pytest -p no:cacheprovider tests/<file> -k <name>`.
+  Never run `uv run` or `uv lock`, which write python/.venv and python/uv.lock,
+  and never build .#qwen-tts-server for a review: it downloads several GB of
+  CUDA wheels.

@@ -1,0 +1,28 @@
+[project]
+name = "qwen-tts-server"
+version = "0.1.0"
+requires-python = "==3.12.*"
+# What the server's own modules import; enough to run the tests without torch.
+dependencies = [
+  "numpy",
+  "soundfile",
+  "starlette",
+  "uvicorn",
+]
+
+[project.optional-dependencies]
+# The model stack, installed only in the CUDA environment.
+engine = [
+  "faster-qwen3-tts==0.5.4",
+  "qwen-tts-hf==0.1.1.post1",
+  "transformers==5.15.1",
+  "torch==2.15.0",
+  "torchaudio==2.11.1",
+]
+
+[dependency-groups]
+dev = ["pytest", "httpx"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+override-dependencies = ["gradio ; sys_platform == 'never'"]

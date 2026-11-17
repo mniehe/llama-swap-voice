@@ -23,3 +23,6 @@ go.work
 # Nix build output links
 result
 result-*
+
+# Python bytecode from running the server tests outside Nix
+__pycache__/
