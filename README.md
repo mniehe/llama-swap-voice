@@ -190,11 +190,15 @@ On SIGTERM or SIGINT, readiness turns 503 and shutdown runs in three steps:
 ## NixOS module
 
 The flake's `nixosModules.default` runs the service as a systemd unit under
-its own user. It does not set up llama-swap or the models yet.
+its own user. It also adds the Qwen3 ASR model and one TTS model to the
+host's llama-swap (nixpkgs' `services.llama-swap`) and points the service at
+it. Enable llama-swap yourself; the module does not.
 
 ```nix
 {
   imports = [llama-swap-voice.nixosModules.default];
+
+  services.llama-swap.enable = true;
 
   services.llama-swap-voice = {
     enable = true;
@@ -204,51 +208,61 @@ its own user. It does not set up llama-swap or the models yet.
 }
 ```
 
+When llama-swap runs on another host, set `llamaSwap.enable = false` and
+`upstreamURL`; the module then leaves `services.llama-swap` alone.
+
 Options under `services.llama-swap-voice`:
 
 | Option | Type | Default | What it does |
 |---|---|---|---|
 | `enable` | bool | `false` | Run the service |
 | `package` | package | this flake's package | The build to run |
-| `user`, `group` | string | `llama-swap-voice` | Account the service runs as. The module creates them only under the default name; a custom user or group must already exist |
+| `user`, `group` | string | `llama-swap-voice` | Account the service runs as. The module creates them only under the default name; a custom user or group must already exist. Under `qwentts` llama-swap's user joins `group` and gains all its access, so do not pick a group other services share |
 | `stateDir` | absolute path, not `/`, no trailing slash, no `%` | `/var/lib/llama-swap-voice` | The service reads voices from `<stateDir>/voices`. It must belong to this module alone, because tmpfiles sets its owner and mode |
 | `defaultVoice` | string | *required* | `VOICES_DEFAULT`; must be one of `voiceNames` |
 | `host`, `port` | string, integer 1 to 65535 | `127.0.0.1`, `8920` | `HOST`, `PORT` |
-| `upstreamURL` | `http://` or `https://` URL | `http://127.0.0.1:8080` | `UPSTREAM_URL`. Evaluation checks only for the scheme, a non-empty host and no whitespace; the service parses the URL fully at startup |
+| `upstreamURL` | `http://` or `https://` URL | llama-swap's listen address and port, or `http://127.0.0.1:8080` when `llamaSwap.enable` is false | `UPSTREAM_URL`. A wildcard listen address (`""`, `0.0.0.0`, `[::]`) becomes loopback, and `services.llama-swap.tls.enable` selects `https`; the certificate must then cover the derived host (`localhost` by default, or the loopback IP), or set `upstreamURL` by hand. Evaluation checks only for the scheme, a non-empty host and no whitespace; the service parses the URL fully at startup |
 | `ipAddressAllow` | list of strings | `[]` | Addresses besides loopback the service may talk to, in systemd's `IPAddressAllow=` syntax |
 | `tts.backend` | `llamacpp` or `qwentts` | `llamacpp` | `UPSTREAM_TTSBACKEND` |
 | `tts.maxInputChars` | positive int or null | `null` | `TTS_MAXINPUTCHARS` |
-| `upstream.ttsConcurrency` | positive int or null | `null` | `UPSTREAM_TTSCONCURRENCY` |
+| `upstream.ttsConcurrency` | positive int | `1` | `UPSTREAM_TTSCONCURRENCY`. The service's gate keeps sentence order and releases when generation ends, not playback, so 1 costs nothing under either backend. The TTS entry's `concurrencyLimit` must be at least this |
 | `request.timeout` | positive Go duration or null | `null` | `REQUEST_TIMEOUT` |
 | `request.maxConcurrent`, `request.maxConcurrentTTS` | positive int or null | `null` | `REQUEST_MAXCONCURRENT`, `REQUEST_MAXCONCURRENTTTS` |
 | `shutdown.grace` | Go duration or null | `null` | `SHUTDOWN_GRACE` |
 | `shutdown.total`, `shutdown.hard` | positive Go duration or null | `null` | `SHUTDOWN_TOTAL`, `SHUTDOWN_HARD` |
 | `voices.<name>.clip` | absolute path, as a string | *required* | The voice's recording; `.wav` or `.mp3`, and `.wav` under `qwentts` |
-| `voices.<name>.transcript` | string or null | `null` | What the clip says. Null selects embedding-only cloning, which keeps the voice but not its accent. No effect yet; see below |
-| `voices.<name>.instruct` | string or null | `null` | Style instruction; under `qwentts` it needs a transcript. No effect yet; see below |
-| `voices.<name>.temperature`, `.topK`, `.topP`, `.repetitionPenalty` | number, int, number, number | `0.7`, `50`, `1.0`, `1.05` | Sampling settings. No effect yet; see below |
+| `voices.<name>.transcript` | string or null | `null` | What the clip says. Null selects embedding-only cloning, which keeps the voice but not its accent. Used under `qwentts`; see below |
+| `voices.<name>.instruct` | string or null | `null` | Style instruction; under `qwentts` it needs a transcript. Used under `qwentts`; see below |
+| `voices.<name>.temperature`, `.topK`, `.topP`, `.repetitionPenalty` | number, int, number, number | `0.7`, `50`, `1.0`, `1.05` | Sampling settings. Used under `qwentts`; see below |
 | `voiceNames` | list of strings, read-only | | The declared voice names, sorted, since Nix attribute sets keep no order |
-| `extraEnvironment` | attribute set of strings | `{}` | Extra variables by full name; they win over generated ones |
+| `extraEnvironment` | attribute set of strings | `{}` | Extra variables by full name; they win over generated ones. The module reads some of them itself; see below |
 
 A limit left `null` leaves its variable unset, so the service's own default
 from the table above applies. Durations use Go's syntax, such as `1m30s`,
 without a leading `+` or `-`; evaluation reads them exactly as the service
 does and refuses any above Go's maximum of about 292 years. Evaluation fails, naming the option, when
 `defaultVoice` is missing or undeclared, a clip path is relative or has
-another extension, or a `qwentts` voice has an empty transcript or an
-`instruct` without a transcript.
+another extension, or a `qwentts` voice has a transcript of only whitespace,
+as Python's `str.strip` counts it (non-breaking and other Unicode spaces
+included), or an `instruct` without a transcript.
 
-A voice's `transcript`, `instruct` and sampling settings are for the
-faster-qwen3-tts server's configuration. This module does not generate that
-configuration yet, so these values have no effect on the service today; only
-the clip does.
+A voice's `transcript`, `instruct` and sampling settings go into the
+faster-qwen3-tts server's configuration, which the module generates under the
+`qwentts` backend when `llamaSwap.enable` is true. The `llamacpp` backend
+ignores them and uses only the clip. That configuration lives in the
+world-readable Nix store, so transcripts and instructs are not secret.
 
 Stopping the unit waits for the shutdown steps one after another, so
 `TimeoutStopSec` is the sum of the shutdown durations you set plus 30 seconds
-for the ones you leave unset, and at least 90 seconds. A `SHUTDOWN_GRACE`,
-`SHUTDOWN_TOTAL` or `SHUTDOWN_HARD` set through `extraEnvironment` counts
-instead of the option it overrides, and evaluation fails, naming the
-variable, if it is not a duration the option would accept.
+for the ones you leave unset, and at least 90 seconds.
+
+The module reads six variables itself after `extraEnvironment` is merged:
+`SHUTDOWN_GRACE`, `SHUTDOWN_TOTAL` and `SHUTDOWN_HARD` for `TimeoutStopSec`,
+and `TTS_MAXINPUTCHARS`, `UPSTREAM_TTSCONCURRENCY` and `REQUEST_MAXCONCURRENT`
+for the llama-swap entries below. A value set through `extraEnvironment`
+counts instead of the option it overrides, and evaluation fails, naming the
+variable, if it is not a value the option would accept: a Go duration, or a
+positive decimal integer without a sign or leading zero.
 
 Each voice becomes the symlink `<stateDir>/voices/<name>.<extension>`,
 pointing at its clip. Clips stay where they are and never enter the Nix
@@ -264,7 +278,118 @@ both`; delete the link with the old extension by hand.
 
 The unit can write only to its private `/tmp`, where large uploads spool,
 cannot read home directories, and can exchange packets only with loopback. Put a non-loopback upstream, its DNS resolver,
-or the clients of a non-loopback `host` in `ipAddressAllow`.
+or the clients of a non-loopback `host` in `ipAddressAllow`. That includes
+llama-swap listening on a specific non-loopback address of this host.
+
+### The llama-swap entries
+
+With `llamaSwap.enable` true (the default) the module merges into
+`services.llama-swap.settings`, beside your own models and groups:
+
+- an ASR entry, `models.asr.name` (`qwen3-asr`), running llama.cpp's
+  `llama-server` on the pinned Qwen3-ASR-1.7B Q8_0 GGUF and its projector;
+- exactly one TTS entry, chosen by `tts.backend`: under `llamacpp`,
+  `models.tts.name` (`qwen3-tts`) running `llama-server` on the pinned
+  Qwen3-TTS-12Hz-1.7B-Base Q8_0 GGUFs; under `qwentts`, `tts.qwentts.modelName`
+  (`qwen3-tts`) running `qwen-tts-server` with a configuration generated from
+  the voice registry;
+- the preloaded entries' names in `hooks.on_startup.preload`, beside yours;
+- with `llamaSwap.group.enable` (the default), a group holding both entries
+  (`swap = false`, `exclusive = false`, `persistent = true`), so they stay
+  loaded while your other models swap. Without the group both entries fall
+  into llama-swap's implicit default group, which swaps: loading one stops
+  the other, so a transcription followed by speech reloads both models, and
+  `ttl = 0` does not prevent it.
+
+It sets no top-level llama-swap value such as `healthCheckTimeout`, and it
+sets `UPSTREAM_TTSMODEL` and `UPSTREAM_ASRMODEL` to the two entries' names.
+Evaluation fails, naming the option, when:
+
+- `services.llama-swap.enable` is false;
+- the TTS entry's `concurrencyLimit` is below the effective
+  `UPSTREAM_TTSCONCURRENCY`, or `models.asr.concurrencyLimit` is below the
+  effective `REQUEST_MAXCONCURRENT`. llama-swap answers 429 to requests over
+  an entry's `concurrencyLimit` rather than queueing them;
+- `services.llama-swap.settings.apiKeys` is set: the service cannot send a
+  llama-swap API key yet, so every voice request would get 401. Set
+  `llamaSwap.enable = false` to run the service against a llama-swap without
+  keys;
+- `services.llama-swap.listenAddress` is an IPv6 address without brackets,
+  such as `::1` (nixpkgs' unit passes `--listen=<address>:<port>`, which
+  llama-swap refuses), or carries a zone such as `%eth0`;
+- `llamaCpp.package` is older than llama.cpp 0.8.0;
+- an entry name is empty, or the ASR and TTS entries share a name;
+- the group's layout clashes with yours (see `llamaSwap.group.location`).
+  Because the group is on by default, a consumer with the other layout must
+  set `llamaSwap.group.location` or `llamaSwap.group.enable = false`.
+
+| Option | Default | What it does |
+|---|---|---|
+| `llamaSwap.enable` | `true` | Contribute the entries and derive `upstreamURL`. Off, the module leaves `services.llama-swap` untouched |
+| `llamaSwap.group.enable` | `true` | Add the group. Off, the two entries swap each other (above) |
+| `llamaSwap.group.name` | `voice` | The group's name |
+| `llamaSwap.group.location` | `legacy` | `legacy` writes top-level `groups`; `routing` writes `routing.router.settings.groups`. llama-swap refuses a configuration with both layouts, so match yours: `legacy` fails when your settings have a `routing.router` engine or a top-level `matrix`, and `routing` fails when they have top-level `groups` or `matrix`, or a `routing.router.use` other than `group` |
+| `llamaCpp.backend` | `cpu` | `cpu`, `cuda`, `vulkan` or `rocm`. Picks the default package and, for `cuda`, relaxes llama-swap's unit (below) |
+| `llamaCpp.package` | `pkgs.llama-cpp` with `cudaSupport`, `rocmSupport` and `vulkanSupport` each true only for `llamaCpp.backend` | The llama.cpp providing `llama-server`; 0.8.0 or newer. The default sets every flag, so `nixpkgs.config.cudaSupport` does not add CUDA to a `cpu` build. A package you set must be built for the backend `llamaCpp.backend` names, because that option sets the unit's hardening. The check reads the package's version, so a version string that is a build number passes unchecked |
+| `models.asr.name`, `models.tts.name` | `qwen3-asr`, `qwen3-tts` | Entry names, not empty. `models.tts` is used only under `llamacpp` |
+| `models.<entry>.artifacts.model`, `.mmproj` | pinned `url` and `hash` | Each has `url`, `hash` and `path`; `path` defaults to `pkgs.fetchurl { url, hash }`. Set `path` to a local file to skip the download, as a string: a Nix path literal copies the file into the store |
+| `models.<entry>.device` | `null` | `--device`, such as `CUDA0`; null leaves it out, which a CPU build needs |
+| `models.<entry>.gpuLayers`, `.contextSize`, `.parallel` | `99`, `4096`, `1` | `-ngl`, `-c`, `-np` |
+| `models.<entry>.concurrencyLimit` | ASR: the service's transcription limit (`request.maxConcurrent`, or `REQUEST_MAXCONCURRENT` from `extraEnvironment`, else 4); TTS `5` | llama-swap's `concurrencyLimit`. llama-swap answers 429 beyond it; within it, llama-server queues requests beyond its `parallel` slots |
+| `models.<entry>.ttl` | `0` | Seconds idle before llama-swap unloads the entry. 0 disables idle unloading; swapping can still unload it |
+| `models.<entry>.preload` | `true` | Load at llama-swap's start |
+| `models.<entry>.extraArgs` | `[]` | Appended to the `llama-server` command |
+| `tts.qwentts.package` | this flake's `qwen-tts-server` | The server; the flake builds it for x86_64 Linux only |
+| `tts.qwentts.model` | this flake's `qwen3-tts-model` | The weights directory. A local copy works; give it as a string, because a Nix path literal copies the directory into the store |
+| `tts.qwentts.modelName` | `qwen3-tts` | Entry name, not empty |
+| `tts.qwentts.language`, `.chunkSize`, `.queueSize`, `.queueWaitSeconds`, `.maxSegmentChars`, `.maxNewTokens` | `English`, `12`, `8`, `60`, `400`, `600` | The server's `language`, `chunk_size`, `queue_size`, `queue_wait_seconds`, `max_segment_chars` and `max_new_tokens` |
+| `tts.qwentts.ttl`, `.preload` | `0`, `true` | As for the llama.cpp entries |
+| `tts.qwentts.concurrencyLimit` | `queueSize` | llama-swap's `concurrencyLimit`, beyond which llama-swap answers 429; the server itself holds at most `queueSize` + 1 requests |
+| `tts.qwentts.cudaDevice` | `"0"` | The entry's only environment variable, `CUDA_VISIBLE_DEVICES` |
+| `tts.qwentts.extraArgs` | `[]` | Appended to the `qwen-tts-server` command |
+
+The llama.cpp commands are
+`llama-server --port ${PORT} -m <model> --mmproj <mmproj> [--device <device>] -ngl 99 -c 4096 -np 1 --flash-attn on --no-webui`,
+with `--temp 0` before `--flash-attn` for the ASR entry. The `qwentts` entry
+runs `qwen-tts-server --port ${PORT} --config <generated JSON>`; both check
+`/health`. The generated configuration takes `max_input_chars` from the
+effective `TTS_MAXINPUTCHARS` (`tts.maxInputChars`, or the value from
+`extraEnvironment`, else the service's default of 4096), so the server and the
+service refuse the same inputs. Each voice's `clip` is its link in
+`<stateDir>/voices`.
+
+nixpkgs' llama-swap unit runs as a dynamic user with a read-only file system
+and no access to `/home`, so put GGUFs and clips elsewhere. The module
+changes that unit only as follows:
+
+- `cuda`, or the `qwentts` backend whatever `llamaCpp.backend` is (torch uses
+  CUDA): `MemoryDenyWriteExecute = false`, `DeviceAllow` for `char-nvidia` and
+  `char-nvidia-uvm`, and `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so a device index
+  means the same card as in `nvidia-smi`. A `DeviceAllow` list closes every
+  other device, so this affects every model llama-swap runs, CPU ones
+  included; with `vulkan` or `rocm` the module adds `char-drm` (and
+  `/dev/kfd` for `rocm`) back. An older NVIDIA driver that names its device
+  `nvidia-frontend` in `/proc/devices` needs that added to `DeviceAllow`.
+- `qwentts`: llama-swap's user joins the module's group, because the server
+  reads each clip through `<stateDir>/voices`, and a start step creates the
+  server's cache root, `${XDG_CACHE_HOME:-/var/cache/llama-swap}/qwen-tts-server`.
+  The voices directory is group-readable, but the module cannot change your
+  clips: under `qwentts` each clip must be readable by the module's group
+  (for example mode `0640`, group `llama-swap-voice`). Nothing checks this
+  before llama-swap starts the server; an unreadable clip stops the server at
+  startup, and its error is in llama-swap's upstream log.
+- `vulkan` and `rocm` under `llamacpp`, and `cpu`, leave the unit as nixpkgs
+  ships it.
+
+As a sizing guide, measured on one host by another session and not verified
+here: on a 16 GB RTX A4000 the TTS server took 5864 MiB and the llama.cpp
+ASR 3332 MiB, 9196 MiB together, and the server's `/health` answered about
+16 seconds after start. llama-swap waits
+`services.llama-swap.settings.healthCheckTimeout` (120 seconds by default)
+for an entry's `/health`, and that must cover loading the model and, for the
+TTS server, warming up every voice; set it yourself, since the module sets no
+top-level llama-swap value. llama-swap behaviours worth knowing are under
+[Under llama-swap](#under-llama-swap).
 
 ## API
 
@@ -326,7 +451,9 @@ supervisor. It keeps its caches under
 The only variable to set per deployment is `CUDA_VISIBLE_DEVICES`. The
 default cache directory, `/var/cache/llama-swap/qwen-tts-server`, must exist
 and be writable by the user the server runs as; elsewhere, set
-`XDG_CACHE_HOME`.
+`XDG_CACHE_HOME`. The NixOS module's `qwentts` backend creates it and writes
+the server's llama-swap entry and configuration for you; see
+[The llama-swap entries](#the-llama-swap-entries).
 
 It exits 2 when the config is invalid, naming the problem, and 1 when the
 model or a voice fails to load. After a fatal GPU error, such as running out
@@ -335,7 +462,9 @@ of GPU memory, the request that hit it gets its 500 and the server then exits
 
 ### Config
 
-A JSON file:
+A JSON file. Under the NixOS module, `tts.qwentts` and the voice registry
+generate it, and `nix flake check` loads the generated file with the
+server's own `config.py`:
 
 ```json
 {
@@ -463,7 +592,7 @@ llama-swap-voice runs it.
 
 ### Under llama-swap
 
-A llama-swap model entry for the server:
+A llama-swap model entry for the server, as the NixOS module writes it:
 
 ```yaml
 models:

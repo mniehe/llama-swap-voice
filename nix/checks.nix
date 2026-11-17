@@ -9,6 +9,9 @@
 
   modules = (lib.importTOML ../gomod2nix.toml).mod;
 
+  moduleChecks = import ./tests {inherit pkgs module go;};
+  qwenConfigCheck = "module-qwen-tts-config";
+
   # A check built as a gomod2nix application gets every module from the
   # vendor set, so it runs offline in the sandbox.
   goCheck = {
@@ -92,7 +95,14 @@
     extract ${rfc8251Vectors} $out/rfc8251 36
   '';
 in {
-  inherit (import ./tests {inherit pkgs module go;}) module-eval module-vm duration-corpus;
+  inherit (moduleChecks) module-eval module-vm module-llama-swap-vm module-model-pins duration-corpus;
+  # Defined only where the TTS server builds; a null name adds no attribute.
+  ${
+    if moduleChecks ? ${qwenConfigCheck}
+    then qwenConfigCheck
+    else null
+  } =
+    moduleChecks.${qwenConfigCheck};
 
   tests = goCheck {
     name = "tests";

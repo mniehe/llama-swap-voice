@@ -74,8 +74,8 @@ the list above needs confirmation even when it is only a file edit.
   /server         # HTTP handlers, admission pools, the TTS queue, panic recovery, request log, JSON errors
   /upstream       # llama-swap client: TTS backends (llamacpp, qwentts), transcription, one retry, no redirects
   /voices         # Finds and checks voice clips at startup; the llamacpp backend reopens the clip on each request
-/nix                    # packages.nix (the build), checks.nix (what nix flake check runs), devshells.nix (nix develop), module.nix (nixosModules.default)
-  /tests                # NixOS module checks: default.nix (the module-eval, module-vm and duration-corpus checks), eval.nix (assertions, generated environment), vm.nix (VM test), fake-upstream.py (strict fake TTS and ASR upstream), duration-corpus.nix with durations.nix and testdata/parse-duration.go (durations compared with Go)
+/nix                    # packages.nix (the build), checks.nix (what nix flake check runs), devshells.nix (nix develop), module.nix (nixosModules.default), llama-swap.nix (the module's llama-swap entries and unit changes), models.nix (pinned GGUFs), qwen-tts-config.nix (the TTS server's generated config)
+  /tests                # NixOS module checks: default.nix (lists them), eval.nix (assertions, generated environment, llama-swap settings), vm.nix (VM test against fake-upstream.py, a strict fake TTS and ASR upstream), llama-swap-vm.nix (VM test under nixpkgs' llama-swap with the fakes in fakes.nix and fake-model-server.py), qwen-tts-config.nix (config.py loads the generated config), model-pins.nix (default GGUF pins, evaluation only), duration-corpus.nix with durations.nix and testdata/parse-duration.go (durations compared with Go)
   /qwen-tts-server      # The TTS server's CUDA environment (uv2nix), wheel overrides, weights pin, tests and launcher
 /python                 # qwen-tts-server: the faster-qwen3-tts HTTP server the qwentts backend calls; pyproject.toml and uv.lock pin its environment
   /qwen_tts_server      # app.py (endpoints), config.py, engine.py (the model), worker.py (the one CUDA thread), text.py, wav.py
@@ -176,8 +176,9 @@ gofmt -l . && go vet ./... && golangci-lint run ./...   # gofmt -l must print no
 go test ./...
 go test -race ./...                  # when the change touches goroutines, channels, locks or internal/server
 go test -run '^$' -fuzz '^FuzzNormaliseUpload$' -fuzztime 30s ./internal/audio   # when the change touches a Go parser or the time-stretch
-nix flake check                      # before a push: race tests, lint, gofmt, alejandra, Opus conformance, package version, gomod2nix sync, NixOS module eval and VM tests, duration corpus, the Python server's tests and weights pin
+nix flake check                      # before a push: race tests, lint, gofmt, alejandra, Opus conformance, package version, gomod2nix sync, NixOS module eval, VM tests (with and without llama-swap), TTS server config and GGUF pins, duration corpus, the Python server's tests and weights pin
 nix build -L .#checks.x86_64-linux.qwen-tts-server-tests   # when the change touches python/ or nix/qwen-tts-server/
+nix build -L --no-link .#checks.x86_64-linux.module-eval .#checks.x86_64-linux.duration-corpus .#checks.x86_64-linux.module-model-pins .#checks.x86_64-linux.module-qwen-tts-config .#checks.x86_64-linux.module-vm .#checks.x86_64-linux.module-llama-swap-vm   # when the change touches nix/module.nix, nix/llama-swap.nix, nix/models.nix, nix/qwen-tts-config.nix, nix/tests/ or python/qwen_tts_server/config.py
 nix build .#qwen-tts-server.env .#qwen-tts-server.tokenizer-test   # when the change touches python/pyproject.toml, python/uv.lock, nix/qwen-tts-server/overrides.nix, python/tests/test_tokenizer.py or python/qwen_tts_server/engine.py
 ```
 
@@ -238,7 +239,7 @@ hole, or silently corrupts audio:
 A change is done when everything this Verification section requires of it has
 run and passed, review included. Four rules apply on top of that:
 
-- `nix flake check` passes before a push, on Linux with KVM, because the flake defines no checks on Darwin and module-vm boots virtual machines.
+- `nix flake check` passes before a push, on Linux with KVM, because the flake defines no checks on Darwin and the VM checks boot virtual machines.
 - A behaviour change carries a test that failed before the change and passes after it, so the test is known to detect the fault.
 - Each commit is SSH-signed with a single-line conventional subject, `type(scope): subject`, because the history is the changelog cocogitto reads.
 - No commit, comment, code or document carries AI attribution, because the owner publishes the work as his own.

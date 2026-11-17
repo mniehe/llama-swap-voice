@@ -100,34 +100,80 @@ flakeSelf: {
     types.addCheck duration (value: durationNanoseconds value > 0)
     // {description = "positive Go duration";};
 
-  # The shutdown steps the service will run, after extraEnvironment overrides.
-  shutdownSteps = {
-    GRACE = duration;
-    TOTAL = positiveDuration;
-    HARD = positiveDuration;
+  # Decimal without a sign or leading zero, at most Go's int64: the subset
+  # that Nix's toInt and the service's integer parsing read alike.
+  positiveInteger =
+    types.addCheck types.str (value:
+      builtins.match "[1-9][0-9]{0,18}" value
+      != null
+      && (lib.stringLength value < 19 || value <= "9223372036854775807"))
+    // {description = "positive integer";};
+
+  # Variables the module itself reads after extraEnvironment is merged, each
+  # with the type an override must have.
+  checkedVariables = {
+    SHUTDOWN_GRACE = duration;
+    SHUTDOWN_TOTAL = positiveDuration;
+    SHUTDOWN_HARD = positiveDuration;
+    TTS_MAXINPUTCHARS = positiveInteger;
+    UPSTREAM_TTSCONCURRENCY = positiveInteger;
+    REQUEST_MAXCONCURRENT = positiveInteger;
   };
-  effectiveShutdown = lib.mapAttrs (step: _: environment."${envPrefix}SHUTDOWN_${step}" or null) shutdownSteps;
+
+  # The service's own defaults (cmd/llama-swap-voice/config.go), for the
+  # checked integers left unset.
+  serviceDefaults = {
+    TTS_MAXINPUTCHARS = 4096;
+    UPSTREAM_TTSCONCURRENCY = 1;
+    REQUEST_MAXCONCURRENT = 4;
+  };
+
+  rawValue = name: environment."${envPrefix}${name}" or null;
+
+  # A checked variable's value after extraEnvironment, or null when it is
+  # unset or invalid; an invalid value fails an assertion instead.
+  effective = name: let
+    value = rawValue name;
+  in
+    if value != null && checkedVariables.${name}.check value
+    then value
+    else null;
+
+  effectiveInteger = name: let
+    value = effective name;
+  in
+    if value == null
+    then serviceDefaults.${name}
+    else lib.toInt value;
 
   # The service runs the shutdown steps one after another. The margin covers
   # the steps left unset, whose Go defaults total 18 s. Seconds and remainders
   # are summed apart, so three maximal durations cannot overflow.
   stopTimeout = let
-    valid = lib.filter (value: value != null) (lib.mapAttrsToList (step: value:
-      if value != null && shutdownSteps.${step}.check value
-      then durationNanoseconds value
-      else null)
-    effectiveShutdown);
+    valid = map durationNanoseconds (lib.filter (value: value != null) (map (step: effective "SHUTDOWN_${step}") ["GRACE" "TOTAL" "HARD"]));
     seconds = lib.foldl' (sum: value: sum + value / 1000000000) 0 valid;
     remainder = lib.foldl' (sum: value: sum + lib.mod value 1000000000) 0 valid;
   in
     lib.max 90 (seconds + (remainder + 999999999) / 1000000000 + 30);
 
-  shutdownAssertions =
-    lib.mapAttrsToList (step: value: {
-      assertion = value == null || shutdownSteps.${step}.check value;
-      message = "${opt}.extraEnvironment.${envPrefix}SHUTDOWN_${step} is \"${toString value}\", which is not a ${shutdownSteps.${step}.description} the module accepts.";
+  checkedAssertions =
+    lib.mapAttrsToList (name: type: let
+      value = rawValue name;
+    in {
+      assertion = value == null || type.check value;
+      message = "${opt}.extraEnvironment.${envPrefix}${name} is \"${toString value}\", which is not a ${type.description} the module accepts.";
     })
-    effectiveShutdown;
+    checkedVariables;
+
+  # Python's str.isspace() characters, which config.py strips before it
+  # refuses an empty transcript; JSON spells them, as Nix strings cannot.
+  pythonWhitespace = builtins.fromJSON ''
+    ["\t", "\n", "\u000b", "\u000c", "\r", "\u001c", "\u001d", "\u001e", "\u001f", " ",
+     "\u0085", "\u00a0", "\u1680", "\u2000", "\u2001", "\u2002", "\u2003", "\u2004",
+     "\u2005", "\u2006", "\u2007", "\u2008", "\u2009", "\u200a", "\u2028", "\u2029",
+     "\u202f", "\u205f", "\u3000"]
+  '';
+  isBlank = text: builtins.replaceStrings pythonWhitespace (map (_: "") pythonWhitespace) text == "";
 
   # systemd-tmpfiles reads % as a specifier in paths and arguments.
   tmpfilesEscape = lib.replaceStrings ["%"] ["%%"];
@@ -158,38 +204,65 @@ flakeSelf: {
         type = types.nullOr types.str;
         default = null;
         description = ''
-          What the clip says, for the faster-qwen3-tts server's configuration.
-          Null selects embedding-only cloning, which keeps the voice but not
-          its accent. This module does not generate that configuration yet, so the value has no effect on the service today.
+          What the clip says. Null selects embedding-only cloning, which keeps
+          the voice but not its accent. Under the qwentts backend it goes into the faster-qwen3-tts server's configuration, which the module generates when llamaSwap.enable is true; the llamacpp backend ignores it.
         '';
       };
       instruct = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = "Style instruction, for the faster-qwen3-tts server's configuration. Under qwentts it needs a transcript. This module does not generate that configuration yet, so the value has no effect on the service today.";
+        description = "Style instruction, which needs a transcript under qwentts. Under the qwentts backend it goes into the faster-qwen3-tts server's configuration, which the module generates when llamaSwap.enable is true; the llamacpp backend ignores it.";
       };
       temperature = mkOption {
         type = types.numbers.nonnegative;
         default = 0.7;
-        description = "Sampling temperature, for the faster-qwen3-tts server's configuration. This module does not generate that configuration yet, so the value has no effect on the service today.";
+        description = "Sampling temperature. Under the qwentts backend it goes into the faster-qwen3-tts server's configuration, which the module generates when llamaSwap.enable is true; the llamacpp backend ignores it.";
       };
       topK = mkOption {
         type = types.ints.positive;
         default = 50;
-        description = "Top-k sampling, for the faster-qwen3-tts server's configuration. This module does not generate that configuration yet, so the value has no effect on the service today.";
+        description = "Top-k sampling. Under the qwentts backend it goes into the faster-qwen3-tts server's configuration, which the module generates when llamaSwap.enable is true; the llamacpp backend ignores it.";
       };
       topP = mkOption {
         type = types.numbers.between 0 1;
         default = 1.0;
-        description = "Top-p sampling, for the faster-qwen3-tts server's configuration. This module does not generate that configuration yet, so the value has no effect on the service today.";
+        description = "Top-p sampling. Under the qwentts backend it goes into the faster-qwen3-tts server's configuration, which the module generates when llamaSwap.enable is true; the llamacpp backend ignores it.";
       };
       repetitionPenalty = mkOption {
         type = types.numbers.positive;
         default = 1.05;
-        description = "Repetition penalty, for the faster-qwen3-tts server's configuration. This module does not generate that configuration yet, so the value has no effect on the service today.";
+        description = "Repetition penalty. Under the qwentts backend it goes into the faster-qwen3-tts server's configuration, which the module generates when llamaSwap.enable is true; the llamacpp backend ignores it.";
       };
     };
   };
+
+  # llama-swap answers on every address for a wildcard listen address; the
+  # service reaches it over loopback, which its IPAddressAllow always allows.
+  # An unbracketed IPv6 address fails an assertion in llama-swap.nix.
+  loopbackFor = address:
+    if address == "" || address == "0.0.0.0"
+    then "127.0.0.1"
+    else if address == "[::]"
+    then "[::1]"
+    else address;
+
+  llamaSwapURL = let
+    swap = config.services.llama-swap;
+    scheme =
+      if swap.tls.enable
+      then "https"
+      else "http";
+  in "${scheme}://${loopbackFor swap.listenAddress}:${toString swap.port}";
+
+  whenIntegrated = value:
+    if cfg.llamaSwap.enable
+    then value
+    else null;
+
+  ttsModelName =
+    if cfg.tts.backend == "qwentts"
+    then cfg.tts.qwentts.modelName
+    else cfg.models.tts.name;
 
   extensionOf = path: lib.last (lib.splitString "." path);
   hasExtension = exts: path: lib.elem (lib.toLower (extensionOf path)) exts;
@@ -216,8 +289,8 @@ flakeSelf: {
       message = "${voiceOpt}.clip must end in .wav when ${opt}.tts.backend is qwentts, got \"${voice.clip}\".";
     }
     {
-      assertion = qwentts -> voice.transcript != "";
-      message = "${voiceOpt}.transcript must be null or non-empty when ${opt}.tts.backend is qwentts; null selects embedding-only cloning.";
+      assertion = qwentts -> voice.transcript == null || !isBlank voice.transcript;
+      message = "${voiceOpt}.transcript must be null or hold more than whitespace when ${opt}.tts.backend is qwentts; null selects embedding-only cloning.";
     }
     {
       assertion = qwentts -> voice.instruct != null -> voice.transcript != null;
@@ -231,6 +304,8 @@ flakeSelf: {
     UPSTREAM_URL = cfg.upstreamURL;
     UPSTREAM_TTSBACKEND = cfg.tts.backend;
     UPSTREAM_TTSCONCURRENCY = cfg.upstream.ttsConcurrency;
+    UPSTREAM_TTSMODEL = whenIntegrated ttsModelName;
+    UPSTREAM_ASRMODEL = whenIntegrated cfg.models.asr.name;
     VOICES_DIR = voicesDir;
     VOICES_DEFAULT = cfg.defaultVoice;
     TTS_MAXINPUTCHARS = cfg.tts.maxInputChars;
@@ -265,6 +340,8 @@ flakeSelf: {
     exit $status
   '';
 in {
+  imports = [(import ./llama-swap.nix {inherit flakeSelf linkName ttsModelName effectiveInteger;})];
+
   options.services.llama-swap-voice = {
     enable = lib.mkEnableOption "llama-swap-voice, the OpenAI audio API in front of llama-swap";
 
@@ -284,7 +361,12 @@ in {
     group = mkOption {
       type = types.str;
       default = defaultName;
-      description = "System group the service runs as. The module creates it only under the default name; a custom group must already exist.";
+      description = ''
+        System group the service runs as. The module creates it only under
+        the default name; a custom group must already exist. Under the
+        qwentts backend llama-swap's user joins this group, gaining all its
+        access, so do not pick a group other services share.
+      '';
     };
 
     stateDir = mkOption {
@@ -323,7 +405,15 @@ in {
 
     upstreamURL = mkOption {
       type = types.strMatching "https?://[^[:space:]/?#]+([/?#][^[:space:]]*)?";
-      default = "http://127.0.0.1:8080";
+      default =
+        if cfg.llamaSwap.enable
+        then llamaSwapURL
+        else "http://127.0.0.1:8080";
+      defaultText = lib.literalMD ''
+        services.llama-swap's listen address and port when llamaSwap.enable
+        is true, with a wildcard address replaced by loopback; otherwise
+        `http://127.0.0.1:8080`
+      '';
       description = ''
         llama-swap's base URL. Evaluation checks only a conservative subset,
         http:// or https:// followed by a non-empty host and no whitespace;
@@ -358,11 +448,20 @@ in {
       maxInputChars = limit types.ints.positive "Longest text accepted per speech request (TTS_MAXINPUTCHARS).";
     };
 
-    upstream.ttsConcurrency = limit types.ints.positive "Speech requests sent to the TTS model at once (UPSTREAM_TTSCONCURRENCY).";
+    upstream.ttsConcurrency = mkOption {
+      type = types.ints.positive;
+      default = 1;
+      description = ''
+        Speech requests sent to the TTS model at once
+        (UPSTREAM_TTSCONCURRENCY). The service's gate keeps sentence order,
+        and it releases a request when generation ends, not playback, so 1
+        costs nothing. The TTS entry's concurrencyLimit must be at least this.
+      '';
+    };
 
     request = {
       timeout = durationLimit positiveDuration "Longest a speech or transcription request may take (REQUEST_TIMEOUT).";
-      maxConcurrent = limit types.ints.positive "Transcriptions handled at once (REQUEST_MAXCONCURRENT).";
+      maxConcurrent = limit types.ints.positive "Transcriptions handled at once (REQUEST_MAXCONCURRENT); models.asr.concurrencyLimit follows it.";
       maxConcurrentTTS = limit types.ints.positive "Speech requests handled at once, queued ones included (REQUEST_MAXCONCURRENTTTS).";
     };
 
@@ -386,8 +485,10 @@ in {
       description = ''
         The voice registry. Each voice becomes the symlink
         <stateDir>/voices/<name>.<extension of clip>. The service uses only
-        the clip; the other settings are for the faster-qwen3-tts server's
-        configuration, which this module does not generate yet.
+        the clip; the other settings go into the faster-qwen3-tts server's
+        configuration under the qwentts backend. Under qwentts llama-swap's
+        user reads each clip too, through the voices directory, so each clip
+        must be readable by the module's group.
       '';
     };
 
@@ -409,7 +510,10 @@ in {
       example = {LLAMA_SWAP_VOICE_LOG_LEVEL = "debug";};
       description = ''
         Extra environment variables for the service, by full name. They win
-        over the variables the module generates.
+        over the variables the module generates. The module reads the
+        shutdown durations, TTS_MAXINPUTCHARS, UPSTREAM_TTSCONCURRENCY and
+        REQUEST_MAXCONCURRENT after this merge, and evaluation fails when an
+        override is not a value the matching option accepts.
       '';
     };
   };
@@ -427,7 +531,7 @@ in {
         }
       ]
       ++ lib.concatLists (lib.mapAttrsToList voiceAssertions cfg.voices)
-      ++ shutdownAssertions;
+      ++ checkedAssertions;
 
     users.users = lib.mkIf (cfg.user == defaultName) {
       ${defaultName} = {
@@ -455,7 +559,7 @@ in {
     systemd.services.llama-swap-voice = {
       description = "llama-swap-voice";
       wantedBy = ["multi-user.target"];
-      after = ["network.target" "systemd-tmpfiles-setup.service" "systemd-tmpfiles-resetup.service"];
+      after = ["network.target" "systemd-tmpfiles-setup.service" "systemd-tmpfiles-resetup.service"] ++ lib.optional cfg.llamaSwap.enable "llama-swap.service";
       inherit environment;
 
       serviceConfig = {

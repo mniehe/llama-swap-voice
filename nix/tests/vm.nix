@@ -56,8 +56,11 @@
       "C ${clip} - - - - ${fixture}"
     ];
 
+    # The fake upstream stands in for llama-swap, so the module contributes
+    # nothing to one.
     services.llama-swap-voice = {
       enable = true;
+      llamaSwap.enable = false;
       tts.backend = backend;
       defaultVoice = "sample";
       voices.sample.clip = clip;
