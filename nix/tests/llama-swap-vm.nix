@@ -50,6 +50,17 @@
     environment.systemPackages = [pkgs.curl pkgs.jq];
     virtualisation.memorySize = 1024;
   };
+
+  # The consumer's own model in no group, so llama-swap puts it in its
+  # implicit default group, which is exclusive.
+  chatNode = voice: {
+    imports = [(node "llamacpp")];
+    services.llama-swap.settings.models.chat = {
+      cmd = "${fakes.llamaServer}/bin/llama-server --port \${PORT} -m ${fakes.artifacts.chat.model.path} --mmproj ${fakes.artifacts.chat.mmproj.path}";
+      checkEndpoint = "/health";
+    };
+    services.llama-swap-voice = voice;
+  };
 in
   pkgs.testers.runNixOSTest {
     name = "llama-swap-voice-llama-swap";
@@ -57,6 +68,8 @@ in
     nodes = {
       llamacpp = node "llamacpp";
       qwentts = node "qwentts";
+      pinned = chatNode {};
+      takeTurns = chatNode {llamaSwap.group.sharing = "takeTurns";};
     };
 
     testScript = {nodes, ...}: let
@@ -191,5 +204,75 @@ in
           assert len(starts(llamacpp, LLAMA_RECORD, TTS_MODEL)) == 1
           assert len(starts(qwentts, LLAMA_RECORD, ASR_MODEL)) == 1
           assert len(starts(qwentts, QWEN_RECORD, None)) == 1
+
+
+      # Every curl below is bounded, so a hung load fails the subtest rather
+      # than the driver's global timeout.
+      CURL = "curl -sS --max-time 30"
+      LLAMA_SWAP = "http://localhost:${toString llamaSwapPort}"
+      CHAT_BODY = json.dumps({"model": "chat", "messages": [{"role": "user", "content": "hi"}]})
+      SPEECH_BODY = json.dumps({"input": TRANSCRIPT, "voice": "sample", "response_format": "wav"})
+      VOICE_READY = (
+          f"{CURL} -f {LLAMA_SWAP}/running | "
+          "jq -e '[.running[] | select(.state == \"ready\") | .model] | sort == [\"qwen3-asr\", \"qwen3-tts\"]'"
+      )
+
+
+      def running(machine):
+          reply = json.loads(machine.succeed(f"{CURL} -f {LLAMA_SWAP}/running"))
+          return sorted((r["model"], r["state"]) for r in reply["running"])
+
+
+      # llama-swap stops the evicted models before it starts the target, and
+      # replies only once the target is ready, so /running is settled when
+      # each of these returns.
+      def chat(machine):
+          machine.succeed(f"{CURL} -f -H 'Content-Type: application/json' -d '{CHAT_BODY}' {LLAMA_SWAP}/v1/chat/completions")
+
+
+      def transcribe(machine):
+          return machine.succeed(
+              f"{CURL} -o /dev/null -w '%{{http_code}}' -F file=@{FIXTURE} http://127.0.0.1:8920/v1/audio/transcriptions"
+          ).strip()
+
+
+      def speak(machine):
+          return machine.succeed(
+              f"{CURL} -o /dev/null -w '%{{http_code}}' -H 'Content-Type: application/json' -d '{SPEECH_BODY}' {SPEECH}"
+          ).strip()
+
+
+      for machine in (pinned, takeTurns):
+          machine.wait_for_unit("llama-swap.service")
+          machine.wait_for_open_port(${toString llamaSwapPort})
+          machine.wait_for_unit("llama-swap-voice.service")
+          machine.wait_for_open_port(8920)
+          machine.wait_until_succeeds(VOICE_READY, timeout=30)
+
+      with subtest("pinned: a default-group model loads beside the voice entries without stopping them"):
+          chat(pinned)
+          state = running(pinned)
+          assert state == [("chat", "ready"), ("qwen3-asr", "ready"), ("qwen3-tts", "ready")], state
+          assert len(starts(pinned, LLAMA_RECORD, ASR_MODEL)) == 1
+          assert len(starts(pinned, LLAMA_RECORD, TTS_MODEL)) == 1
+
+      with subtest("takeTurns: a default-group model stops the voice entries"):
+          chat(takeTurns)
+          state = running(takeTurns)
+          assert state == [("chat", "ready")], state
+
+      with subtest("takeTurns: a transcription through the service stops the default-group model"):
+          status = transcribe(takeTurns)
+          assert status == "200", status
+          state = running(takeTurns)
+          assert state == [("qwen3-asr", "ready")], state
+
+      with subtest("takeTurns: speech then loads beside the asr entry"):
+          status = speak(takeTurns)
+          assert status == "200", status
+          state = running(takeTurns)
+          assert state == [("qwen3-asr", "ready"), ("qwen3-tts", "ready")], state
+          assert len(starts(takeTurns, LLAMA_RECORD, ASR_MODEL)) == 2
+          assert len(starts(takeTurns, LLAMA_RECORD, TTS_MODEL)) == 2
     '';
   }

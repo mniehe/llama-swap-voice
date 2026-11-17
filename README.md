@@ -314,7 +314,8 @@ refuses to start with `voice "<name>" is provided by both`.
 | Option | Default | What it does |
 |---|---|---|
 | `llamaSwap.enable` | `true` | Add the entries to `services.llama-swap.settings` and derive `upstreamURL`. Off, the module leaves `services.llama-swap` untouched |
-| `llamaSwap.group.enable` | `true` | Put both entries in a group that keeps them loaded; see [When the models unload](#when-the-models-unload) |
+| `llamaSwap.group.enable` | `true` | Put both entries in a group, so loading one never stops the other; see [When the models unload](#when-the-models-unload) |
+| `llamaSwap.group.sharing` | `"pinned"` | `pinned` keeps both entries loaded when other models load. `takeTurns` lets a model from an exclusive group, such as an ungrouped chat model, stop both, and makes loading either entry stop your models in groups that are not `persistent`; see [When the models unload](#when-the-models-unload) |
 | `llamaSwap.group.name` | `"voice"` | The group's name |
 | `llamaSwap.group.location` | `"legacy"` | `legacy` writes top-level `groups`; `routing` writes `routing.router.settings.groups`. llama-swap refuses a configuration with both layouts, so match yours |
 | `llamaCpp.backend` | `"cpu"` | `cpu`, `cuda`, `vulkan` or `rocm`. Picks the default package and, for `cuda`, relaxes llama-swap's unit |
@@ -371,14 +372,29 @@ sets `UPSTREAM_TTSMODEL` and `UPSTREAM_ASRMODEL` to the two entries' names.
 
 #### When the models unload
 
-With `llamaSwap.group.enable` on (the default), the group is written with
-`swap = false`, `exclusive = false` and `persistent = true`. The ASR and TTS
-entries stay loaded together, loading your other models does not stop them,
-and only a `ttl` above 0 unloads them when idle.
+llama-swap stops running models when it loads another one, by group. A model
+in no group joins llama-swap's implicit default group, which has `swap` and
+`exclusive` on: loading one of its models stops the others in it, and stops
+the models of every other group that is not `persistent`. A `ttl` above 0
+also unloads an idle model, and llama-swap's `/unload` endpoint stops them
+all. The voice group is written with `swap = false`, so the ASR and TTS
+entries never stop each other. `llamaSwap.group.sharing` sets the rest:
+`pinned` writes `exclusive = false` and `persistent = true`; `takeTurns`
+writes `exclusive = true` and `persistent = false`.
 
-With the group off, both entries join llama-swap's implicit default group,
-which swaps: loading one stops the other, so a transcription followed by
-speech reloads both models, whatever their `ttl`.
+| `llamaSwap.group` | The ASR and TTS entries | Loading an ungrouped model, such as a chat model | Loading the ASR or TTS entry |
+|---|---|---|---|
+| `enable = true`, `sharing = "pinned"` (the default) | Stay loaded together | Leaves both loaded; only their `ttl` unloads them | Stops no other model |
+| `enable = true`, `sharing = "takeTurns"` | Stay loaded together | Stops both, as does a model from any other exclusive group | Stops every running model of every group that is not `persistent`, the default group and your non-exclusive groups included |
+| `enable = false` | Loading one stops the other, so a transcription followed by speech reloads both | Stops both, as does a model from any other exclusive group | Stops the other voice entry, the default group's other models and every running model of every group that is not `persistent` |
+
+The default suits a GPU with room for the voice models beside your others.
+On a single GPU that cannot hold a large chat model and the voice models at
+once, set `sharing = "takeTurns"`: the chat model stops the pair, and the
+next voice request stops the chat model and loads its entry again. llama-swap
+preloads in order, so under `takeTurns` a voice preload stops any model of a
+non-persistent group preloaded before it. Loading a model from a group of
+yours with `exclusive = false` never stops the voice entries.
 
 #### Checks at evaluation
 
@@ -754,8 +770,10 @@ hooks:
     preload: [qwen3-asr, qwen3-tts]
 ```
 
-Drop `-ngl 99` to run on the CPU. Then put a clip in a voices directory and
-run the service:
+Drop `-ngl 99` to run on the CPU. For the module's `takeTurns`, set
+`exclusive: true` and `persistent: false`; see
+[When the models unload](#when-the-models-unload). Then put a clip in a
+voices directory and run the service:
 
 ```sh
 LLAMA_SWAP_VOICE_VOICES_DIR=~/voices \

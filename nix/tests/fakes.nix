@@ -51,5 +51,10 @@ in {
       model.path = artifact "tts-model.gguf";
       mmproj.path = artifact "tts-mmproj.gguf";
     };
+    # A consumer's own model, outside the module's entries.
+    chat = {
+      model.path = artifact "chat-model.gguf";
+      mmproj.path = artifact "chat-mmproj.gguf";
+    };
   };
 }

@@ -76,6 +76,29 @@
       description = "${what}, downloaded from a pinned revision unless path is set.";
     };
 
+  ttlDescription = what: ''
+    Seconds idle before llama-swap unloads the ${what}; 0 disables idle
+    unloading. Under the default llamaSwap.group.sharing, "pinned", loading
+    another model never unloads it. Under "takeTurns", loading a model from
+    an exclusive group, such as llama-swap's implicit default group of
+    ungrouped models, unloads it whatever its ttl. With
+    llamaSwap.group.enable false the ${what} is itself in that default group,
+    so loading any model in it, the other voice entry included, unloads it
+    too.
+  '';
+
+  # What each llamaSwap.group.sharing value writes into the voice group.
+  sharingModes = {
+    pinned = {
+      exclusive = false;
+      persistent = true;
+    };
+    takeTurns = {
+      exclusive = true;
+      persistent = false;
+    };
+  };
+
   entryOptions = {
     what,
     name,
@@ -121,7 +144,7 @@
     ttl = mkOption {
       type = types.ints.unsigned;
       default = 0;
-      description = "Seconds idle before llama-swap unloads the entry. 0 disables idle unloading; swapping can still unload it.";
+      description = ttlDescription "entry";
     };
     preload = mkOption {
       type = types.bool;
@@ -197,14 +220,13 @@
 
   preloaded = lib.optional cfg.models.asr.preload asrName ++ lib.optional tts.preload ttsModelName;
 
+  group = cfg.llamaSwap.group;
+
   voiceGroup = {
     swap = false;
-    exclusive = false;
-    persistent = true;
+    inherit (sharingModes.${group.sharing}) exclusive persistent;
     members = [asrName ttsModelName];
   };
-
-  group = cfg.llamaSwap.group;
   groupOpt = "${opt}.llamaSwap.group.location";
 
   # What llama-swap's loader treats as each layout (internal/config/load.go).
@@ -248,11 +270,36 @@ in {
       group = {
         enable =
           lib.mkEnableOption ''
-            a llama-swap group holding the ASR and TTS entries, so both stay
-            loaded while other models swap. Without it they fall into
-            llama-swap's default group, where loading one stops the other,
+            a llama-swap group holding the ASR and TTS entries, so loading
+            one never stops the other; group.sharing decides how they share
+            llama-swap with other models. Without it they fall into
+            llama-swap's implicit default group, where loading one stops the
+            other and loading a model from any exclusive group stops both,
             whatever their ttl''
           // {default = true;};
+        sharing = mkOption {
+          type = types.enum (lib.attrNames sharingModes);
+          default = "pinned";
+          description = ''
+            How the ASR and TTS entries share llama-swap with other models;
+            it has effect only with group.enable. Either way the two entries
+            never stop each other.
+
+            "pinned" writes the group with exclusive = false and
+            persistent = true: loading another model never stops the entries
+            and loading them never stops another model. Only a ttl above 0,
+            or an unload through llama-swap's API, stops them.
+
+            "takeTurns" writes exclusive = true and persistent = false, for a
+            GPU that cannot hold the voice models beside a large model.
+            Loading a model from an exclusive group, which includes
+            llama-swap's implicit default group of ungrouped models, stops
+            both entries. Loading either entry stops every running model of
+            every group that is not persistent, the default group and
+            non-exclusive groups included. llama-swap preloads in order, so a
+            later preload can stop an earlier one.
+          '';
+        };
         name = mkOption {
           type = types.str;
           default = "voice";
@@ -359,7 +406,7 @@ in {
       ttl = mkOption {
         type = types.ints.unsigned;
         default = 0;
-        description = "Seconds idle before llama-swap unloads the server. 0 disables idle unloading; swapping can still unload it.";
+        description = ttlDescription "server";
       };
       preload = mkOption {
         type = types.bool;

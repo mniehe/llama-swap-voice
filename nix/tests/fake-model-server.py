@@ -4,11 +4,12 @@ Each takes the command line the module writes into llama-swap's settings,
 checks that the files it names can be read from inside llama-swap's sandbox,
 and appends every start and request to a JSON-lines record for the test.
 
-llama-server answers /tts with a fixed WAV and /v1/audio/transcriptions with
-a fixed transcript. qwen-tts-server loads its configuration with the real
-server's config.py, reads every voice clip as the real engine does, and
-answers JSON /v1/tts with a fixed WAV. Its record goes in the cache root the
-module must create; it never creates that directory itself.
+llama-server answers /tts with a fixed WAV, /v1/audio/transcriptions with a
+fixed transcript and /v1/chat/completions with a fixed reply.
+qwen-tts-server loads its configuration with the real server's config.py,
+reads every voice clip as the real engine does, and answers JSON /v1/tts
+with a fixed WAV. Its record goes in the cache root the module must
+create; it never creates that directory itself.
 
 A request body goes to its own file, named by its SHA-256, in the directory
 `<record>.bodies`, and the record holds only the digest. The test driver
@@ -26,6 +27,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TRANSCRIPT = "language English<asr_text>The kitchen lights are off."
+CHAT_REPLY = {"choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]}
 DEFAULT_CACHE = "/var/cache/llama-swap"
 EXIT_CONFIG = 2
 
@@ -130,7 +132,10 @@ def llama_server(reply, argv):
     def transcript(_content_type, _body):
         return 200, "application/json", json.dumps({"text": TRANSCRIPT}).encode()
 
-    routes = {"/tts": wav, "/v1/audio/transcriptions": transcript}
+    def chat(_content_type, _body):
+        return 200, "application/json", json.dumps(CHAT_REPLY).encode()
+
+    routes = {"/tts": wav, "/v1/audio/transcriptions": transcript, "/v1/chat/completions": chat}
     serve(args.port, recorder, routes, {"status": "ok"})
 
 

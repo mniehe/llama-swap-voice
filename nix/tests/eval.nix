@@ -392,12 +392,21 @@
     qwentts = qwenTtsServer;
   };
 
-  voiceGroup = tts: {
-    swap = false;
+  voiceGroupWith = sharing: tts:
+    {
+      swap = false;
+      members = ["qwen3-asr" tts];
+    }
+    // sharing;
+  pinned = {
     exclusive = false;
     persistent = true;
-    members = ["qwen3-asr" tts];
   };
+  takeTurns = {
+    exclusive = true;
+    persistent = false;
+  };
+  voiceGroup = voiceGroupWith pinned;
 
   mergesWith = backend: let
     settings = swapSettings (withLlamaSwap consumer) {
@@ -576,6 +585,25 @@
       in
         !(settings ? groups) && !(settings ? routing))
       "a group was written")
+
+    (let
+      legacy = swapSettings (withLlamaSwap {}) {llamaSwap.group.sharing = "takeTurns";};
+      routing = swapSettings (withLlamaSwap {}) {
+        llamaSwap.group = {
+          sharing = "takeTurns";
+          location = "routing";
+        };
+      };
+      byDefault = swapSettings (withLlamaSwap {}) {llamaSwap.group.location = "routing";};
+    in
+      holds "group.sharing = takeTurns writes an exclusive, non-persistent group in either location; the default stays pinned"
+      (legacy.groups or null
+        == {voice = voiceGroupWith takeTurns "qwen3-tts";}
+        && routing.routing.router.settings.groups or null == {voice = voiceGroupWith takeTurns "qwen3-tts";}
+        && byDefault.routing.router.settings.groups or null == {voice = voiceGroupWith pinned "qwen3-tts";})
+      "legacy ${show (legacy.groups or null)}; routing ${show (routing.routing or null)}; default routing ${show (byDefault.routing or null)}")
+
+    (refuses "group.sharing refuses a value outside pinned and takeTurns" ["llamaSwap" "group" "sharing"] "evictable")
 
     (failsWithIn (withLlamaSwap routerGroups) "legacy group with a consumer routing.router block fails naming both layouts"
       (swapped {llamaSwap.group.enable = true;})
