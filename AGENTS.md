@@ -66,7 +66,8 @@ the list above needs confirmation even when it is only a file edit.
   /server         # HTTP handlers, admission pools, the TTS queue, panic recovery, request log, JSON errors
   /upstream       # llama-swap client: TTS backends (llamacpp, qwentts), transcription, one retry, no redirects
   /voices         # Finds and checks voice clips at startup; the llamacpp backend reopens the clip on each request
-/nix                    # packages.nix (the build), checks.nix (what nix flake check runs), devshells.nix (nix develop)
+/nix                    # packages.nix (the build), checks.nix (what nix flake check runs), devshells.nix (nix develop), module.nix (nixosModules.default)
+  /tests                # NixOS module checks: default.nix (the module-eval, module-vm and duration-corpus checks), eval.nix (assertions, generated environment), vm.nix (VM test), fake-upstream.py (strict fake TTS and ASR upstream), duration-corpus.nix with durations.nix and testdata/parse-duration.go (durations compared with Go)
 flake.nix               # Package, dev shell and checks; flake.lock pins the inputs
 gomod2nix.toml          # Hash of every Go module for the Nix build; regenerated with go.mod
 .version                # Version stamped into the binary; cocogitto (.cog.toml) writes it on a bump
@@ -123,7 +124,10 @@ A suppression names the linter and states why.
 - Packages log through the `*slog.Logger` they were constructed with. Only
   `main` touches the default logger.
 - A change to an endpoint, status code, limit or environment variable updates
-  `README.md` in the same change.
+  `README.md` in the same change, and `nix/module.nix` with
+  `nix/tests/eval.nix` when the variable has a module option, because the
+  module names each variable by hand and no test compares it with
+  `config.go`.
 - Values from a spec or shared across call sites are named constants.
 
 ## Verification
@@ -139,7 +143,7 @@ gofmt -l . && go vet ./... && golangci-lint run ./...   # gofmt -l must print no
 go test ./...
 go test -race ./...                  # when the change touches goroutines, channels, locks or internal/server
 go test -run '^$' -fuzz '^FuzzNormaliseUpload$' -fuzztime 30s ./internal/audio   # when the change touches a parser or the time-stretch
-nix flake check                      # before a push: race tests, lint, gofmt, alejandra, Opus conformance, package version, gomod2nix sync
+nix flake check                      # before a push: race tests, lint, gofmt, alejandra, Opus conformance, package version, gomod2nix sync, NixOS module eval and VM tests, duration corpus
 ```
 
 Run the fuzz target that reaches the changed code: `FuzzNormaliseUpload` for
@@ -197,7 +201,7 @@ hole, or silently corrupts audio:
 A change is done when everything this Verification section requires of it has
 run and passed, review included. Four rules apply on top of that:
 
-- `nix flake check` passes before a push, on Linux, because the flake defines no checks on Darwin.
+- `nix flake check` passes before a push, on Linux with KVM, because the flake defines no checks on Darwin and module-vm boots virtual machines.
 - A behaviour change carries a test that failed before the change and passes after it, so the test is known to detect the fault.
 - Each commit is SSH-signed with a single-line conventional subject, `type(scope): subject`, because the history is the changelog cocogitto reads.
 - No commit, comment, code or document carries AI attribution, because the owner publishes the work as his own.

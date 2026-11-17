@@ -187,6 +187,85 @@ On SIGTERM or SIGINT, readiness turns 503 and shutdown runs in three steps:
    and wait this long for them to wind down. If requests are still running
    after it, the service logs an error and exits with status 1.
 
+## NixOS module
+
+The flake's `nixosModules.default` runs the service as a systemd unit under
+its own user. It does not set up llama-swap or the models yet.
+
+```nix
+{
+  imports = [llama-swap-voice.nixosModules.default];
+
+  services.llama-swap-voice = {
+    enable = true;
+    defaultVoice = "sample";
+    voices.sample.clip = "/srv/voices/sample.wav";
+  };
+}
+```
+
+Options under `services.llama-swap-voice`:
+
+| Option | Type | Default | What it does |
+|---|---|---|---|
+| `enable` | bool | `false` | Run the service |
+| `package` | package | this flake's package | The build to run |
+| `user`, `group` | string | `llama-swap-voice` | Account the service runs as. The module creates them only under the default name; a custom user or group must already exist |
+| `stateDir` | absolute path, not `/`, no trailing slash, no `%` | `/var/lib/llama-swap-voice` | The service reads voices from `<stateDir>/voices`. It must belong to this module alone, because tmpfiles sets its owner and mode |
+| `defaultVoice` | string | *required* | `VOICES_DEFAULT`; must be one of `voiceNames` |
+| `host`, `port` | string, integer 1 to 65535 | `127.0.0.1`, `8920` | `HOST`, `PORT` |
+| `upstreamURL` | `http://` or `https://` URL | `http://127.0.0.1:8080` | `UPSTREAM_URL`. Evaluation checks only for the scheme, a non-empty host and no whitespace; the service parses the URL fully at startup |
+| `ipAddressAllow` | list of strings | `[]` | Addresses besides loopback the service may talk to, in systemd's `IPAddressAllow=` syntax |
+| `tts.backend` | `llamacpp` or `qwentts` | `llamacpp` | `UPSTREAM_TTSBACKEND` |
+| `tts.maxInputChars` | positive int or null | `null` | `TTS_MAXINPUTCHARS` |
+| `upstream.ttsConcurrency` | positive int or null | `null` | `UPSTREAM_TTSCONCURRENCY` |
+| `request.timeout` | positive Go duration or null | `null` | `REQUEST_TIMEOUT` |
+| `request.maxConcurrent`, `request.maxConcurrentTTS` | positive int or null | `null` | `REQUEST_MAXCONCURRENT`, `REQUEST_MAXCONCURRENTTTS` |
+| `shutdown.grace` | Go duration or null | `null` | `SHUTDOWN_GRACE` |
+| `shutdown.total`, `shutdown.hard` | positive Go duration or null | `null` | `SHUTDOWN_TOTAL`, `SHUTDOWN_HARD` |
+| `voices.<name>.clip` | absolute path, as a string | *required* | The voice's recording; `.wav` or `.mp3`, and `.wav` under `qwentts` |
+| `voices.<name>.transcript` | string or null | `null` | What the clip says. Null selects embedding-only cloning, which keeps the voice but not its accent. No effect yet; see below |
+| `voices.<name>.instruct` | string or null | `null` | Style instruction; under `qwentts` it needs a transcript. No effect yet; see below |
+| `voices.<name>.temperature`, `.topK`, `.topP`, `.repetitionPenalty` | number, int, number, number | `0.7`, `50`, `1.0`, `1.05` | Sampling settings. No effect yet; see below |
+| `voiceNames` | list of strings, read-only | | The declared voice names, sorted, since Nix attribute sets keep no order |
+| `extraEnvironment` | attribute set of strings | `{}` | Extra variables by full name; they win over generated ones |
+
+A limit left `null` leaves its variable unset, so the service's own default
+from the table above applies. Durations use Go's syntax, such as `1m30s`,
+without a leading `+` or `-`; evaluation reads them exactly as the service
+does and refuses any above Go's maximum of about 292 years. Evaluation fails, naming the option, when
+`defaultVoice` is missing or undeclared, a clip path is relative or has
+another extension, or a `qwentts` voice has an empty transcript or an
+`instruct` without a transcript.
+
+A voice's `transcript`, `instruct` and sampling settings are for the
+faster-qwen3-tts server's configuration. This module does not generate that
+configuration yet, so these values have no effect on the service today; only
+the clip does.
+
+Stopping the unit waits for the shutdown steps one after another, so
+`TimeoutStopSec` is the sum of the shutdown durations you set plus 30 seconds
+for the ones you leave unset, and at least 90 seconds. A `SHUTDOWN_GRACE`,
+`SHUTDOWN_TOTAL` or `SHUTDOWN_HARD` set through `extraEnvironment` counts
+instead of the option it overrides, and evaluation fails, naming the
+variable, if it is not a duration the option would accept.
+
+Each voice becomes the symlink `<stateDir>/voices/<name>.<extension>`,
+pointing at its clip. Clips stay where they are and never enter the Nix
+store, and the service user must be able to read them. Clips copied into the
+directory by hand also count and are never removed. The module does not
+remove links either: after you delete a voice from the configuration, delete
+its link by hand. If a declared link points somewhere other than its clip,
+for example after you change the clip's path, the service refuses to start
+until you delete the link and run `systemd-tmpfiles --create`. If you change
+a clip's extension, including only its case, the old link stays beside the
+new one and the service refuses to start with `voice "<name>" is provided by
+both`; delete the link with the old extension by hand.
+
+The unit can write only to its private `/tmp`, where large uploads spool,
+cannot read home directories, and can exchange packets only with loopback. Put a non-loopback upstream, its DNS resolver,
+or the clients of a non-loopback `host` in `ipAddressAllow`.
+
 ## API
 
 Every path also works without the `/v1` prefix.

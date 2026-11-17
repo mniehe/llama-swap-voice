@@ -37,8 +37,12 @@
           import ./nix/checks.nix {
             inherit pkgs go version;
             package = packages.default;
+            module = self.nixosModules.default;
           }
         );
       }
-    );
+    )
+    // {
+      nixosModules.default = import ./nix/module.nix self;
+    };
 }

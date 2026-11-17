@@ -3,6 +3,7 @@
   go,
   version,
   package,
+  module,
 }: let
   inherit (pkgs) lib;
 
@@ -91,6 +92,8 @@
     extract ${rfc8251Vectors} $out/rfc8251 36
   '';
 in {
+  inherit (import ./tests {inherit pkgs module go;}) module-eval module-vm duration-corpus;
+
   tests = goCheck {
     name = "tests";
     tools = [pkgs.opus-tools pkgs.ffmpeg-headless];
