@@ -6,7 +6,8 @@ crossed, the asset, and what they gain. The service has no authentication:
 any client that reaches the port can call every route, so the questions are
 memory safety, resource exhaustion and disclosure. AGENTS.md names
 `internal/audio`, `internal/voices`, `internal/upstream`, `internal/openai`,
-`internal/pipeline`, `cmd/llama-swap-voice` and the build files critical paths, where a small
+`internal/wyoming`, `internal/pipeline`, `cmd/llama-swap-voice` and the build
+files critical paths, where a small
 mistake is a memory-safety or denial-of-service hole.
 
 ## Trust boundaries
@@ -19,6 +20,19 @@ mistake is a memory-safety or denial-of-service hole.
   `audio.MinSpeed`..`audio.MaxSpeed` (`pipeline.ResolveSpeed`). Uploads are
   bounded by `Limits().MaxUploadBytes` through `http.MaxBytesReader`, and
   `ParseMultipartForm(uploadMemory)` spools the rest to disk.
+- Wyoming clients over TCP, through `internal/wyoming`: `ReadEvent` bounds
+  the header line (`maxHeaderBytes`), data (`maxDataBytes`) and payload
+  (`maxPayloadBytes`) before allocating; `maxConns` caps connections at
+  accept. With no request open, a connection must start one by `idleSince`
+  plus `idleTimeout`, checked again for buffered events; describe and ping
+  do not extend it. With a request open, each event gets `idleTimeout`,
+  clamped to the request deadline. Describe and ping replies get
+  `writeTimeout`, cut to the idle deadline when no request is open; the
+  event that closes a request or the connection (the transcript or an
+  `error`) gets the whole `writeTimeout`, and an `error` closes the
+  connection. `audio-start` takes an ASR slot, and the recording is bounded
+  by `Limits().MaxUploadBytes` minus `wavHeaderBytes` before `Transcribe`
+  reads it whole.
 - Untrusted audio, `internal/audio`: `NormaliseUpload` reads the whole
   upload, `sniff` picks a decoder: the in-repo WAV parser (`wav.go`), the Ogg
   reader (`ogg.go`, `maxOggPacketBytes`) feeding pion/opus, or go-mp3.
@@ -64,15 +78,13 @@ mistake is a memory-safety or denial-of-service hole.
 6. Dependencies and lint: a new or upgraded module with a published
    advisory; a gosec or errcheck setting loosened.
 
-Search the web only for a specific advisory against a specific version, and
-quote its id and affected range.
-
 ## Check for what is absent
 
 - Every new client or upstream input has a named limit and a test at it.
 - Every changed parser is reached by a fuzz target that runs the changed
   code: `FuzzNormaliseUpload` (upload decoding), `FuzzOpusPacket` (Opus
-  packets) or `FuzzStretcher` (WSOLA). None reaches `NewWAVReader`; a change
+  packets), `FuzzStretcher` (WSOLA) or `FuzzReadEvent` (Wyoming frames,
+  `internal/wyoming`). None reaches `NewWAVReader`; a change
   to its header parsing without a new target is a finding.
 - Every new outbound client keeps `refuseRedirect` and a context deadline.
 

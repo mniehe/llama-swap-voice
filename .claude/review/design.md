@@ -9,7 +9,9 @@ a bug it prevents or a test it enables.
 
 - In non-test code, imports run one way: `cmd/llama-swap-voice` wires
   everything; `internal/openai` imports `internal/pipeline` and
-  `internal/audio` (for the encoders); `internal/pipeline` imports
+  `internal/audio` (for the encoders); `internal/wyoming` imports
+  `internal/pipeline` and `internal/audio` (for `WAVHeader`) and never
+  `internal/openai`; `internal/pipeline` imports
   `internal/audio` and `internal/upstream` and never `net/http`; `audio`,
   `upstream` and `voices` import no other internal package.
   A reverse or sideways import is a finding.
@@ -18,8 +20,8 @@ a bug it prevents or a test it enables.
   `cmd/llama-swap-voice/config.go`, and `serverConfig` maps them onto
   `pipeline.Config`.
 - `internal/audio` exports a small surface: `NormaliseUpload`, `Limits`,
-  `NewEncoder`, `Format`, `NewWAVReader`, `NewStretcher`, `MinSpeed`,
-  `MaxSpeed` and three sentinel errors. `decoderPanic` stays unexported
+  `NewEncoder`, `Format`, `NewWAVReader`, `WAVHeader`, `NewStretcher`,
+  `MinSpeed`, `MaxSpeed` and three sentinel errors. `decoderPanic` stays unexported
   and reaches `internal/pipeline` through a `Stack()` interface check; that
   is the pattern for extra detail across the boundary.
 - cgo is confined to `internal/audio/libopus.go`. Another file importing
@@ -32,9 +34,11 @@ a bug it prevents or a test it enables.
   `upstream.Backend` with `ParseBackend`); options are functional
   (`upstream.Option`, `WithBackend`).
 - Tests reach seams through real HTTP (`fakeUpstream`), one package
-  variable (`newEncoder`) and standard library interfaces
-  (`http.RoundTripper` in `roundTripFunc`, `io.WriteCloser` in
-  `panickingEncoder`); no interface exists only for tests.
+  variable (`newEncoder`), unexported `wyoming.Server` fields
+  (`transcribe`, `idleTimeout`, `writeTimeout`, set through `withServer`)
+  and standard library interfaces (`http.RoundTripper` in
+  `roundTripFunc`, `io.WriteCloser` in `panickingEncoder`); no interface
+  exists only for tests.
 
 ## Lenses, in priority order
 
