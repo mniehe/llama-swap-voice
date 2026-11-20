@@ -24,14 +24,14 @@ type modelList struct {
 
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	models := []model{
-		{ID: s.cfg.TTSModel, Object: modelObject, OwnedBy: modelOwner},
-		{ID: s.cfg.ASRModel, Object: modelObject, OwnedBy: modelOwner},
+		{ID: s.catalogue.TTSModel, Object: modelObject, OwnedBy: modelOwner},
+		{ID: s.catalogue.ASRModel, Object: modelObject, OwnedBy: modelOwner},
 	}
 	s.writeJSON(w, http.StatusOK, modelList{Object: listObject, Data: models})
 }
 
 func (s *Server) handleVoices(w http.ResponseWriter, _ *http.Request) {
-	s.writeJSON(w, http.StatusOK, map[string][]string{"voices": s.voices})
+	s.writeJSON(w, http.StatusOK, map[string][]string{"voices": s.catalogue.Voices})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {

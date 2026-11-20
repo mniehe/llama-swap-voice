@@ -3,12 +3,10 @@ package openai
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"encoding/binary"
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,7 +17,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/mniehe/llama-swap-voice/internal/audio"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
@@ -261,21 +258,6 @@ func TestServer_HandleTranscription_CorruptDetailIsLoggedNotSent(t *testing.T) {
 	assert.Contains(t, line["error"], "WAV")
 }
 
-func TestServer_DecodeFailure_ExpiredContextIs504(t *testing.T) {
-	h := newHarness(t, serveTranscript(t, transcriptText))
-	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
-	defer cancel()
-	r := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/audio/transcriptions", http.NoBody)
-
-	for _, err := range []error{audio.ErrCorrupt, audio.ErrUnsupported, audio.ErrTooLong, context.DeadlineExceeded} {
-		w := httptest.NewRecorder()
-
-		h.service.decodeFailure(w, r, err)
-
-		assert.Equal(t, http.StatusGatewayTimeout, w.Code, "expired context with %v", err)
-	}
-}
-
 // The upload decodes honestly to almost 20 minutes, which takes seconds, so
 // the request deadline passes mid-decode and the 504 rides on the write slack.
 func TestServer_HandleTranscription_SlowDecodeIs504(t *testing.T) {
@@ -301,6 +283,27 @@ func TestServer_HandleTranscription_OversizedTranscriptIs502(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
 	assert.Contains(t, errorMessage(t, resp), "transcript is larger than")
+}
+
+// A transcript that is not JSON arrives after a 200, but the upstream client
+// reports only the error, so the request log has no upstream status for it.
+func TestServer_HandleTranscription_MalformedTranscriptLogsNoUpstreamStatus(t *testing.T) {
+	h := newHarness(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", contentTypeJSON)
+		writeOrFail(t, w, "{not json")
+	})
+	logs := &logBuffer{}
+	h.logTo(logs)
+
+	resp := h.transcribe(map[string]string{"response_format": "text"}, []byte(streamedWAV))
+	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+
+	var line map[string]any
+	require.Eventually(t, func() bool {
+		line = logs.message(t, "request", resp.Header.Get(requestIDHeader))
+		return line != nil
+	}, waitTimeout, time.Millisecond, "no request log line")
+	assert.InDelta(t, 0, line["upstream_status"], 0)
 }
 
 func TestServer_HandleTranscription_Upstream5xxIsJSONError(t *testing.T) {
@@ -373,10 +376,30 @@ func (b *logBuffer) find(t *testing.T, level slog.Level, requestID string) map[s
 	return nil
 }
 
-// logTo points the harness's service at a logger that writes to logs, so a
-// test can assert on what the server logged.
+// message returns the JSON log line with msg for the request id, or nil.
+func (b *logBuffer) message(t *testing.T, msg, requestID string) map[string]any {
+	t.Helper()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	scanner := bufio.NewScanner(bytes.NewReader(b.buf.Bytes()))
+	scanner.Buffer(nil, len(b.buf.Bytes())+1)
+	for scanner.Scan() {
+		var line map[string]any
+		require.NoError(t, json.Unmarshal(scanner.Bytes(), &line))
+		if line["msg"] == msg && line["request_id"] == requestID {
+			return line
+		}
+	}
+
+	return nil
+}
+
+// logTo rebuilds the harness's pipeline and service on a logger that writes
+// to logs, so a test can assert on what the server logged.
 func (h *harness) logTo(logs *logBuffer) {
-	h.service.log = slog.New(slog.NewJSONHandler(logs, nil))
+	h.serve(slog.New(slog.NewJSONHandler(logs, nil)))
 }
 
 func TestHarness_LogTo_KeepsBackend(t *testing.T) {

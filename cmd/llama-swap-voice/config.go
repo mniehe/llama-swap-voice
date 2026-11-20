@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/mniehe/llama-swap-voice/internal/observability"
-	"github.com/mniehe/llama-swap-voice/internal/openai"
+	"github.com/mniehe/llama-swap-voice/internal/pipeline"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 	"github.com/mniehe/llama-swap-voice/internal/voices"
 )
@@ -237,8 +237,8 @@ func (c *ServiceConfig) validateShutdown() error {
 	return errors.Join(errs...)
 }
 
-func (c *ServiceConfig) serverConfig(voiceFiles map[string]string) openai.Config {
-	return openai.Config{
+func (c *ServiceConfig) serverConfig(voiceFiles map[string]string) pipeline.Config {
+	return pipeline.Config{
 		TTSModel:         c.Upstream.TTSModel,
 		ASRModel:         c.Upstream.ASRModel,
 		Voices:           voiceFiles,

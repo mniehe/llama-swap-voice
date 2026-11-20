@@ -280,15 +280,6 @@ func TestServer_HandleSpeech_TruncatedUpstreamIsClientError(t *testing.T) {
 	}
 }
 
-func TestSpeechPCM_SpeedOutsideStretcherRangeIsInternalError(t *testing.T) {
-	pcm, status, err := speechPCM(strings.NewReader(upstreamAudio), 0)
-
-	require.Error(t, err)
-	assert.Nil(t, pcm)
-	assert.Equal(t, http.StatusInternalServerError, status)
-	assert.Contains(t, err.Error(), "between 0.25 and 4")
-}
-
 func TestServer_HandleSpeech_QwenTTSSendsVoiceNameAsJSON(t *testing.T) {
 	h := newBackendHarness(t, upstream.QwenTTS, serveWAV(t), func(cfg *Config) {
 		cfg.Voices["robbie"] = filepath.Join(t.TempDir(), "never-created.wav")

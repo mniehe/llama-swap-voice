@@ -1,4 +1,4 @@
-package openai
+package pipeline
 
 import (
 	"context"

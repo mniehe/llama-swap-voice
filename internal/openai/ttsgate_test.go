@@ -1,9 +1,7 @@
 package openai
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,102 +21,6 @@ const (
 	queueTimeout    = 300 * time.Millisecond
 	concurrencyBody = `{"error":{"message":"too many requests","code":"concurrency_limit"}}`
 )
-
-func (g *ttsGate) queued() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	return len(g.waiters)
-}
-
-func (g *ttsGate) available() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	return g.free
-}
-
-func waitForQueue(t *testing.T, g *ttsGate, want int) {
-	t.Helper()
-
-	require.Eventually(t, func() bool { return g.queued() == want }, waitTimeout, time.Millisecond,
-		"want %d queued waiters, have %d", want, g.queued())
-}
-
-func TestTTSGate_Acquire_LimitsHolders(t *testing.T) {
-	g := newTTSGate(2)
-	require.NoError(t, g.acquire(t.Context()))
-	require.NoError(t, g.acquire(t.Context()))
-
-	ctx, cancel := context.WithTimeout(t.Context(), arrivalGap)
-	defer cancel()
-
-	assert.ErrorIs(t, g.acquire(ctx), context.DeadlineExceeded, "a third holder got in past a size of 2")
-}
-
-func TestTTSGate_Acquire_AdmitsInArrivalOrder(t *testing.T) {
-	const waiters = 3
-	g := newTTSGate(1)
-	require.NoError(t, g.acquire(t.Context()))
-
-	var mu sync.Mutex
-	var order []int
-	var wg sync.WaitGroup
-	for id := range waiters {
-		wg.Go(func() {
-			if !assert.NoError(t, g.acquire(t.Context())) {
-				return
-			}
-			mu.Lock()
-			order = append(order, id)
-			mu.Unlock()
-			g.release()
-		})
-		waitForQueue(t, g, id+1)
-	}
-
-	g.release()
-	wg.Wait()
-
-	assert.Equal(t, []int{0, 1, 2}, order)
-	assert.Equal(t, 1, g.available(), "the slot did not come back after the last release")
-}
-
-func TestTTSGate_Acquire_ExpiredWaiterLeavesQueue(t *testing.T) {
-	g := newTTSGate(1)
-	require.NoError(t, g.acquire(t.Context()))
-
-	ctx, cancel := context.WithTimeout(t.Context(), arrivalGap)
-	defer cancel()
-
-	assert.ErrorIs(t, g.acquire(ctx), context.DeadlineExceeded)
-	assert.Zero(t, g.queued(), "an expired waiter stayed in the queue")
-
-	g.release()
-	assert.Equal(t, 1, g.available(), "the release went to the expired waiter")
-	require.NoError(t, g.acquire(t.Context()))
-}
-
-func TestTTSGate_Abandon_HandedSlotPassesOn(t *testing.T) {
-	g := newTTSGate(1)
-	require.NoError(t, g.acquire(t.Context()))
-
-	turn := make(chan struct{})
-	g.mu.Lock()
-	g.waiters = append(g.waiters, turn)
-	g.mu.Unlock()
-
-	g.release()
-	select {
-	case <-turn:
-	case <-time.After(waitTimeout):
-		require.Fail(t, "release did not hand the slot to the queued waiter")
-	}
-
-	errLate := errors.New("deadline won the race")
-	assert.ErrorIs(t, g.abandon(turn, errLate), errLate)
-	assert.Equal(t, 1, g.available(), "a slot handed to a waiter that gave up was lost")
-}
 
 // overlapUpstream answers like llama-swap with concurrencyLimit 1: a call
 // that arrives while another is running gets a 429.
@@ -257,9 +159,28 @@ func TestServer_HandleSpeech_QueuedRequestsReachUpstreamInArrivalOrder(t *testin
 	assert.Equal(t, []string{"start A", "end A", "start B", "end B", "start C", "end C"}, fake.log())
 }
 
+// holdTTSGate takes the only TTS slot through the pipeline, on a reply the
+// upstream holds open, and returns the stream whose Close frees the slot.
+func holdTTSGate(t *testing.T, h *harness) io.Closer {
+	t.Helper()
+
+	job, err := h.pipeline.PrepareSpeech("", "holder")
+	require.NoError(t, err)
+
+	speech, err := h.pipeline.Speak(t.Context(), job, normalSpeed)
+	require.NoError(t, err)
+	t.Cleanup(func() { closeQuietly(t, speech.PCM) })
+
+	return speech.PCM
+}
+
 func TestServer_HandleSpeech_TimeoutWhileQueuedIs504(t *testing.T) {
-	h := newHarness(t, serveWAV(t), func(cfg *Config) { cfg.RequestTimeout = queueTimeout })
-	require.NoError(t, h.service.ttsGate.acquire(t.Context()))
+	release := make(chan struct{})
+	releaseHolder := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseHolder)
+	paused := servePaused(t, streamedSpeech(t, fixtureSamples(t)), release)
+	h := newHarness(t, paused, func(cfg *Config) { cfg.RequestTimeout = queueTimeout })
+	holder := holdTTSGate(t, h)
 
 	start := time.Now()
 	got := sendSpeech(t, h, "queued", "wav")
@@ -268,10 +189,10 @@ func TestServer_HandleSpeech_TimeoutWhileQueuedIs504(t *testing.T) {
 	requireTimeoutBody(t, got)
 	assert.Contains(t, got.body, "waiting for a free TTS slot")
 	assert.Less(t, elapsed, queueTimeout+deadlineSlack)
-	assert.Zero(t, h.upstream.callCount(), "the queued request reached upstream")
-	assert.Zero(t, h.service.ttsGate.queued(), "the timed-out request stayed queued")
+	assert.Len(t, h.upstream.callsTo(ttsRoute), 1, "the queued request reached upstream")
 
-	h.service.ttsGate.release()
+	releaseHolder()
+	require.NoError(t, holder.Close())
 	after := sendSpeech(t, h, "after", "wav")
 	require.NoError(t, after.err)
 	assert.Equal(t, http.StatusOK, after.status, "the gate leaked a slot: %s", after.body)
@@ -305,7 +226,6 @@ func TestServer_HandleSpeech_SlowUpstreamTimeoutIs504(t *testing.T) {
 
 			requireTimeoutBody(t, got)
 			assert.Less(t, elapsed, shortDeadline+deadlineSlack)
-			assert.Equal(t, 1, h.service.ttsGate.available(), "the timed-out request kept its TTS slot")
 		})
 	}
 }

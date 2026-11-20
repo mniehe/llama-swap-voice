@@ -7,18 +7,20 @@ a bug it prevents or a test it enables.
 
 ## Shape of the service
 
-- Imports run one way: `cmd/llama-swap-voice` wires everything;
-  `internal/openai` imports `internal/audio` and `internal/upstream`;
-  `audio`, `upstream` and `voices` import no other internal package.
+- In non-test code, imports run one way: `cmd/llama-swap-voice` wires
+  everything; `internal/openai` imports `internal/pipeline` and
+  `internal/audio` (for the encoders); `internal/pipeline` imports
+  `internal/audio` and `internal/upstream` and never `net/http`; `audio`,
+  `upstream` and `voices` import no other internal package.
   A reverse or sideways import is a finding.
 - `internal/config` is generic koanf loading (`LoadConfig[T]`); the
   service's own settings, defaults and `Validate` live in
   `cmd/llama-swap-voice/config.go`, and `serverConfig` maps them onto
-  `server.Config`.
+  `pipeline.Config`.
 - `internal/audio` exports a small surface: `NormaliseUpload`, `Limits`,
   `NewEncoder`, `Format`, `NewWAVReader`, `NewStretcher`, `MinSpeed`,
   `MaxSpeed` and three sentinel errors. `decoderPanic` stays unexported
-  and reaches `internal/openai` through a `Stack()` interface check; that
+  and reaches `internal/pipeline` through a `Stack()` interface check; that
   is the pattern for extra detail across the boundary.
 - cgo is confined to `internal/audio/libopus.go`. Another file importing
   "C", or a C type escaping the `libopus` struct, is a finding.
@@ -37,16 +39,20 @@ a bug it prevents or a test it enables.
 ## Lenses, in priority order
 
 1. Design that causes or hides a bug: an invariant enforced in two places
-   that can drift (a limit in both `server` and `audio`), a resource whose
+   that can drift (a limit in both `pipeline` and `audio`), a resource whose
    owner is unclear across a package boundary (the TTS slot, the Opus
    encoder handle, the upstream body).
 2. Streaming broken by structure: an API that takes `[]byte` where a
    reader or writer keeps replies streaming.
-3. Layering: inbound HTTP belongs in `server`, outbound llama-swap HTTP in
-   `upstream`, codecs and DSP in `audio`, generic loading in
-   `internal/config`, service defaults and validation in `cmd`. HTTP in
-   `audio`, codec detail in `server` handlers, or service settings parsed
-   outside `cmd` is a finding.
+3. Layering: inbound HTTP and its body bounds (`maxSpeechBodyBytes`,
+   `uploadMemory`, `http.MaxBytesReader`) belong in `openai`;
+   transport-neutral limits (input characters, upload size, decoded
+   duration) and audio steps (decoding, time-stretch) in `pipeline`;
+   outbound llama-swap HTTP in `upstream`; codecs and DSP in `audio`;
+   generic loading in `internal/config`; service defaults and validation in
+   `cmd`. In non-test code, HTTP in `audio` or `pipeline`, a
+   transport-neutral limit or a decode or stretch step in `openai` handlers,
+   or service settings parsed outside `cmd` is a finding.
 4. Surface: a new export with no caller outside its package, visibility
    widened without need, a boolean parameter where a named type reads at
    the call site.
@@ -59,7 +65,7 @@ a bug it prevents or a test it enables.
 - A sentinel error exported when a caller in another package needs
   `errors.Is`, as `audio.ErrCorrupt` is for `decodeFailure`.
 - A new configuration value threaded through `ServiceConfig`, its owning
-  component and `docs/options.md` together; only server settings go through
+  component and `docs/options.md` together; only pipeline settings go through
   `serverConfig` (`main` reads host, port, logging and shutdown itself).
 - A named constant for a value from a spec or shared between call sites.
 

@@ -6,7 +6,7 @@ crossed, the asset, and what they gain. The service has no authentication:
 any client that reaches the port can call every route, so the questions are
 memory safety, resource exhaustion and disclosure. AGENTS.md names
 `internal/audio`, `internal/voices`, `internal/upstream`, `internal/openai`,
-`cmd/llama-swap-voice` and the build files critical paths, where a small
+`internal/pipeline`, `cmd/llama-swap-voice` and the build files critical paths, where a small
 mistake is a memory-safety or denial-of-service hole.
 
 ## Trust boundaries
@@ -14,9 +14,10 @@ mistake is a memory-safety or denial-of-service hole.
 - Clients, through `internal/openai`: `POST /v1/audio/speech` and
   `/v1/audio/transcriptions`, also served without the `/v1` prefix
   (`routePrefixes`). Speech JSON is bounded by `maxSpeechBodyBytes` and
-  `MaxInputChars` (runes); the voice comes from the `cfg.Voices` map, never
-  a client path; `speed` is held to `audio.MinSpeed`..`audio.MaxSpeed`.
-  Uploads are bounded by `maxUploadBytes` through `http.MaxBytesReader`, and
+  `MaxInputChars` (runes, `pipeline.PrepareSpeech`); the voice comes from
+  the `cfg.Voices` map, never a client path; `speed` is held to
+  `audio.MinSpeed`..`audio.MaxSpeed` (`pipeline.ResolveSpeed`). Uploads are
+  bounded by `Limits().MaxUploadBytes` through `http.MaxBytesReader`, and
   `ParseMultipartForm(uploadMemory)` spools the rest to disk.
 - Untrusted audio, `internal/audio`: `NormaliseUpload` reads the whole
   upload, `sniff` picks a decoder: the in-repo WAV parser (`wav.go`), the Ogg

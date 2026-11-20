@@ -5,32 +5,49 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/mniehe/llama-swap-voice/internal/upstream"
+	"github.com/mniehe/llama-swap-voice/internal/pipeline"
 )
 
 const retryAfterHeader = "Retry-After"
 
-func (s *Server) upstreamFailure(w http.ResponseWriter, r *http.Request, err error) {
-	var statusErr *upstream.StatusError
-	if errors.As(err, &statusErr) {
-		record(r).upstreamStatus = statusErr.Code
-		if statusErr.RetryAfter != "" {
-			w.Header().Set(retryAfterHeader, statusErr.RetryAfter)
-		}
-		s.writeError(w, clientStatus(statusErr.Code), err)
+// failure answers a pipeline error with the status each kind had before the
+// pipeline existed, and records the upstream status for the request log.
+func (s *Server) failure(w http.ResponseWriter, r *http.Request, err error) {
+	var failed *pipeline.Error
+	if !errors.As(err, &failed) {
+		s.log.Error("unexpected pipeline failure", slog.String("request_id", record(r).id), slog.Any("error", err))
+		s.writeError(w, http.StatusInternalServerError, errInternal)
 		return
 	}
 
-	if r.Context().Err() != nil {
-		s.log.Info("request ended before upstream answered",
-			slog.String("request_id", record(r).id),
-			slog.Any("error", err),
-		)
-		s.writeError(w, http.StatusGatewayTimeout, err)
+	if failed.UpstreamStatus != 0 {
+		record(r).upstreamStatus = failed.UpstreamStatus
+	}
+
+	switch failed.Kind {
+	case pipeline.KindInvalid:
+		s.writeError(w, http.StatusBadRequest, failed)
+	case pipeline.KindBusy, pipeline.KindShuttingDown:
+		s.reject(w, failed)
+	case pipeline.KindTimeout:
+		s.writeError(w, http.StatusGatewayTimeout, failed)
+	case pipeline.KindUpstream:
+		s.upstreamError(w, failed)
+	default:
+		s.writeError(w, http.StatusInternalServerError, failed)
+	}
+}
+
+func (s *Server) upstreamError(w http.ResponseWriter, failed *pipeline.Error) {
+	if failed.Upstream == nil {
+		s.writeError(w, http.StatusBadGateway, failed)
 		return
 	}
 
-	s.writeError(w, http.StatusBadGateway, err)
+	if failed.Upstream.RetryAfter != "" {
+		w.Header().Set(retryAfterHeader, failed.Upstream.RetryAfter)
+	}
+	s.writeError(w, clientStatus(failed.Upstream.Code), failed)
 }
 
 func (s *Server) streamFailure(r *http.Request, err error) {

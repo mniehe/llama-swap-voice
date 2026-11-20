@@ -1,18 +1,15 @@
 package openai
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"regexp"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/mniehe/llama-swap-voice/internal/upstream"
+	"github.com/mniehe/llama-swap-voice/internal/pipeline"
 )
 
 const (
@@ -22,53 +19,21 @@ const (
 
 var routePrefixes = []string{"/v1", ""}
 
-var errBusy = errors.New("too many concurrent requests, retry shortly")
-
-type Config struct {
-	TTSModel         string
-	ASRModel         string
-	Voices           map[string]string
-	DefaultVoice     string
-	Lang             string
-	RequestTimeout   time.Duration
-	MaxInputChars    int
-	MaxConcurrent    int
-	MaxConcurrentTTS int
-	TTSConcurrency   int
-	ASRPrefixRegex   string
-}
-
 type Server struct {
-	cfg            Config
-	upstream       *upstream.Client
-	prefix         *regexp.Regexp
-	voices         []string
-	slots          chan struct{}
-	ttsSlots       chan struct{}
-	ttsGate        *ttsGate
+	pipeline       *pipeline.Pipeline
+	catalogue      pipeline.Catalogue
 	log            *slog.Logger
 	shuttingDown   atomic.Bool
-	admission      admission
 	controlTimeout time.Duration
 }
 
-func New(cfg *Config, client *upstream.Client, log *slog.Logger) (*Server, error) {
-	prefix, err := compilePrefix(cfg.ASRPrefixRegex)
-	if err != nil {
-		return nil, err
-	}
-
+func New(p *pipeline.Pipeline, log *slog.Logger) *Server {
 	return &Server{
-		cfg:            *cfg,
-		upstream:       client,
-		prefix:         prefix,
-		voices:         voiceNames(cfg.Voices),
-		slots:          make(chan struct{}, cfg.MaxConcurrent),
-		ttsSlots:       make(chan struct{}, cfg.MaxConcurrentTTS),
-		ttsGate:        newTTSGate(cfg.TTSConcurrency),
+		pipeline:       p,
+		catalogue:      p.Catalogue(),
 		log:            log,
 		controlTimeout: controlRequestTimeout,
-	}, nil
+	}
 }
 
 type route struct {
@@ -84,8 +49,8 @@ func (s *Server) routes() []route {
 		{http.MethodGet, "/internal/readiness", s.handleReadiness},
 	}
 	api := []route{
-		{http.MethodPost, "/audio/speech", s.limited(s.ttsSlots, s.handleSpeech)},
-		{http.MethodPost, "/audio/transcriptions", s.limited(s.slots, s.handleTranscription)},
+		{http.MethodPost, "/audio/speech", s.limited(pipeline.WorkSpeak, s.handleSpeech)},
+		{http.MethodPost, "/audio/transcriptions", s.limited(pipeline.WorkTranscribe, s.handleTranscription)},
 		{http.MethodGet, "/models", s.handleModels},
 		{http.MethodGet, "/audio/voices", s.handleVoices},
 	}
@@ -159,21 +124,17 @@ func (s *Server) bounded(next http.Handler) http.Handler {
 
 // The request context ends at deadline, so writes get responseWriteSlack
 // longer: otherwise the 504 a timeout produces never reaches the client.
-func (s *Server) limited(slots chan struct{}, next http.HandlerFunc) http.HandlerFunc {
+func (s *Server) limited(work pipeline.Work, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		deadline := time.Now().Add(s.cfg.RequestTimeout)
+		deadline := s.pipeline.RequestDeadline(time.Now())
 		s.setDeadlines(w, deadline, deadline.Add(responseWriteSlack))
 
-		select {
-		case slots <- struct{}{}:
-		default:
-			s.reject(w, errBusy)
+		ctx, release, err := s.pipeline.Admit(r.Context(), work, deadline)
+		if err != nil {
+			s.failure(w, r, err)
 			return
 		}
-		defer func() { <-slots }()
-
-		ctx, cancel := context.WithDeadline(r.Context(), deadline)
-		defer cancel()
+		defer release()
 
 		next(w, r.WithContext(ctx))
 	}
@@ -192,24 +153,6 @@ func (s *Server) setDeadlines(w http.ResponseWriter, read, write time.Time) {
 	if err != nil {
 		s.log.Warn("could not set connection deadlines", slog.Any("error", err))
 	}
-}
-
-func compilePrefix(pattern string) (*regexp.Regexp, error) {
-	if pattern == "" {
-		return nil, nil
-	}
-
-	return regexp.Compile(pattern)
-}
-
-func voiceNames(voices map[string]string) []string {
-	names := make([]string, 0, len(voices))
-	for name := range voices {
-		names = append(names, name)
-	}
-	slices.Sort(names)
-
-	return names
 }
 
 func elapsedMillis(start, end time.Time) int64 {

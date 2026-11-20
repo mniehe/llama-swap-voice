@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -17,6 +18,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mniehe/llama-swap-voice/internal/pipeline"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
@@ -37,6 +39,17 @@ const (
 	fakeFormMemory  = 1 << 20
 	harnessTimeout  = 10 * time.Second
 	harnessMaxChars = 100
+	normalSpeed     = 1.0
+	transcodedName  = "audio.wav"
+)
+
+// Config, errBusy and errShuttingDown keep the names these tests used when
+// the HTTP package owned them; the busy text is pinned here as public text.
+type Config = pipeline.Config
+
+var (
+	errBusy         = errors.New("too many concurrent requests, retry shortly")
+	errShuttingDown = pipeline.ErrShuttingDown
 )
 
 type upstreamCall struct {
@@ -157,6 +170,8 @@ func (f *fakeUpstream) callCount() int {
 type harness struct {
 	t        *testing.T
 	upstream *fakeUpstream
+	client   *upstream.Client
+	pipeline *pipeline.Pipeline
 	service  *Server
 	server   *httptest.Server
 	cfg      Config
@@ -193,16 +208,26 @@ func newBackendHarness(t *testing.T, backend upstream.Backend, respond http.Hand
 		apply(&h.cfg)
 	}
 
-	client, err := upstream.New(h.upstream.server.URL, ttsModel, asrModel, &http.Client{}, upstream.WithBackend(backend))
+	var err error
+	h.client, err = upstream.New(h.upstream.server.URL, ttsModel, asrModel, &http.Client{}, upstream.WithBackend(backend))
 	require.NoError(t, err)
 
-	h.service, err = New(&h.cfg, client, discardLogger())
-	require.NoError(t, err)
-
-	h.server = httptest.NewServer(h.service.Handler())
-	t.Cleanup(h.server.Close)
+	h.serve(discardLogger())
 
 	return h
+}
+
+// serve builds the pipeline and the service on log and starts serving them.
+func (h *harness) serve(log *slog.Logger) {
+	h.t.Helper()
+
+	var err error
+	h.pipeline, err = pipeline.New(&h.cfg, h.client, log)
+	require.NoError(h.t, err)
+
+	h.service = New(h.pipeline, log)
+	h.server = httptest.NewServer(h.service.Handler())
+	h.t.Cleanup(h.server.Close)
 }
 
 func discardLogger() *slog.Logger {

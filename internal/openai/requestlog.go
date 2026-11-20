@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/mniehe/llama-swap-voice/internal/pipeline"
 )
 
 const requestIDHeader = "X-Request-Id"
@@ -36,7 +38,8 @@ func (s *Server) logged(next http.Handler) http.Handler {
 		tracked := &trackingWriter{ResponseWriter: w, start: time.Now(), status: http.StatusOK}
 		defer s.logRequest(r, rec, tracked)
 
-		next.ServeHTTP(tracked, r.WithContext(context.WithValue(r.Context(), recordKey{}, rec)))
+		ctx := pipeline.WithRequestID(context.WithValue(r.Context(), recordKey{}, rec), rec.id)
+		next.ServeHTTP(tracked, r.WithContext(ctx))
 	})
 }
 

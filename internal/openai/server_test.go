@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -27,6 +28,9 @@ const (
 	deadlineSlack     = 700 * time.Millisecond
 	stalledBodyLength = "100\r\n\r\n"
 	transcriptionPath = "/v1/audio/transcriptions"
+
+	goroutineDumpBytes = 64 << 10
+	ttsGateWait        = "pipeline.(*ttsGate).acquire("
 )
 
 func readUntilClosed(t *testing.T, conn net.Conn) (string, time.Duration) {
@@ -112,6 +116,30 @@ func requireBusy(t *testing.T, resp *http.Response) {
 	assert.True(t, resp.Close, "want Connection: close on a rejected request")
 }
 
+// gateWaiters counts goroutines parked in the pipeline's TTS queue. The queue
+// is private to the pipeline, so a goroutine dump is the only view an HTTP
+// test has of it.
+func gateWaiters() int {
+	dump := make([]byte, goroutineDumpBytes)
+	for {
+		n := runtime.Stack(dump, true)
+		if n < len(dump) {
+			dump = dump[:n]
+			break
+		}
+		dump = make([]byte, 2*len(dump))
+	}
+
+	waiters := 0
+	for stack := range strings.SplitSeq(string(dump), "\n\n") {
+		if strings.Contains(stack, "[select") && strings.Contains(stack, ttsGateWait) {
+			waiters++
+		}
+	}
+
+	return waiters
+}
+
 // waitInGate fails with the reply of a speech request that ended instead of
 // reaching its place in the gate.
 func waitInGate(t *testing.T, placed func() bool, reply <-chan speechResult) {
@@ -156,7 +184,8 @@ func TestServer_Limited_QueuedSpeechLeavesTranscriptionSlots(t *testing.T) {
 	releaseAll := sync.OnceFunc(func() { close(release) })
 	t.Cleanup(releaseAll)
 
-	gate := h.service.ttsGate
+	alreadyWaiting := gateWaiters()
+	queued := func() int { return gateWaiters() - alreadyWaiting }
 	inputs := make([]string, speechSlots)
 	replies := make([]chan speechResult, speechSlots)
 	for i := range speechSlots {
@@ -164,7 +193,7 @@ func TestServer_Limited_QueuedSpeechLeavesTranscriptionSlots(t *testing.T) {
 		replies[i] = make(chan speechResult, 1)
 		wg.Go(func() { replies[i] <- sendSpeech(t, h, inputs[i], "wav") })
 
-		placed := func() bool { return gate.queued() == i }
+		placed := func() bool { return queued() == i }
 		if i == 0 {
 			placed = func() bool { return len(h.upstream.callsTo(ttsRoute)) == 1 }
 		}
@@ -178,7 +207,7 @@ func TestServer_Limited_QueuedSpeechLeavesTranscriptionSlots(t *testing.T) {
 
 	ninth := h.speech(speechPath, map[string]any{"input": "sentence 8", "response_format": "wav"})
 	requireBusy(t, ninth)
-	assert.Equal(t, speechSlots-1, gate.queued(), "the rejected speech request joined the gate")
+	assert.Equal(t, speechSlots-1, queued(), "the rejected speech request joined the gate")
 	assert.Len(t, h.upstream.callsTo(ttsRoute), 1, "the rejected speech request reached the upstream")
 
 	releaseAll()
@@ -188,7 +217,10 @@ func TestServer_Limited_QueuedSpeechLeavesTranscriptionSlots(t *testing.T) {
 		assert.Equal(t, http.StatusOK, got.status, "%s: %s", inputs[i], got.body)
 	}
 	assert.Equal(t, inputs, inputsOf(h.upstream.callsTo(ttsRoute)))
-	assert.Equal(t, 1, gate.available(), "a finished speech request kept its TTS slot")
+
+	after := sendSpeech(t, h, "after", "wav")
+	require.NoError(t, after.err)
+	assert.Equal(t, http.StatusOK, after.status, "a finished speech request kept its TTS slot: %s", after.body)
 }
 
 // transcriptionStatus runs off the test goroutine, so it reports failures
@@ -344,7 +376,7 @@ func TestServer_Bounded_StalledHealthBodyEndsAtDeadline(t *testing.T) {
 func TestServer_Drain_RejectsLaterRequests(t *testing.T) {
 	h := newHarness(t, serveWAV(t))
 
-	require.NoError(t, h.service.Drain(t.Context()), "nothing in flight, so the drain is immediate")
+	require.NoError(t, h.pipeline.Drain(t.Context()), "nothing in flight, so the drain is immediate")
 
 	resp := h.get("/health")
 	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
@@ -369,10 +401,10 @@ func TestServer_Drain_WaitsForRunningHandler(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), shortDeadline)
 	defer cancel()
-	require.ErrorIs(t, h.service.Drain(ctx), context.DeadlineExceeded)
+	require.ErrorIs(t, h.pipeline.Drain(ctx), context.DeadlineExceeded)
 
 	close(release)
-	require.NoError(t, h.service.Drain(t.Context()))
+	require.NoError(t, h.pipeline.Drain(t.Context()))
 	assert.Equal(t, http.StatusOK, <-finished)
 }
 
@@ -431,12 +463,6 @@ func TestServer_Handler_WrongMethodIsJSON405(t *testing.T) {
 		assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"), "%s %s", tt.method, tt.path)
 		assert.Contains(t, errorMessage(t, resp), tt.method, "%s %s", tt.method, tt.path)
 	}
-}
-
-func TestNew_InvalidPrefixRegex_ReturnsError(t *testing.T) {
-	_, err := New(&Config{ASRPrefixRegex: "(", MaxConcurrent: 1}, nil, discardLogger())
-
-	require.Error(t, err)
 }
 
 func TestElapsedMillis_ZeroEnd_IsNegative(t *testing.T) {

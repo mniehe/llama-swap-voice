@@ -16,6 +16,7 @@ import (
 	"github.com/mniehe/llama-swap-voice/internal/config"
 	"github.com/mniehe/llama-swap-voice/internal/observability"
 	"github.com/mniehe/llama-swap-voice/internal/openai"
+	"github.com/mniehe/llama-swap-voice/internal/pipeline"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 	"github.com/mniehe/llama-swap-voice/internal/voices"
 )
@@ -73,10 +74,11 @@ func run(cfg *ServiceConfig, logger *slog.Logger) error {
 
 	serverLogger := logger.With(slog.String(observability.ComponentLabel, "server"))
 	serverCfg := cfg.serverConfig(voiceFiles)
-	service, err := openai.New(&serverCfg, client, serverLogger)
+	pipe, err := pipeline.New(&serverCfg, client, serverLogger)
 	if err != nil {
 		return err
 	}
+	service := &services{api: openai.New(pipe, serverLogger), pipeline: pipe}
 
 	logger.Info("server starting",
 		slog.String("name", serviceName),
@@ -90,13 +92,20 @@ func run(cfg *ServiceConfig, logger *slog.Logger) error {
 	return serve(ctx, cfg, service, logger)
 }
 
-func serve(ctx context.Context, cfg *ServiceConfig, service *openai.Server, logger *slog.Logger) error {
+// services pairs the HTTP entrypoint with the pipeline whose admission the
+// shutdown drains.
+type services struct {
+	api      *openai.Server
+	pipeline *pipeline.Pipeline
+}
+
+func serve(ctx context.Context, cfg *ServiceConfig, service *services, logger *slog.Logger) error {
 	ongoingCtx, stopOngoing := context.WithCancel(context.Background())
 	defer stopOngoing()
 
 	httpServer := &http.Server{
 		Addr:              net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
-		Handler:           service.Handler(),
+		Handler:           service.api.Handler(),
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
 		BaseContext: func(net.Listener) context.Context {
@@ -116,7 +125,7 @@ func serve(ctx context.Context, cfg *ServiceConfig, service *openai.Server, logg
 	}
 
 	logger.Info("received shutdown signal, shutting down")
-	service.SetShuttingDown()
+	service.api.SetShuttingDown()
 	time.Sleep(cfg.ShutdownTiming.Grace)
 
 	return shutdown(httpServer, service, stopOngoing, &cfg.ShutdownTiming, logger)
@@ -137,7 +146,7 @@ func listen(httpServer *http.Server) error {
 // their handlers to return.
 func shutdown(
 	httpServer *http.Server,
-	service *openai.Server,
+	service *services,
 	cancelRequests context.CancelFunc,
 	timing *ShutdownTimingConfig,
 	logger *slog.Logger,
@@ -159,7 +168,7 @@ func shutdown(
 		logger.Warn("closing connections", slog.Any("error", err))
 	}
 
-	return awaitHandlers(service, timing.Hard)
+	return awaitHandlers(service.pipeline, timing.Hard)
 }
 
 func drain(httpServer *http.Server, total time.Duration) error {
@@ -169,11 +178,11 @@ func drain(httpServer *http.Server, total time.Duration) error {
 	return httpServer.Shutdown(ctx)
 }
 
-func awaitHandlers(service *openai.Server, hard time.Duration) error {
+func awaitHandlers(pipe *pipeline.Pipeline, hard time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), hard)
 	defer cancel()
 
-	if err := service.Drain(ctx); err != nil {
+	if err := pipe.Drain(ctx); err != nil {
 		return fmt.Errorf("requests still running %s after cancellation: %w", hard, err)
 	}
 

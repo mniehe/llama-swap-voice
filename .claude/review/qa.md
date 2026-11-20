@@ -12,10 +12,13 @@ frames.
 
 - testify `require` and/or `assert` in every test file; test names read
   `TestUnit_Condition_Result` (`TestTTSGate_Abandon_HandedSlotPassesOn`).
-- Server tests drive the real handlers through `newHarness` and
+- HTTP tests drive the real handlers through `newHarness` and
   `newBackendHarness` in `internal/openai/harness_test.go`, against
   `fakeUpstream`; assert what upstream received with `lastCall`, `callsTo`
   and `callCount`, and the client's error text with `errorMessage`.
+  Pipeline tests build a `Pipeline` with `newPipeline` in
+  `internal/pipeline/fake_test.go` and assert the error's kind and message
+  with `requireKind`.
   `speech_encoding_test.go` swaps the package variable `newEncoder` to
   force encoder failures.
 - Oracles: `requireTool` in `internal/audio/oracle_test.go` and the helper

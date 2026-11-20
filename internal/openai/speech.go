@@ -1,19 +1,15 @@
 package openai
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
-	"unicode/utf8"
 
 	"github.com/mniehe/llama-swap-voice/internal/audio"
-	"github.com/mniehe/llama-swap-voice/internal/upstream"
+	"github.com/mniehe/llama-swap-voice/internal/pipeline"
 )
 
 const (
@@ -23,27 +19,22 @@ const (
 	contentTypePCM = "audio/pcm"
 
 	defaultSpeechFormat = "mp3"
-	normalSpeed         = 1.0
 	maxSpeechBodyBytes  = 1 << 20
-	pcmSampleBytes      = 2
 )
-
-var errNoAudio = errors.New("upstream sent no audio")
 
 // newEncoder is a variable so tests can substitute an encoder that fails.
 var newEncoder = audio.NewEncoder
 
 type outputFormat struct {
 	contentType string
-	upstream    upstream.Format
 	codec       audio.Format
 }
 
 var outputFormats = map[string]outputFormat{
-	"wav":  {contentType: contentTypeWAV, upstream: upstream.WAV, codec: audio.WAV},
-	"pcm":  {contentType: contentTypePCM, upstream: upstream.WAV, codec: audio.PCM},
-	"mp3":  {contentType: contentTypeMP3, upstream: upstream.WAV, codec: audio.MP3},
-	"opus": {contentType: contentTypeOgg, upstream: upstream.WAV, codec: audio.Opus},
+	"wav":  {contentType: contentTypeWAV, codec: audio.WAV},
+	"pcm":  {contentType: contentTypePCM, codec: audio.PCM},
+	"mp3":  {contentType: contentTypeMP3, codec: audio.MP3},
+	"opus": {contentType: contentTypeOgg, codec: audio.Opus},
 }
 
 type speechRequest struct {
@@ -56,12 +47,10 @@ type speechRequest struct {
 }
 
 type speechJob struct {
-	voice     string
-	voicePath string
-	input     string
-	format    string
-	output    outputFormat
-	speed     float64
+	job    pipeline.SpeechJob
+	format string
+	output outputFormat
+	speed  float64
 }
 
 func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
@@ -72,44 +61,34 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rec := record(r)
-	rec.voice = job.voice
+	rec.voice = job.job.Voice
 	rec.format = job.format
 
-	reply, err := s.synthesize(r.Context(), &upstream.Speech{
-		Voice:      job.voice,
-		Input:      job.input,
-		Lang:       s.cfg.Lang,
-		SpeakerRef: job.voicePath,
-		Format:     job.output.upstream,
-	})
+	speech, err := s.pipeline.Speak(r.Context(), job.job, job.speed)
 	if err != nil {
-		s.upstreamFailure(w, r, err)
+		var failed *pipeline.Error
+		if errors.As(err, &failed) {
+			s.logRetry(rec, failed.Retried)
+		}
+		s.failure(w, r, err)
 		return
 	}
-	rec.upstreamStatus = reply.Status
+	defer s.closeSpeech(speech)
 
-	if reply.Retried {
+	rec.upstreamStatus = speech.UpstreamStatus
+	s.logRetry(rec, speech.Retried)
+
+	s.encoded(w, r, speech, &job)
+}
+
+func (s *Server) logRetry(rec *requestRecord, retried bool) {
+	if retried {
 		s.log.Info("upstream speech retried", slog.String("request_id", rec.id))
 	}
-
-	s.encoded(w, r, reply, &job)
 }
 
-func (s *Server) synthesize(ctx context.Context, speech *upstream.Speech) (*upstream.Audio, error) {
-	if err := s.ttsGate.acquire(ctx); err != nil {
-		return nil, fmt.Errorf("waiting for a free TTS slot: %w", err)
-	}
-
-	reply, err := s.upstream.Synthesize(ctx, speech)
-	if err != nil {
-		s.ttsGate.release()
-		return nil, err
-	}
-
-	reply.Body = &gatedBody{ReadCloser: reply.Body, release: s.ttsGate.release}
-	return reply, nil
-}
-
+// Validation runs in a fixed order, input and voice before format and speed,
+// so the same bad request always gets the same message.
 func (s *Server) parseSpeech(w http.ResponseWriter, r *http.Request) (speechJob, error) {
 	var req speechRequest
 	body := http.MaxBytesReader(w, r.Body, maxSpeechBodyBytes)
@@ -117,16 +96,7 @@ func (s *Server) parseSpeech(w http.ResponseWriter, r *http.Request) (speechJob,
 		return speechJob{}, fmt.Errorf("invalid JSON body: %w", err)
 	}
 
-	input := strings.TrimSpace(req.Input)
-	if input == "" {
-		return speechJob{}, errors.New("input is required")
-	}
-
-	if utf8.RuneCountInString(input) > s.cfg.MaxInputChars {
-		return speechJob{}, fmt.Errorf("input exceeds %d characters", s.cfg.MaxInputChars)
-	}
-
-	voice, path, err := s.resolveVoice(req.Voice)
+	job, err := s.pipeline.PrepareSpeech(req.Voice, req.Input)
 	if err != nil {
 		return speechJob{}, err
 	}
@@ -136,25 +106,12 @@ func (s *Server) parseSpeech(w http.ResponseWriter, r *http.Request) (speechJob,
 		return speechJob{}, err
 	}
 
-	speed, err := resolveSpeed(req.Speed)
+	speed, err := pipeline.ResolveSpeed(req.Speed)
 	if err != nil {
 		return speechJob{}, err
 	}
 
-	return speechJob{voice: voice, voicePath: path, input: input, format: format, output: output, speed: speed}, nil
-}
-
-func (s *Server) resolveVoice(name string) (voice, path string, err error) {
-	if name == "" {
-		name = s.cfg.DefaultVoice
-	}
-
-	path, ok := s.cfg.Voices[name]
-	if !ok {
-		return "", "", fmt.Errorf("unknown voice %q; available voices: %s", name, strings.Join(s.voices, ", "))
-	}
-
-	return name, path, nil
+	return speechJob{job: job, format: format, output: output, speed: speed}, nil
 }
 
 func resolveFormat(name string) (string, outputFormat, error) {
@@ -170,36 +127,10 @@ func resolveFormat(name string) (string, outputFormat, error) {
 	return name, output, nil
 }
 
-func resolveSpeed(requested *float64) (float64, error) {
-	if requested == nil {
-		return normalSpeed, nil
-	}
-
-	speed := *requested
-	if speed < audio.MinSpeed || speed > audio.MaxSpeed {
-		return 0, fmt.Errorf("speed must be between %g and %g", audio.MinSpeed, audio.MaxSpeed)
-	}
-
-	return speed, nil
-}
-
-// encoded holds the 200 back until the first samples arrive and the encoder
-// exists, so a failure before any audio is still a JSON error.
-func (s *Server) encoded(w http.ResponseWriter, r *http.Request, reply *upstream.Audio, job *speechJob) {
-	defer s.closeUpstream(reply)
-
-	pcm, status, err := speechPCM(reply.Body, job.speed)
-	if err != nil {
-		s.writeError(w, unlessRequestEnded(r, status), err)
-		return
-	}
-
-	first, err := readFirstChunk(pcm)
-	if err != nil {
-		s.writeError(w, unlessRequestEnded(r, http.StatusBadGateway), err)
-		return
-	}
-
+// The pipeline holds the 200 back until the first samples arrive; encoded
+// holds it until the encoder exists too, so a failure before any audio is
+// still a JSON error.
+func (s *Server) encoded(w http.ResponseWriter, r *http.Request, speech *pipeline.Speech, job *speechJob) {
 	w.Header().Set("Content-Type", job.output.contentType)
 	encoder, err := newEncoder(job.output.codec, &flushWriter{w: w, rc: http.NewResponseController(w)})
 	if err != nil {
@@ -207,7 +138,7 @@ func (s *Server) encoded(w http.ResponseWriter, r *http.Request, reply *upstream
 		return
 	}
 
-	if err := streamEncoded(encoder, io.MultiReader(bytes.NewReader(first), pcm)); err != nil {
+	if err := streamEncoded(encoder, speech.PCM); err != nil {
 		s.streamFailure(r, err)
 	}
 }
@@ -222,23 +153,6 @@ func (s *Server) encoderFailure(w http.ResponseWriter, r *http.Request, err erro
 	s.writeError(w, unlessRequestEnded(r, http.StatusInternalServerError), err)
 }
 
-// speechPCM strips the upstream WAV header and, when the request changes the
-// speed, time-stretches the samples as they arrive. On failure it also
-// returns the status to answer with.
-func speechPCM(body io.Reader, speed float64) (io.Reader, int, error) {
-	pcm, err := audio.NewWAVReader(body)
-	if err != nil {
-		return nil, http.StatusBadGateway, fmt.Errorf("upstream audio: %w", err)
-	}
-
-	stretched, err := audio.NewStretcher(pcm, speed)
-	if err != nil {
-		return nil, http.StatusInternalServerError, err
-	}
-
-	return stretched, http.StatusOK, nil
-}
-
 // The encoder is closed on every path, a failed write included, because an
 // Opus encoder holds memory outside the Go heap until then. The first write
 // commits the 200.
@@ -251,24 +165,8 @@ func streamEncoded(encoder io.WriteCloser, pcm io.Reader) (err error) {
 
 // The response is already decided by the time the upstream body is closed,
 // so a close error only matters for diagnosis.
-func (s *Server) closeUpstream(reply *upstream.Audio) {
-	if err := reply.Body.Close(); err != nil {
+func (s *Server) closeSpeech(speech *pipeline.Speech) {
+	if err := speech.PCM.Close(); err != nil {
 		s.log.Debug("closing upstream audio", slog.Any("error", err))
 	}
-}
-
-// readFirstChunk waits for at least one whole sample, so the 200 is never
-// committed for a reply that cannot hold any audio.
-func readFirstChunk(r io.Reader) ([]byte, error) {
-	chunk := make([]byte, copyBufferBytes)
-	n, err := io.ReadAtLeast(r, chunk, pcmSampleBytes)
-	if err == nil {
-		return chunk[:n], nil
-	}
-
-	if errors.Is(err, io.EOF) {
-		return nil, errNoAudio
-	}
-
-	return nil, err
 }
