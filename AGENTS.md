@@ -75,7 +75,7 @@ the list above needs confirmation even when it is only a file edit.
     /testdata     # Reference clips and the commands that produced them
   /config         # Generic koanf loading from LLAMA_SWAP_VOICE_* environment variables
   /observability  # slog logger construction (json or console)
-  /server         # HTTP handlers, admission pools, the TTS queue, panic recovery, request log, JSON errors
+  /openai         # HTTP handlers, admission pools, the TTS queue, panic recovery, request log, JSON errors
   /upstream       # llama-swap client: TTS backends (llamacpp, qwentts), transcription, one retry, no redirects
   /voices         # Finds and checks voice clips at startup; the llamacpp backend reopens the clip on each request
 /nix                    # packages.nix (the build), checks.nix (what nix flake check runs), devshells.nix (nix develop), module.nix (nixosModules.default), llama-swap.nix (the module's llama-swap entries and unit changes), models.nix (pinned GGUFs), qwen-tts-config.nix (the TTS server's generated config)
@@ -107,7 +107,7 @@ them present, or a broken encoder passes.
 The Go tests and the GPU-free Python suite need no GPU, model or running
 llama-swap; the Python tokenizer test, which needs torch, is the one exception.
 Server tests drive the real handlers against the fake upstream in
-`internal/server/harness_test.go`.
+`internal/openai/harness_test.go`.
 
 The Python server under `python/` is built and tested through the flake, on
 x86_64 Linux only. Its tests run without torch against a fake engine; the
@@ -138,7 +138,7 @@ A suppression names the linter and states why.
 
 - Return errors wrapped with `%w`. `os.Exit` belongs to `main` alone, and the
   only panics outside tests are the `http.ErrAbortHandler` re-panics in
-  `internal/server`, which abort a response that has already started.
+  `internal/openai`, which abort a response that has already started.
 - Everything a client or the upstream sends is read through a bound: body
   size, decoded duration, transcript size, input characters. A new input
   gets a named limit and a test at the limit.
@@ -149,7 +149,7 @@ A suppression names the linter and states why.
 - Replies stream. Encode and write as audio arrives; do not buffer a whole
   reply to simplify a code path.
 - Error responses are JSON `{"error":{"message":"…"}}`, written with
-  `writeError` in `internal/server/respond.go`. Two exceptions: the readiness
+  `writeError` in `internal/openai/respond.go`. Two exceptions: the readiness
   probe answers a plain-text 503 while shutting down, and a failure after the
   response is committed aborts the transfer, because JSON appended to audio
   corrupts it. Writing the Opus headers commits the response before the
@@ -182,7 +182,7 @@ hosted CI and no push hook: run `nix flake check` yourself before every push.
 ```bash
 gofmt -l . && go vet ./... && golangci-lint run ./...   # gofmt -l must print nothing
 go test ./...
-go test -race ./...                  # when the change touches goroutines, channels, locks or internal/server
+go test -race ./...                  # when the change touches goroutines, channels, locks or internal/openai
 go test -run '^$' -fuzz '^FuzzNormaliseUpload$' -fuzztime 30s ./internal/audio   # when the change touches a Go parser or the time-stretch
 nix flake check                      # before a push: race tests, lint, gofmt, alejandra, Opus conformance, package version, gomod2nix sync, NixOS module eval, VM tests (with and without llama-swap), TTS server config and GGUF pins, duration corpus, the Python server's tests and weights pin
 nix build -L .#checks.x86_64-linux.qwen-tts-server-tests   # when the change touches python/ or nix/qwen-tts-server/
@@ -234,7 +234,7 @@ hole, or silently corrupts audio:
 - `internal/audio/**`: parses untrusted uploads and calls libopus through cgo
 - `internal/voices/**`: reads operator files and follows symlinks
 - `internal/upstream/**`: retry, redirect refusal and response bounds
-- `internal/server/**`: request bounds, the admission pools, the TTS queue, response commitment, panic recovery
+- `internal/openai/**`: request bounds, the admission pools, the TTS queue, response commitment, panic recovery
 - `cmd/llama-swap-voice/**`: limit validation, connection deadlines, the three-step shutdown
 - `go.mod`, `go.sum`, `.golangci.yaml` and `.claude/review/review.yaml`, which holds shell commands that review prep runs
 - `flake.nix`, `flake.lock`, `gomod2nix.toml` and `nix/**`: the toolchain, the build and the checks that gate a push

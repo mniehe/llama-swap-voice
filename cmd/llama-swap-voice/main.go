@@ -15,7 +15,7 @@ import (
 
 	"github.com/mniehe/llama-swap-voice/internal/config"
 	"github.com/mniehe/llama-swap-voice/internal/observability"
-	"github.com/mniehe/llama-swap-voice/internal/server"
+	"github.com/mniehe/llama-swap-voice/internal/openai"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 	"github.com/mniehe/llama-swap-voice/internal/voices"
 )
@@ -73,7 +73,7 @@ func run(cfg *ServiceConfig, logger *slog.Logger) error {
 
 	serverLogger := logger.With(slog.String(observability.ComponentLabel, "server"))
 	serverCfg := cfg.serverConfig(voiceFiles)
-	service, err := server.New(&serverCfg, client, serverLogger)
+	service, err := openai.New(&serverCfg, client, serverLogger)
 	if err != nil {
 		return err
 	}
@@ -90,7 +90,7 @@ func run(cfg *ServiceConfig, logger *slog.Logger) error {
 	return serve(ctx, cfg, service, logger)
 }
 
-func serve(ctx context.Context, cfg *ServiceConfig, service *server.Server, logger *slog.Logger) error {
+func serve(ctx context.Context, cfg *ServiceConfig, service *openai.Server, logger *slog.Logger) error {
 	ongoingCtx, stopOngoing := context.WithCancel(context.Background())
 	defer stopOngoing()
 
@@ -137,7 +137,7 @@ func listen(httpServer *http.Server) error {
 // their handlers to return.
 func shutdown(
 	httpServer *http.Server,
-	service *server.Server,
+	service *openai.Server,
 	cancelRequests context.CancelFunc,
 	timing *ShutdownTimingConfig,
 	logger *slog.Logger,
@@ -169,7 +169,7 @@ func drain(httpServer *http.Server, total time.Duration) error {
 	return httpServer.Shutdown(ctx)
 }
 
-func awaitHandlers(service *server.Server, hard time.Duration) error {
+func awaitHandlers(service *openai.Server, hard time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), hard)
 	defer cancel()
 

@@ -17,7 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/mniehe/llama-swap-voice/internal/server"
+	"github.com/mniehe/llama-swap-voice/internal/openai"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
 
@@ -50,14 +50,14 @@ func freePort(t *testing.T) int {
 	return addr.Port
 }
 
-func newService(t *testing.T, respond http.HandlerFunc) *server.Server {
+func newService(t *testing.T, respond http.HandlerFunc) *openai.Server {
 	t.Helper()
 
 	cfg := validConfig(t)
 	return serviceFor(t, &cfg, respond, &http.Client{})
 }
 
-func serviceFor(t *testing.T, cfg *ServiceConfig, respond http.HandlerFunc, httpClient *http.Client) *server.Server {
+func serviceFor(t *testing.T, cfg *ServiceConfig, respond http.HandlerFunc, httpClient *http.Client) *openai.Server {
 	t.Helper()
 
 	fake := httptest.NewServer(respond)
@@ -67,7 +67,7 @@ func serviceFor(t *testing.T, cfg *ServiceConfig, respond http.HandlerFunc, http
 	require.NoError(t, err)
 
 	serverCfg := cfg.serverConfig(map[string]string{"alice": filepath.Join(cfg.Voices.Dir, "alice.mp3")})
-	service, err := server.New(&serverCfg, client, slog.New(slog.DiscardHandler))
+	service, err := openai.New(&serverCfg, client, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
 	return service
@@ -96,7 +96,7 @@ func waitReady(t *testing.T, base string) {
 	}, probeTimeout, probeEvery)
 }
 
-func startServe(t *testing.T, cfg *ServiceConfig, service *server.Server) (cancel context.CancelFunc, done <-chan error) {
+func startServe(t *testing.T, cfg *ServiceConfig, service *openai.Server) (cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -166,7 +166,7 @@ func TestServe_Signal_DrainsInFlightRequest(t *testing.T) {
 
 // stuckSpeech starts a speech request through service and returns once the
 // upstream reply has paused mid-body.
-func stuckSpeech(t *testing.T, cfg *ServiceConfig, service *server.Server, paused <-chan struct{}) (cancel context.CancelFunc, done <-chan error) {
+func stuckSpeech(t *testing.T, cfg *ServiceConfig, service *openai.Server, paused <-chan struct{}) (cancel context.CancelFunc, done <-chan error) {
 	t.Helper()
 
 	base := "http://" + net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))

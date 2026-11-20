@@ -8,7 +8,7 @@ a bug it prevents or a test it enables.
 ## Shape of the service
 
 - Imports run one way: `cmd/llama-swap-voice` wires everything;
-  `internal/server` imports `internal/audio` and `internal/upstream`;
+  `internal/openai` imports `internal/audio` and `internal/upstream`;
   `audio`, `upstream` and `voices` import no other internal package.
   A reverse or sideways import is a finding.
 - `internal/config` is generic koanf loading (`LoadConfig[T]`); the
@@ -18,7 +18,7 @@ a bug it prevents or a test it enables.
 - `internal/audio` exports a small surface: `NormaliseUpload`, `Limits`,
   `NewEncoder`, `Format`, `NewWAVReader`, `NewStretcher`, `MinSpeed`,
   `MaxSpeed` and three sentinel errors. `decoderPanic` stays unexported
-  and reaches `internal/server` through a `Stack()` interface check; that
+  and reaches `internal/openai` through a `Stack()` interface check; that
   is the pattern for extra detail across the boundary.
 - cgo is confined to `internal/audio/libopus.go`. Another file importing
   "C", or a C type escaping the `libopus` struct, is a finding.

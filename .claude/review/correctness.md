@@ -10,7 +10,7 @@ streams, so trace across files rather than reading hunks alone.
 - `cmd/llama-swap-voice/main.go` wires `voices.Discover`, `upstream.New` and
   `server.New`, then runs `serve` and `shutdown`; `config.go` holds
   `ServiceConfig`, `Validate` and `serverConfig`.
-- `internal/server/server.go` `Handler` composes
+- `internal/openai/server.go` `Handler` composes
   `logged(recovered(bounded(admitted(mux))))`. `limited` wraps the two audio
   routes: a non-blocking slot from `ttsSlots` (speech) or `slots`
   (transcriptions), a request deadline of `RequestTimeout`, and a write
@@ -24,10 +24,10 @@ streams, so trace across files rather than reading hunks alone.
 
 ## Concurrency: open these together
 
-- `internal/server/admission.go`: `enter` calls `active.Add` under the same
+- `internal/openai/admission.go`: `enter` calls `active.Add` under the same
   lock `close` sets `closed` with, so no handler starts once `Drain` waits.
   An `Add` outside that lock races `Wait`.
-- `internal/server/ttsgate.go`: FIFO. `acquire` takes a free slot only when
+- `internal/openai/ttsgate.go`: FIFO. `acquire` takes a free slot only when
   `waiters` is empty; `release` and `abandon` call `handOver`, which closes
   the oldest waiter's channel instead of incrementing `free`. A waiter whose
   context ends after it was handed the slot is gone from `waiters` and must
@@ -35,7 +35,7 @@ streams, so trace across files rather than reading hunks alone.
   `speech.go` releases on upstream error, otherwise `gatedBody` releases
   through `once` on EOF or `Close`, and `encoded` closes the body on every
   path through `closeUpstream`.
-- `internal/server/recovery.go`: `http.ErrAbortHandler` is re-panicked; once
+- `internal/openai/recovery.go`: `http.ErrAbortHandler` is re-panicked; once
   `committed` (`trackingWriter.wroteHeader`, `requestlog.go`) a recovered
   panic becomes `ErrAbortHandler`, never a JSON body appended to audio.
 - `cmd/llama-swap-voice/main.go` shutdown, three steps: `SetShuttingDown`

@@ -20,7 +20,7 @@ termination owner.
 Go only. Intended outcomes, from the code and `docs/api.md`:
 
 - Before the response is committed (`committed`) a failure is a JSON error
-  through `writeError` (`internal/server/respond.go`); the readiness
+  through `writeError` (`internal/openai/respond.go`); the readiness
   probe's plain-text 503 while shutting down is the one exception. Opus
   construction writes headers and can commit the 200, so `encoderFailure`
   checks. After commitment `streamFailure` (`failure.go`) logs and panics

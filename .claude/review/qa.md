@@ -13,13 +13,13 @@ frames.
 - testify `require` and/or `assert` in every test file; test names read
   `TestUnit_Condition_Result` (`TestTTSGate_Abandon_HandedSlotPassesOn`).
 - Server tests drive the real handlers through `newHarness` and
-  `newBackendHarness` in `internal/server/harness_test.go`, against
+  `newBackendHarness` in `internal/openai/harness_test.go`, against
   `fakeUpstream`; assert what upstream received with `lastCall`, `callsTo`
   and `callCount`, and the client's error text with `errorMessage`.
   `speech_encoding_test.go` swaps the package variable `newEncoder` to
   force encoder failures.
 - Oracles: `requireTool` in `internal/audio/oracle_test.go` and the helper
-  in `internal/server/speech_encoding_test.go` skip when `opusinfo`,
+  in `internal/openai/speech_encoding_test.go` skip when `opusinfo`,
   `opusdec` or `ffmpeg` is missing. A new encoder assertion that only an
   oracle checks passes silently without those tools; say so in the
   Verification hint.

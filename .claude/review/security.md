@@ -5,13 +5,13 @@ Every finding states the actor or the access they need, the trust boundary
 crossed, the asset, and what they gain. The service has no authentication:
 any client that reaches the port can call every route, so the questions are
 memory safety, resource exhaustion and disclosure. AGENTS.md names
-`internal/audio`, `internal/voices`, `internal/upstream`, `internal/server`,
+`internal/audio`, `internal/voices`, `internal/upstream`, `internal/openai`,
 `cmd/llama-swap-voice` and the build files critical paths, where a small
 mistake is a memory-safety or denial-of-service hole.
 
 ## Trust boundaries
 
-- Clients, through `internal/server`: `POST /v1/audio/speech` and
+- Clients, through `internal/openai`: `POST /v1/audio/speech` and
   `/v1/audio/transcriptions`, also served without the `/v1` prefix
   (`routePrefixes`). Speech JSON is bounded by `maxSpeechBodyBytes` and
   `MaxInputChars` (runes); the voice comes from the `cfg.Voices` map, never
