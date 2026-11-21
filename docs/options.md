@@ -421,8 +421,8 @@ variables only when `WYOMING_ENABLED` is `true`.
 | `WYOMING_PORT` | none | `10300` | The Wyoming port, 1 to 65535. The host and port together must differ from `HOST` and `PORT`. |
 | `WYOMING_LANGUAGES` | none | `en` | The languages that `info` lists for the ASR model and each voice, separated by commas. |
 | `WYOMING_SPEED` | none | `1.0` | The speech speed for every Wyoming synthesis, 0.25 to 4. |
-| `WYOMING_STREAMING` | none | `sentences` | `sentences` or `whole`. The service checks it but does not use it yet: it does not offer streamed synthesis. |
-| `WYOMING_STREAMINGMAXCHARS` | none | `300` | 1 to `TTS_MAXINPUTCHARS`. The service checks it but does not use it yet. |
+| `WYOMING_STREAMING` | none | `sentences` | How the service speaks a [streamed synthesis](api.md#streamed-synthesis): `sentences` speaks each sentence as it completes and advertises streaming in `info`; `whole` speaks the whole text after `synthesize-stop` and advertises no streaming. |
+| `WYOMING_STREAMINGMAXCHARS` | none | `300` | 1 to `TTS_MAXINPUTCHARS`. In `sentences` mode, the most characters of the sentences that one `synthesize-chunk` completes to join into one request. A longer sentence is spoken whole. |
 
 Set a variable that has no option through `extraEnvironment`:
 

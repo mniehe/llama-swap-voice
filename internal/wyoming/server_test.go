@@ -61,15 +61,19 @@ func TestServe_Describe_ReturnsInfoWithDefaultVoiceFirst(t *testing.T) {
 	assert.JSONEq(t, wantInfo, string(c.readType(typeInfo).Data))
 }
 
-func TestServe_Describe_StreamingModeStillAdvertisesNoStreaming(t *testing.T) {
-	h := newHarness(t, func(s *setup) { s.config.Streaming = ModeSentences })
-	c := h.dial()
+func TestServe_Describe_AdvertisesStreamingOnlyInSentencesMode(t *testing.T) {
+	for mode, want := range map[Mode]bool{ModeSentences: true, ModeWhole: false} {
+		t.Run(string(mode), func(t *testing.T) {
+			h := newHarness(t, func(s *setup) { s.config.Streaming = mode })
+			c := h.dial()
 
-	c.send(typeDescribe, nil, nil)
+			c.send(typeDescribe, nil, nil)
 
-	tts := decodeData[info](t, c.readType(typeInfo)).TTS
-	require.Len(t, tts, 1)
-	assert.False(t, tts[0].SupportsSynthesizeStreaming)
+			tts := decodeData[info](t, c.readType(typeInfo)).TTS
+			require.Len(t, tts, 1)
+			assert.Equal(t, want, tts[0].SupportsSynthesizeStreaming)
+		})
+	}
 }
 
 func TestServe_Describe_NoLanguagesListsAnEmptyArray(t *testing.T) {
@@ -276,17 +280,21 @@ func TestReadDeadline(t *testing.T) {
 	tests := []struct {
 		name    string
 		request *request
+		stream  *stream
 		want    time.Time
 	}{
 		{name: "no request counts from the idle start", want: now.Add(idle - 10*time.Second)},
 		{name: "an earlier request deadline clamps", request: &request{deadline: now.Add(time.Second)}, want: now.Add(time.Second)},
 		{name: "a later request deadline does not", request: &request{deadline: now.Add(2 * idle)}, want: now.Add(idle)},
 		{name: "an unadmitted request", request: &request{}, want: now.Add(idle)},
+		{name: "an earlier stream deadline clamps", stream: &stream{deadline: now.Add(time.Second)}, want: now.Add(time.Second)},
+		{name: "a later stream deadline does not", stream: &stream{deadline: now.Add(2 * idle)}, want: now.Add(idle)},
+		{name: "a sentence's deadline wins over its stream's", request: &request{deadline: now.Add(2 * time.Second)}, stream: &stream{deadline: now.Add(time.Second)}, want: now.Add(2 * time.Second)},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c := &connection{server: s, request: tc.request, idleSince: now.Add(-10 * time.Second)}
+			c := &connection{server: s, request: tc.request, stream: tc.stream, idleSince: now.Add(-10 * time.Second)}
 
 			assert.Equal(t, tc.want, c.readDeadline(now))
 		})
@@ -337,16 +345,20 @@ func TestWriteDeadline(t *testing.T) {
 		name      string
 		idleSince time.Time
 		request   *request
+		stream    *stream
 		want      time.Time
 	}{
 		{name: "no request and the idle deadline comes first", idleSince: now.Add(-idle + time.Second), want: now.Add(time.Second)},
 		{name: "no request and the write timeout comes first", idleSince: now, want: now.Add(write)},
 		{name: "a request ignores the idle deadline", idleSince: now.Add(-idle), request: &request{}, want: now.Add(write)},
+		{name: "a stream ignores the idle deadline", idleSince: now.Add(-idle), stream: &stream{deadline: now.Add(idle)}, want: now.Add(write)},
+		{name: "a stream's deadline comes first", idleSince: now, stream: &stream{deadline: now.Add(time.Second)}, want: now.Add(time.Second)},
+		{name: "a sentence ignores its stream's deadline", idleSince: now, request: &request{}, stream: &stream{deadline: now.Add(time.Second)}, want: now.Add(write)},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c := &connection{server: s, request: tc.request, idleSince: tc.idleSince}
+			c := &connection{server: s, request: tc.request, stream: tc.stream, idleSince: tc.idleSince}
 
 			assert.Equal(t, tc.want, c.writeDeadline(now))
 		})

@@ -18,6 +18,11 @@ const (
 	maxConns     = 64
 	idleTimeout  = 60 * time.Second
 	writeTimeout = 10 * time.Second
+	// No event of a synthesis stream is read and no sentence starts after
+	// maxStreamDuration from synthesize-start, so a client cannot keep one
+	// open by sending chunks slowly. A sentence already running finishes
+	// within its own request timeout.
+	maxStreamDuration = 10 * time.Minute
 )
 
 // The wait before Serve accepts again after a retried accept error doubles
@@ -66,6 +71,8 @@ type Server struct {
 	transcribe   func(ctx context.Context, upload io.Reader) (string, error)
 	idleTimeout  time.Duration
 	writeTimeout time.Duration
+	// maxStreamDuration is a field so that a test can shorten it.
+	maxStreamDuration time.Duration
 
 	mu     sync.Mutex
 	closed bool
@@ -85,16 +92,17 @@ type Server struct {
 // cancelling base ends every request.
 func New(base context.Context, cfg *Config, p *pipeline.Pipeline, log *slog.Logger) *Server {
 	s := &Server{
-		base:         base,
-		cfg:          *cfg,
-		pipeline:     p,
-		log:          log,
-		transcribe:   p.Transcribe,
-		idleTimeout:  idleTimeout,
-		writeTimeout: writeTimeout,
-		stopped:      make(chan struct{}),
-		listeners:    map[net.Listener]struct{}{},
-		conns:        map[net.Conn]bool{},
+		base:              base,
+		cfg:               *cfg,
+		pipeline:          p,
+		log:               log,
+		transcribe:        p.Transcribe,
+		idleTimeout:       idleTimeout,
+		writeTimeout:      writeTimeout,
+		maxStreamDuration: maxStreamDuration,
+		stopped:           make(chan struct{}),
+		listeners:         map[net.Listener]struct{}{},
+		conns:             map[net.Conn]bool{},
 	}
 	s.drained = sync.OnceValue(s.waitGoroutines)
 
@@ -383,7 +391,11 @@ func (s *Server) info() info {
 	}
 	asr.Version = s.cfg.Version
 
-	tts := ttsProgram{artefact: s.artefact(programName, catalogue.TTSModel), Voices: voices}
+	tts := ttsProgram{
+		artefact:                    s.artefact(programName, catalogue.TTSModel),
+		Voices:                      voices,
+		SupportsSynthesizeStreaming: s.cfg.Streaming == ModeSentences,
+	}
 	tts.Version = s.cfg.Version
 
 	return info{ASR: []asrProgram{asr}, TTS: []ttsProgram{tts}}

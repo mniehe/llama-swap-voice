@@ -37,11 +37,14 @@ const (
 
 type state int
 
-// A connection in stateSynthesising reads no event until the reply ends.
+// A connection in stateSynthesising reads no event until the reply ends. One
+// in stateStreaming has a synthesis stream open and no request between its
+// sentences.
 const (
 	stateIdle state = iota
 	stateRecording
 	stateSynthesising
+	stateStreaming
 )
 
 // connection is one client's event loop. Only its own goroutine touches it.
@@ -51,6 +54,7 @@ type connection struct {
 	in        *bufio.Reader
 	state     state
 	request   *request
+	stream    *stream
 	idleSince time.Time
 }
 
@@ -75,7 +79,10 @@ func (s *Server) serveConn(conn net.Conn) {
 	defer s.recoverPanic(conn)
 
 	outcome := outcomePanic
-	defer func() { c.endRequest(outcome) }()
+	defer func() {
+		c.endRequest(outcome)
+		c.endStream(outcome)
+	}()
 
 	err := c.serve()
 	outcome = c.outcomeOf(err)
@@ -100,7 +107,7 @@ func (s *Server) recoverPanic(conn net.Conn) {
 func (c *connection) serve() error {
 	for {
 		deadline := c.readDeadline(time.Now())
-		if c.request == nil && !c.server.markIdle(c.conn) {
+		if c.request == nil && c.stream == nil && !c.server.markIdle(c.conn) {
 			if c.in.Buffered() == 0 {
 				return errShuttingDown
 			}
@@ -116,16 +123,28 @@ func (c *connection) serve() error {
 			return c.readFailed(err)
 		}
 
-		// An event the reader had already buffered was not bound by the
-		// read deadline, so the idle deadline is checked again here.
-		if c.request == nil && !time.Now().Before(c.idleDeadline()) {
-			return errIdle
+		if bufferedErr := c.checkBuffered(time.Now()); bufferedErr != nil {
+			return bufferedErr
 		}
 
 		if handleErr := c.handle(event); handleErr != nil {
 			return c.refuse(handleErr)
 		}
 	}
+}
+
+// checkBuffered checks the idle or stream deadline again after a read,
+// because an event the reader had already buffered was not bound by the read
+// deadline.
+func (c *connection) checkBuffered(now time.Time) error {
+	if c.streamExpired(now) {
+		return c.refuse(c.streamTimeout(os.ErrDeadlineExceeded))
+	}
+	if c.request == nil && c.stream == nil && !now.Before(c.idleDeadline()) {
+		return errIdle
+	}
+
+	return nil
 }
 
 // errShuttingDown ends a connection that Shutdown kept open for its request
@@ -152,29 +171,64 @@ func (c *connection) idleDeadline() time.Time {
 	return c.idleSince.Add(c.server.idleTimeout)
 }
 
-// readDeadline covers one whole event. With no request open it is the idle
-// deadline. With a request open, each event gets idleTimeout, clamped to the
-// request deadline, so a client cannot hold an ASR slot past that deadline by
-// sending slowly.
+// readDeadline covers one whole event. With neither a request nor a stream
+// open it is the idle deadline. Otherwise each event gets idleTimeout,
+// clamped to the request deadline, or else to the stream deadline, so a
+// client cannot hold an ASR slot or a stream past its deadline by sending
+// slowly.
 func (c *connection) readDeadline(now time.Time) time.Time {
-	if c.request == nil {
+	limit, open := c.openDeadline()
+	if !open {
 		return c.idleDeadline()
 	}
 
 	deadline := now.Add(c.server.idleTimeout)
-	if !c.request.deadline.IsZero() && c.request.deadline.Before(deadline) {
-		return c.request.deadline
+	if !limit.IsZero() && limit.Before(deadline) {
+		return limit
 	}
 
 	return deadline
 }
 
+// openDeadline is the deadline of the open request, or else of the open
+// stream. A request not yet admitted has none.
+func (c *connection) openDeadline() (time.Time, bool) {
+	switch {
+	case c.request != nil:
+		return c.request.deadline, true
+	case c.stream != nil:
+		return c.stream.deadline, true
+	}
+
+	return time.Time{}, false
+}
+
+// readFailed refuses a frame over a limit or malformed, and a stream whose
+// deadline ended the read. Any other failure, the idle timeout inside a
+// stream included, closes the connection without a reply.
 func (c *connection) readFailed(err error) error {
 	if errors.Is(err, errTooLarge) || errors.Is(err, errMalformed) {
 		return c.refuse(&pipeline.Error{Kind: pipeline.KindInvalid, Message: err.Error(), Err: err})
 	}
+	if errors.Is(err, os.ErrDeadlineExceeded) && c.streamExpired(time.Now()) {
+		return c.refuse(c.streamTimeout(err))
+	}
 
 	return err
+}
+
+// streamExpired reports whether a stream is open between sentences and its
+// deadline has passed.
+func (c *connection) streamExpired(now time.Time) bool {
+	return c.request == nil && c.stream != nil && !now.Before(c.stream.deadline)
+}
+
+func (c *connection) streamTimeout(err error) *pipeline.Error {
+	return &pipeline.Error{
+		Kind:    pipeline.KindTimeout,
+		Message: fmt.Sprintf("the synthesis stream was open longer than %s", c.server.maxStreamDuration),
+		Err:     err,
+	}
 }
 
 func (c *connection) handle(event *Event) error {
@@ -193,6 +247,12 @@ func (c *connection) handle(event *Event) error {
 		return c.audioStop()
 	case typeSynthesize:
 		return c.synthesize(event)
+	case typeSynthesizeStart:
+		return c.synthesizeStart(event)
+	case typeSynthesizeChunk:
+		return c.synthesizeChunk(event)
+	case typeSynthesizeStop:
+		return c.synthesizeStop()
 	}
 
 	return nil
@@ -203,8 +263,13 @@ func (c *connection) requireState(want state, eventType string) error {
 		return nil
 	}
 
-	if want == stateIdle {
+	switch {
+	case want == stateIdle && c.state == stateStreaming:
+		return invalid("%s is not allowed while a synthesis stream is open", eventType)
+	case want == stateIdle:
 		return invalid("%s is not allowed while audio is being recorded", eventType)
+	case want == stateStreaming:
+		return invalid("%s is only allowed after synthesize-start", eventType)
 	}
 
 	return invalid("%s is only allowed after audio-start", eventType)
@@ -232,9 +297,10 @@ func decode(event *Event, dst any) error {
 	return json.Unmarshal(event.Data, dst)
 }
 
-// refuse ends the request, then tells the client why when the failure is
-// the pipeline's or the client's. The connection closes either way. Ending
-// the request first frees its slot before the client reads the error.
+// refuse ends the request and the stream, then tells the client why when the
+// failure is the pipeline's or the client's, followed by synthesize-stopped
+// when a stream was open. The connection closes either way. Ending the
+// request first frees its slot before the client reads the error.
 //
 // The pipeline reports any ended request context as a timeout, so a request
 // cancelled through the base context is named here, before release cancels
@@ -250,8 +316,17 @@ func (c *connection) refuse(err error) error {
 		code = codeShuttingDown
 	}
 	c.endRequest(code)
+	streamOpen := c.stream != nil && c.stream.opened
+	c.endStream(code)
 
 	if writeErr := c.reply(typeError, errorData{Text: failed.Message, Code: code}, nil); writeErr != nil {
+		return errors.Join(err, writeErr)
+	}
+	if !streamOpen {
+		return err
+	}
+
+	if writeErr := c.reply(typeSynthesizeStopped, nil, nil); writeErr != nil {
 		return errors.Join(err, writeErr)
 	}
 
@@ -294,12 +369,21 @@ func (c *connection) reply(eventType string, data any, payload []byte) error {
 	return c.writeBy(time.Now().Add(c.server.writeTimeout), eventType, data, payload)
 }
 
-// writeDeadline gives each write writeTimeout, cut short with no request open
-// by the idle deadline, so a client that does not read cannot outstay it.
+// writeDeadline gives each write writeTimeout. With no request open it is cut
+// short by the stream deadline, or else by the idle deadline, so a client
+// that does not read cannot outstay either.
 func (c *connection) writeDeadline(now time.Time) time.Time {
 	deadline := now.Add(c.server.writeTimeout)
-	if c.request == nil && c.idleDeadline().Before(deadline) {
-		return c.idleDeadline()
+	if c.request != nil {
+		return deadline
+	}
+
+	limit := c.idleDeadline()
+	if c.stream != nil {
+		limit = c.stream.deadline
+	}
+	if limit.Before(deadline) {
+		return limit
 	}
 
 	return deadline
@@ -329,25 +413,49 @@ func (c *connection) beginRequest(eventType string) {
 	c.request = &request{id: rand.Text(), event: eventType, started: time.Now()}
 }
 
-// admit takes a slot for the current request and ties its context to the
-// connection: a request that ends closes the connection, which wakes a
-// blocked read. The cleanup undoes all of it exactly once.
+// admit enters the current request into the pipeline's admission and takes
+// a slot for it. Its cleanup also leaves the admission. Once Shutdown has
+// begun, no request is admitted.
+func (c *connection) admit(work pipeline.Work) error {
+	if !c.enter() {
+		return pipeline.ErrShuttingDown
+	}
+
+	p := c.server.pipeline
+	if err := c.admitSlot(work); err != nil {
+		p.Leave()
+		return err
+	}
+
+	release := c.request.cleanup
+	c.request.cleanup = sync.OnceFunc(func() {
+		release()
+		p.Leave()
+	})
+
+	return nil
+}
+
+// enter marks the connection busy and counts new work in the pipeline's
+// admission, so Shutdown and Drain wait for it. Each true result needs one
+// pipeline Leave.
+func (c *connection) enter() bool {
+	return c.server.beginWork(c.conn) && c.server.pipeline.Enter()
+}
+
+// admitSlot takes a slot for the current request and ties its context to
+// the connection: a request that ends closes the connection, which wakes a
+// blocked read. The cleanup undoes all of it exactly once; it does not leave
+// the admission, so a stream's sentences can share the stream's.
 //
 // A hook that has started may not have closed the connection yet, and its
 // close would then land on whatever request comes next. So whoever disarms
 // the hook too late closes the connection itself, and it is never reused.
-//
-// Once Shutdown has begun, no request is admitted.
-func (c *connection) admit(work pipeline.Work) error {
+func (c *connection) admitSlot(work pipeline.Work) error {
 	p := c.server.pipeline
-	if !c.server.beginWork(c.conn) || !p.Enter() {
-		return pipeline.ErrShuttingDown
-	}
-
 	deadline := p.RequestDeadline(time.Now())
 	ctx, release, err := p.Admit(pipeline.WithRequestID(c.server.base, c.request.id), work, deadline)
 	if err != nil {
-		p.Leave()
 		return err
 	}
 
@@ -365,25 +473,28 @@ func (c *connection) admit(work pipeline.Work) error {
 		}
 		c.server.closeSpeech(req)
 		release()
-		p.Leave()
 	})
 
 	return nil
 }
 
-// endRequest runs the request's cleanup and writes its log line. Every exit
-// path calls it; with no request open it does nothing.
+// endRequest runs the request's cleanup and writes its log line, unless the
+// request is a sentence of a stream, which has one line for all of them.
+// Every exit path calls it; with no request open it does nothing.
 func (c *connection) endRequest(outcome string) {
 	req := c.request
 	if req == nil {
 		return
 	}
 	c.request = nil
-	c.state = stateIdle
 
 	if req.cleanup != nil {
 		req.cleanup()
 	}
+	if c.stream != nil {
+		return
+	}
+	c.state = stateIdle
 
 	c.server.log.Info("request",
 		slog.String("request_id", req.id),
@@ -395,19 +506,23 @@ func (c *connection) endRequest(outcome string) {
 	)
 }
 
-// outcomeOf names how a connection's open request ended. A cancelled context
-// was cancelled through the server's base context, at shutdown, even when
-// that is noticed after the deadline. Otherwise the read deadline and the
-// context's timer fire at the same instant in either order, so the deadline
-// itself also counts.
+// outcomeOf names how a connection's open request or stream ended. A
+// cancelled context was cancelled through the server's base context, at
+// shutdown, even when that is noticed after the deadline; a stream between
+// sentences has no context of its own, so the base context is asked
+// directly. Otherwise the read deadline and the context's timer fire at the
+// same instant in either order, so the deadline itself also counts.
 func (c *connection) outcomeOf(err error) string {
-	if c.requestCancelled() {
+	if c.requestCancelled() || (c.stream != nil && c.server.base.Err() != nil) {
 		return codeShuttingDown
 	}
 	if req := c.request; req != nil && req.ctx != nil {
 		if req.ctx.Err() != nil || !time.Now().Before(req.deadline) {
 			return codeTimeout
 		}
+	}
+	if c.streamExpired(time.Now()) {
+		return codeTimeout
 	}
 
 	var failed *pipeline.Error

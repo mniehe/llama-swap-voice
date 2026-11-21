@@ -2,7 +2,7 @@ package wyoming
 
 // Event types and data fields as OHF-Voice/wyoming names them at 844d383:
 // info.py:10-30,63-156,273-318; asr.py:9-58; audio.py:20-139;
-// error.py:8-30; ping.py:8-53; tts.py:10,26-59,62-112.
+// error.py:8-30; ping.py:8-53; tts.py:10,26-59,62-112,115-212.
 const (
 	typeDescribe   = "describe"
 	typeInfo       = "info"
@@ -15,6 +15,11 @@ const (
 	typeAudioChunk = "audio-chunk"
 	typeAudioStop  = "audio-stop"
 	typeSynthesize = "synthesize"
+
+	typeSynthesizeStart   = "synthesize-start"
+	typeSynthesizeChunk   = "synthesize-chunk"
+	typeSynthesizeStop    = "synthesize-stop"
+	typeSynthesizeStopped = "synthesize-stopped"
 )
 
 type attribution struct {
@@ -76,11 +81,16 @@ type errorData struct {
 	Code string `json:"code,omitempty"`
 }
 
-// synthesizeData is the data of synthesize. The voice's speaker and
-// language, the text format and the context are not read.
+// synthesizeData is the data of synthesize and synthesize-start, which has
+// no text. The voice's speaker and language, the text format and the context
+// are not read.
 type synthesizeData struct {
 	Text  string           `json:"text"`
 	Voice *synthesizeVoice `json:"voice"`
+}
+
+type synthesizeChunkData struct {
+	Text string `json:"text"`
 }
 
 type synthesizeVoice struct {

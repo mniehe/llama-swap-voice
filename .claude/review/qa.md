@@ -33,8 +33,9 @@ frames.
 - `opusCreated` and `opusDestroyed` (`libopus.go`) let tests prove every C
   encoder is freed; `encoder_test.go` shows the pattern.
 - Fuzz targets `FuzzNormaliseUpload`, `FuzzOpusPacket` (`fuzz_test.go`),
-  `FuzzStretcher` (`wsola_test.go`) and `FuzzReadEvent`
-  (`internal/wyoming/fuzz_test.go`). Deleting a seed needs confirmation.
+  `FuzzStretcher` (`wsola_test.go`), `FuzzReadEvent`
+  (`internal/wyoming/fuzz_test.go`) and `FuzzSplitter`
+  (`internal/wyoming/sentences_test.go`). Deleting a seed needs confirmation.
 - A new input gets a named limit and a test at the limit, per AGENTS.md;
   `TestNormaliseUpload_OpusAtLimit_Passes` next to `..._OpusOverLimit_TooLong`
   is the shape.

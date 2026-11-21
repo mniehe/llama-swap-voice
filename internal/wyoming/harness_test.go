@@ -40,11 +40,15 @@ const (
 	harnessTimeout = 10 * time.Second
 	waitTimeout    = 5 * time.Second
 	drainTimeout   = 5 * time.Second
+	// Config validation keeps streamingMaxChars within tts.maxInputChars.
+	harnessMaxInputChars     = 100
+	harnessStreamingMaxChars = 50
 )
 
 type upstreamCall struct {
-	path  string
-	files map[string][]byte
+	path   string
+	fields map[string]string
+	files  map[string][]byte
 }
 
 // fakeUpstream stands in for llama-swap, recording each multipart request.
@@ -64,7 +68,7 @@ func newFakeUpstream(t *testing.T, respond http.HandlerFunc) *fakeUpstream {
 }
 
 func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
-	call := upstreamCall{path: r.URL.Path, files: map[string][]byte{}}
+	call := upstreamCall{path: r.URL.Path, fields: map[string]string{}, files: map[string][]byte{}}
 	if err := r.ParseMultipartForm(fakeFormMemory); err != nil {
 		assert.NoError(f.t, err, "upstream got an invalid request")
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -72,6 +76,9 @@ func (f *fakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { assert.NoError(f.t, r.MultipartForm.RemoveAll()) }()
 
+	for key, values := range r.MultipartForm.Value {
+		call.fields[key] = values[0]
+	}
 	for key, headers := range r.MultipartForm.File {
 		call.files[key] = readPart(f.t, headers[0])
 	}
@@ -101,6 +108,17 @@ func (f *fakeUpstream) recorded() []upstreamCall {
 	defer f.mu.Unlock()
 
 	return append([]upstreamCall(nil), f.calls...)
+}
+
+// inputs returns the text of each TTS request in arrival order.
+func (f *fakeUpstream) inputs() []string {
+	calls := f.recorded()
+	texts := make([]string, 0, len(calls))
+	for _, call := range calls {
+		texts = append(texts, call.fields["input"])
+	}
+
+	return texts
 }
 
 func serveTranscript(t *testing.T, text string) http.HandlerFunc {
@@ -242,7 +260,7 @@ func newHarness(t *testing.T, opts ...option) *harness {
 	cfg := newSetup(t, opts)
 	h := &harness{t: t, logs: &syncBuffer{}, served: make(chan error, 1)}
 	h.upstream = newFakeUpstream(t, cfg.respond)
-	h.build(&cfg, h.upstream.server.URL)
+	h.build(&cfg, h.upstream.server.URL, &http.Client{})
 
 	listener := cfg.listener
 	if listener == nil {
@@ -261,7 +279,7 @@ func newHarness(t *testing.T, opts ...option) *harness {
 func newSetup(t *testing.T, opts []option) setup {
 	cfg := setup{
 		respond: serveTranscript(t, transcriptText),
-		config:  Config{Languages: []string{"en", "de"}, Speed: 1, Streaming: ModeWhole, StreamingMaxChars: 300, Version: serviceVersion},
+		config:  Config{Languages: []string{"en", "de"}, Speed: 1, Streaming: ModeWhole, StreamingMaxChars: harnessStreamingMaxChars, Version: serviceVersion},
 		base:    t.Context(),
 	}
 	for _, apply := range opts {
@@ -271,12 +289,12 @@ func newSetup(t *testing.T, opts []option) setup {
 	return cfg
 }
 
-// build makes the pipeline, calling the upstream at upstreamURL, and the
-// server.
-func (h *harness) build(cfg *setup, upstreamURL string) {
+// build makes the pipeline, calling the upstream at upstreamURL through
+// httpClient, and the server.
+func (h *harness) build(cfg *setup, upstreamURL string, httpClient *http.Client) {
 	h.t.Helper()
 
-	h.pipeline = newPipeline(h.t, upstreamURL, cfg.pipeline)
+	h.pipeline = newPipelineWith(h.t, upstreamURL, httpClient, cfg.pipeline)
 	log := slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	h.server = New(cfg.base, &cfg.config, h.pipeline, log)
 	for _, apply := range cfg.server {
@@ -284,23 +302,88 @@ func (h *harness) build(cfg *setup, upstreamURL string) {
 	}
 }
 
-// unusedUpstream is never dialled. A synctest bubble's virtual clock stops
-// while a goroutine waits on a real socket, so a bubble test must end before
-// a request reaches the upstream.
-const unusedUpstream = "http://upstream.invalid"
+// memoryUpstream names the upstream of a bubble harness, which memoryTransport
+// serves without a socket.
+const memoryUpstream = "http://upstream.invalid"
 
 // newBubbleHarness is newHarness for a test inside a synctest bubble: no
-// listener and no upstream. The test serves each connection with servePipe.
+// listener, and an upstream served in memory, because a bubble's virtual
+// clock stops while a goroutine waits on a real socket. The test serves each
+// connection with servePipe or serveInBubble.
 func newBubbleHarness(t *testing.T, opts ...option) *harness {
 	t.Helper()
 
 	cfg := newSetup(t, opts)
 	h := &harness{t: t, logs: &syncBuffer{}}
-	h.build(&cfg, unusedUpstream)
+	h.upstream = &fakeUpstream{t: t, respond: cfg.respond}
+	h.build(&cfg, memoryUpstream, &http.Client{Transport: memoryTransport{t: t, handler: http.HandlerFunc(h.upstream.serve)}})
 	t.Cleanup(h.requireDrained)
 
 	return h
 }
+
+// memoryTransport answers each request by running handler on it, with the
+// response body on an in-memory pipe.
+type memoryTransport struct {
+	t       *testing.T
+	handler http.Handler
+}
+
+func (m memoryTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	body, pipe := io.Pipe()
+	w := &memoryResponse{header: http.Header{}, body: pipe, started: make(chan struct{})}
+	go func() {
+		m.handler.ServeHTTP(w, r)
+		w.WriteHeader(http.StatusOK)
+		assert.NoError(m.t, pipe.Close())
+	}()
+
+	select {
+	case <-w.started:
+	case <-r.Context().Done():
+		return nil, r.Context().Err()
+	}
+
+	return &http.Response{
+		Status:        http.StatusText(w.status),
+		StatusCode:    w.status,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        w.header,
+		Body:          body,
+		ContentLength: -1,
+		Request:       r,
+	}, nil
+}
+
+// memoryResponse is the http.ResponseWriter of memoryTransport. Writes block
+// until the client reads them.
+type memoryResponse struct {
+	header  http.Header
+	body    *io.PipeWriter
+	status  int
+	once    sync.Once
+	started chan struct{}
+}
+
+func (w *memoryResponse) Header() http.Header {
+	return w.header
+}
+
+func (w *memoryResponse) WriteHeader(status int) {
+	w.once.Do(func() {
+		w.status = status
+		close(w.started)
+	})
+}
+
+func (w *memoryResponse) Write(p []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	return w.body.Write(p)
+}
+
+func (w *memoryResponse) Flush() {}
 
 // servePipe runs serveConn on one end of an in-memory pipe and returns a
 // client on the other end, and a channel closed when serveConn returns.
@@ -320,6 +403,12 @@ func (h *harness) servePipe() (c *client, done <-chan struct{}) {
 func newPipeline(t *testing.T, upstreamURL string, tweaks []func(*pipeline.Config)) *pipeline.Pipeline {
 	t.Helper()
 
+	return newPipelineWith(t, upstreamURL, &http.Client{}, tweaks)
+}
+
+func newPipelineWith(t *testing.T, upstreamURL string, httpClient *http.Client, tweaks []func(*pipeline.Config)) *pipeline.Pipeline {
+	t.Helper()
+
 	dir := t.TempDir()
 	cfg := pipeline.Config{
 		TTSModel: ttsModelName,
@@ -332,7 +421,7 @@ func newPipeline(t *testing.T, upstreamURL string, tweaks []func(*pipeline.Confi
 		DefaultVoice:     "narrator",
 		Lang:             "en",
 		RequestTimeout:   harnessTimeout,
-		MaxInputChars:    100,
+		MaxInputChars:    harnessMaxInputChars,
 		MaxConcurrent:    4,
 		MaxConcurrentTTS: 8,
 		TTSConcurrency:   1,
@@ -341,7 +430,7 @@ func newPipeline(t *testing.T, upstreamURL string, tweaks []func(*pipeline.Confi
 		apply(&cfg)
 	}
 
-	client, err := upstream.New(upstreamURL, ttsModelName, asrModelName, &http.Client{})
+	client, err := upstream.New(upstreamURL, ttsModelName, asrModelName, httpClient)
 	require.NoError(t, err)
 
 	p, err := pipeline.New(&cfg, client, slog.New(slog.DiscardHandler))

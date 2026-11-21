@@ -25,12 +25,12 @@ mistake is a memory-safety or denial-of-service hole.
   (`maxPayloadBytes`) before allocating; `maxConns` caps connections at
   accept. `Serve` retries only `retriedAcceptErrors`, after a capped backoff
   that `Close` and `Shutdown` end, and `Shutdown` counts each `Serve` loop
-  in `goroutines`. With no request open, a connection must start one by
-  `idleSince` plus `idleTimeout`, checked again for buffered events; describe
-  and ping do not extend it. With a request open, each event gets
-  `idleTimeout`, clamped to the request deadline. Describe and ping replies
-  get `writeTimeout`, cut to the idle deadline when no request is open; the
-  event that closes a request or the connection (the transcript,
+  in `goroutines`. With no request or stream open, a connection must start
+  one by `idleSince` plus `idleTimeout`, checked again for buffered events;
+  describe and ping do not extend it. Otherwise each event gets `idleTimeout`,
+  clamped to the request or stream (`maxStreamDuration`) deadline. `info`
+  and `pong` get `writeTimeout`, cut to that stream or idle deadline with no
+  request open; the event ending a request or the connection (the transcript,
   `audio-stop` or an `error`) gets the whole `writeTimeout`, and an `error`
   closes the connection. `audio-start` takes an ASR slot, and the recording
   is bounded by `Limits().MaxUploadBytes` minus `wavHeaderBytes` before
@@ -90,9 +90,10 @@ mistake is a memory-safety or denial-of-service hole.
 - Every new client or upstream input has a named limit and a test at it.
 - Every changed parser is reached by a fuzz target that runs the changed
   code: `FuzzNormaliseUpload` (upload decoding), `FuzzOpusPacket` (Opus
-  packets), `FuzzStretcher` (WSOLA) or `FuzzReadEvent` (Wyoming frames,
-  `internal/wyoming`). None reaches `NewWAVReader`; a change
-  to its header parsing without a new target is a finding.
+  packets), `FuzzStretcher` (WSOLA), `FuzzReadEvent` (Wyoming frames) or
+  `FuzzSplitter` (sentence splitter, both `internal/wyoming`). None reaches
+  `NewWAVReader`; a change to its header parsing without a new target is a
+  finding.
 - Every new outbound client keeps `refuseRedirect` and a context deadline.
 
 ## Finding fields
