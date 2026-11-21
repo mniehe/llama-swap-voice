@@ -23,16 +23,23 @@ mistake is a memory-safety or denial-of-service hole.
 - Wyoming clients over TCP, through `internal/wyoming`: `ReadEvent` bounds
   the header line (`maxHeaderBytes`), data (`maxDataBytes`) and payload
   (`maxPayloadBytes`) before allocating; `maxConns` caps connections at
-  accept. With no request open, a connection must start one by `idleSince`
-  plus `idleTimeout`, checked again for buffered events; describe and ping
-  do not extend it. With a request open, each event gets `idleTimeout`,
-  clamped to the request deadline. Describe and ping replies get
-  `writeTimeout`, cut to the idle deadline when no request is open; the
-  event that closes a request or the connection (the transcript or an
-  `error`) gets the whole `writeTimeout`, and an `error` closes the
-  connection. `audio-start` takes an ASR slot, and the recording is bounded
-  by `Limits().MaxUploadBytes` minus `wavHeaderBytes` before `Transcribe`
-  reads it whole.
+  accept. `Serve` retries only `retriedAcceptErrors`, after a capped backoff
+  that `Close` and `Shutdown` end, and `Shutdown` counts each `Serve` loop
+  in `goroutines`. With no request open, a connection must start one by
+  `idleSince` plus `idleTimeout`, checked again for buffered events; describe
+  and ping do not extend it. With a request open, each event gets
+  `idleTimeout`, clamped to the request deadline. Describe and ping replies
+  get `writeTimeout`, cut to the idle deadline when no request is open; the
+  event that closes a request or the connection (the transcript,
+  `audio-stop` or an `error`) gets the whole `writeTimeout`, and an `error`
+  closes the connection. `audio-start` takes an ASR slot, and the recording
+  is bounded by `Limits().MaxUploadBytes` minus `wavHeaderBytes` before
+  `Transcribe` reads it whole. `synthesize` takes a TTS slot; its `text` and
+  `voice.name` go through `pipeline.PrepareSpeech` (`MaxInputChars`,
+  `cfg.Voices`). Every reply event (`audio-start`, each `audio-chunk`,
+  `audio-stop`) gets the whole `writeTimeout` through `reply`; `sendChunk`
+  checks the request context before each chunk, and `closeSpeech` closes the
+  PCM, which frees the TTS gate.
 - Untrusted audio, `internal/audio`: `NormaliseUpload` reads the whole
   upload, `sniff` picks a decoder: the in-repo WAV parser (`wav.go`), the Ogg
   reader (`ogg.go`, `maxOggPacketBytes`) feeding pion/opus, or go-mp3.

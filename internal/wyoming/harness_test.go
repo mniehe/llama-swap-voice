@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mniehe/llama-swap-voice/internal/audio"
 	"github.com/mniehe/llama-swap-voice/internal/pipeline"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 )
@@ -29,7 +30,11 @@ const (
 	ttsModelName   = "qwen3-tts"
 	asrModelName   = "qwen3-asr"
 	asrRoute       = "/upstream/" + asrModelName + "/v1/audio/transcriptions"
+	ttsRoute       = "/upstream/" + ttsModelName + "/tts"
 	transcriptText = "turn on the kitchen light"
+	speechRate     = 24000
+	speechWidth    = 2
+	speechChannels = 1
 	serviceVersion = "1.2.3"
 	fakeFormMemory = 1 << 20
 	harnessTimeout = 10 * time.Second
@@ -102,6 +107,23 @@ func serveTranscript(t *testing.T, text string) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		assert.NoError(t, json.NewEncoder(w).Encode(map[string]string{"text": text}))
+	}
+}
+
+// serveSpeech answers a TTS request with pcm in a 24 kHz mono 16-bit WAV.
+// A write fails when the pipeline stops reading, which some tests cause on
+// purpose, so a failed write is logged rather than failing the test.
+func serveSpeech(t *testing.T, pcm []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		header, err := audio.WAVHeader(speechRate, speechWidth, speechChannels, len(pcm))
+		if !assert.NoError(t, err) {
+			return
+		}
+
+		w.Header().Set("Content-Type", "audio/wav")
+		if _, err := w.Write(append(header, pcm...)); err != nil {
+			t.Logf("fake upstream: writing speech: %v", err)
+		}
 	}
 }
 
@@ -209,6 +231,9 @@ type harness struct {
 	addr     string
 	logs     *syncBuffer
 	served   chan error
+
+	serveOnce sync.Once
+	serveErr  error
 }
 
 func newHarness(t *testing.T, opts ...option) *harness {
@@ -337,15 +362,25 @@ func writeFile(t *testing.T, dir, name string) string {
 // stop closes the server, then proves that no request is still admitted.
 func (h *harness) stop() {
 	assert.NoError(h.t, h.server.Close())
-
-	select {
-	case err := <-h.served:
-		assert.NoError(h.t, err, "Serve after Close")
-	case <-time.After(waitTimeout):
-		h.t.Error("Serve did not return after Close")
-	}
+	assert.NoError(h.t, h.serveResult(), "Serve after Close")
 
 	h.requireDrained()
+}
+
+var errServeRunning = errors.New("serve did not return")
+
+// serveResult waits for Serve to return and gives its error, the same on
+// every call; errServeRunning means it was still running after waitTimeout.
+func (h *harness) serveResult() error {
+	h.serveOnce.Do(func() {
+		select {
+		case h.serveErr = <-h.served:
+		case <-time.After(waitTimeout):
+			h.serveErr = errServeRunning
+		}
+	})
+
+	return h.serveErr
 }
 
 // requireDrained fails if a request is still admitted: a leaked admission

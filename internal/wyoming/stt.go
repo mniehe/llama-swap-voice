@@ -17,7 +17,7 @@ const internalErrorText = "internal server error"
 // MaxUploadBytes.
 const wavHeaderBytes = 44
 
-var errRequestEnded = errors.New("the request ended before its transcription began")
+var errRequestEnded = errors.New("the request ended before its upstream call began")
 
 // The audio-start formats a recording may use. The decoder reads 16- and
 // 24-bit PCM, mono or stereo, from 8 to 48 kHz.
@@ -128,7 +128,7 @@ func (c *connection) audioStop() error {
 
 	c.endRequest(outcomeOK)
 
-	if err := c.reply(typeTranscript, transcript{Text: text}); err != nil {
+	if err := c.reply(typeTranscript, transcript{Text: text}, nil); err != nil {
 		return err
 	}
 	c.idleSince = time.Now()

@@ -1,9 +1,9 @@
 # The HTTP API
 
 This page describes the HTTP API of the service: endpoints, audio formats,
-errors, limits and shutdown. The API follows OpenAI's audio API. Related
-pages: [module options](options.md) and
-[the Qwen TTS server](qwen-tts-server.md).
+errors, limits and shutdown. The API follows OpenAI's audio API. The last
+section describes the optional [Wyoming](#wyoming) listener. Related pages:
+[module options](options.md) and [the Qwen TTS server](qwen-tts-server.md).
 
 Option names on this page, such as `request.timeout`, are options of the
 NixOS module. [Environment variables](options.md#environment-variables)
@@ -125,3 +125,135 @@ in three steps:
 
 [Limits and timeouts](options.md#limits-and-timeouts) lists the option for
 each step.
+
+## Wyoming
+
+With `WYOMING_ENABLED=true` the service also speaks the
+[Wyoming protocol](https://github.com/OHF-Voice/wyoming) over TCP, so that
+Home Assistant can use it for speech to text and text to speech without a
+bridge. The listener binds `WYOMING_HOST` and `WYOMING_PORT`
+(`127.0.0.1:10300` by default) before the readiness probe answers. If the
+bind fails, the service does not start. If accepting a connection fails
+because the system is short of file descriptors, buffers or memory, the
+listener logs a warning and tries again after a pause that grows from 5 ms
+to 1 s, and the service keeps running.
+[Environment variables](options.md#environment-variables) lists the
+`WYOMING_` settings. Both listeners share one pipeline, so a Wyoming request
+takes the same transcription or speech slot as an HTTP request.
+
+### Events
+
+| Event from the client | What the service does |
+|---|---|
+| `describe` | Sends `info`. |
+| `ping` | Sends `pong` with the same `text`. |
+| `transcribe` | Accepted and otherwise ignored. Its `language` is not read. |
+| `audio-start` | Opens a recording and takes a transcription slot. |
+| `audio-chunk` | Adds the payload to the recording. |
+| `audio-stop` | Transcribes the recording and sends `transcript`. |
+| `synthesize` | Speaks `text` in `voice.name`, or in the default voice when no name is given, at `WYOMING_SPEED`. Sends `audio-start`, `audio-chunk` events and `audio-stop`. |
+
+The service ignores every other event, including the streamed synthesis
+events `synthesize-start`, `synthesize-chunk` and `synthesize-stop`. It also
+ignores `voice.speaker`, `voice.language`, `text_format` and `context` in
+`synthesize`. Each event is read whole, within the frame limits, before it is
+dropped.
+
+A connection is in one of three states:
+
+| State | Starts with | Accepts | Refuses |
+|---|---|---|---|
+| Idle | the connection; the end of a reply | `describe`, `ping`, `transcribe`, `audio-start`, `synthesize` | `audio-chunk`, `audio-stop` |
+| Recording | `audio-start` | `describe`, `ping`, `audio-chunk`, `audio-stop` | `transcribe`, `audio-start`, `synthesize` |
+| Synthesising | `synthesize` | nothing: the service reads no event until the reply ends | — |
+
+A known event in the wrong state gets an `error` with code `invalid`, and the
+connection closes. A connection can carry any number of requests, one at a
+time.
+
+### The info event
+
+`info` lists one ASR program and one TTS program, both named
+`llama-swap-voice` with the service's version.
+
+- The ASR program's description is the ASR model's name. It has one model,
+  that name, with the `WYOMING_LANGUAGES` languages.
+  `supports_transcript_streaming` is `false`.
+- The TTS program's description is the TTS model's name. It lists every
+  voice, each with the `WYOMING_LANGUAGES` languages. The default voice comes
+  first, and its description ends with ` (default)`.
+  `supports_synthesize_streaming` is `false`.
+
+### Audio formats
+
+| Direction | Format |
+|---|---|
+| Recording, from the client | PCM, 2 or 3 bytes a sample (16- or 24-bit), 1 or 2 channels, 8000 to 48000 Hz. Each `audio-chunk` must repeat the format of `audio-start`. |
+| Speech, to the client | PCM, `rate` 24000, `width` 2, `channels` 1. Each `audio-chunk` holds at most 4800 bytes (100 ms) and whole samples. |
+
+### Limits
+
+| Limit | Value | Set by |
+|---|---|---|
+| Header line of one event | 8 KiB | fixed |
+| Data of one event | 256 KiB | fixed |
+| Payload of one event | 1 MiB | fixed |
+| Open connections | 64; the service closes more at once | fixed |
+| Recording, with the 44-byte WAV header the service adds | 25 MiB | fixed, the upload size |
+| Speech text | 4096 characters | `tts.maxInputChars` |
+| `idleTimeout` | 60 seconds | fixed |
+| `writeTimeout` | 10 seconds | fixed |
+| Time for a request | 2 minutes | `request.timeout` |
+
+The two timeouts work as follows:
+
+- `idleTimeout`. A connection with no request open must start one within
+  60 seconds of its accept or of the end of its last reply. `describe`,
+  `ping` and unknown events do not extend this time. While a recording is
+  open, each event must arrive within 60 seconds, and the recording must end
+  by the request deadline.
+- `writeTimeout`. Each event of a reply (`transcript`, `audio-start`, each
+  `audio-chunk`, `audio-stop` and `error`) gets 10 seconds to be written.
+  `info` and `pong` get the same, cut short by the idle deadline when no
+  request is open.
+- The request deadline starts at `audio-start` or `synthesize`. It bounds
+  the recording, the call to llama-swap and the audio that follows: once it
+  passes, the service sends no further chunk.
+
+### Errors
+
+An `error` event has `text` and `code`, and the connection closes after it.
+This includes a failure after `audio-start` of a synthesis reply.
+
+| Code | Cause |
+|---|---|
+| `invalid` | A malformed event or one over a limit; a known event in the wrong state; an unsupported audio format; an empty or too long text; an unknown voice, with the list of voices |
+| `busy` | Every transcription or speech slot is taken |
+| `timeout` | The request took longer than `request.timeout` |
+| `upstream` | llama-swap failed, sent no audio or broke off its audio |
+| `shutting-down` | The service is shutting down |
+| `internal` | A fault inside the service. The cause is in its log. |
+
+### Disconnects
+
+While the service waits for llama-swap, it does not read the socket. It
+therefore notices a client that has gone at its next write or at the request
+deadline, not at once. A write failure or the request deadline ends the
+request and frees its slot. A client that sends a request and then reads
+nothing blocks the reply, and `writeTimeout` ends that request.
+
+### Shutdown and the Wyoming listener
+
+The Wyoming listener follows the [shutdown](#shutdown) steps of the HTTP
+server:
+
+1. **Grace.** Both listeners keep serving.
+2. **Total.** Both listeners stop accepting. The service closes each Wyoming
+   connection that has no request open. A connection with an open request
+   keeps it until its reply is written, and then closes. Events that the
+   service had already read are handled first: a new request among them gets
+   an `error` with code `shutting-down`. A request that arrives later finds
+   the connection closed.
+3. **Hard.** The service cancels the requests that remain, sends
+   `shutting-down` where it still can, and closes every connection. It waits
+   `SHUTDOWN_HARD` for the requests and the connections to stop.

@@ -116,7 +116,7 @@ func TestServe_UnknownEvents_AreIgnored(t *testing.T) {
 	c := h.dial()
 
 	c.send("run-satellite", nil, nil)
-	c.send("synthesize", map[string]string{"text": "hello"}, nil)
+	c.send("voice-started", map[string]int{"timestamp": 0}, nil)
 	c.send("detect", nil, []byte("payload"))
 	c.send(typePing, map[string]string{"text": "after"}, nil)
 

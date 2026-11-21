@@ -37,9 +37,11 @@ const (
 
 type state int
 
+// A connection in stateSynthesising reads no event until the reply ends.
 const (
 	stateIdle state = iota
 	stateRecording
+	stateSynthesising
 )
 
 // connection is one client's event loop. Only its own goroutine touches it.
@@ -56,6 +58,7 @@ type connection struct {
 type request struct {
 	id        string
 	event     string
+	voice     string
 	started   time.Time
 	ctx       context.Context
 	deadline  time.Time
@@ -63,6 +66,7 @@ type request struct {
 	cleanup   func()
 	format    audioFormat
 	recording []byte
+	pcm       io.Closer
 }
 
 func (s *Server) serveConn(conn net.Conn) {
@@ -95,7 +99,15 @@ func (s *Server) recoverPanic(conn net.Conn) {
 
 func (c *connection) serve() error {
 	for {
-		if err := c.conn.SetReadDeadline(c.readDeadline(time.Now())); err != nil {
+		deadline := c.readDeadline(time.Now())
+		if c.request == nil && !c.server.markIdle(c.conn) {
+			if c.in.Buffered() == 0 {
+				return errShuttingDown
+			}
+			deadline = expiredDeadline
+		}
+
+		if err := c.conn.SetReadDeadline(deadline); err != nil {
 			return err
 		}
 
@@ -115,6 +127,18 @@ func (c *connection) serve() error {
 		}
 	}
 }
+
+// errShuttingDown ends a connection that Shutdown kept open for its request
+// once that request is over. Events the server had already read are handled
+// first, so a request among them is refused with shutting-down. They are
+// read under expiredDeadline, which fetches nothing more from the socket: a
+// request sent later finds the connection closed, and a partly read event
+// ends the connection at once.
+var errShuttingDown = errors.New("the server is shutting down")
+
+// expiredDeadline lies in the past, so a read under it returns only what the
+// reader has buffered.
+var expiredDeadline = time.Unix(0, 0)
 
 // errIdle ends a connection whose idle deadline passed between reading an
 // event and handling it, the same way a read past that deadline does.
@@ -167,6 +191,8 @@ func (c *connection) handle(event *Event) error {
 		return c.audioChunk(event)
 	case typeAudioStop:
 		return c.audioStop()
+	case typeSynthesize:
+		return c.synthesize(event)
 	}
 
 	return nil
@@ -225,7 +251,7 @@ func (c *connection) refuse(err error) error {
 	}
 	c.endRequest(code)
 
-	if writeErr := c.reply(typeError, errorData{Text: failed.Message, Code: code}); writeErr != nil {
+	if writeErr := c.reply(typeError, errorData{Text: failed.Message, Code: code}, nil); writeErr != nil {
 		return errors.Join(err, writeErr)
 	}
 
@@ -258,13 +284,14 @@ func errorCode(kind pipeline.Kind) string {
 
 // write sends an event that answers describe or ping.
 func (c *connection) write(eventType string, data any) error {
-	return c.writeBy(c.writeDeadline(time.Now()), eventType, data)
+	return c.writeBy(c.writeDeadline(time.Now()), eventType, data, nil)
 }
 
-// reply sends the event that ends a request, which gets the whole
-// writeTimeout: the request has ended, but its idle period has not begun.
-func (c *connection) reply(eventType string, data any) error {
-	return c.writeBy(time.Now().Add(c.server.writeTimeout), eventType, data)
+// reply sends an event of a request's reply, which gets the whole
+// writeTimeout: the request deadline bounds the work behind each event, and
+// after the last event the idle period has not begun.
+func (c *connection) reply(eventType string, data any, payload []byte) error {
+	return c.writeBy(time.Now().Add(c.server.writeTimeout), eventType, data, payload)
 }
 
 // writeDeadline gives each write writeTimeout, cut short with no request open
@@ -278,17 +305,22 @@ func (c *connection) writeDeadline(now time.Time) time.Time {
 	return deadline
 }
 
-func (c *connection) writeBy(deadline time.Time, eventType string, data any) error {
-	raw, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("encoding %s: %w", eventType, err)
+// writeBy sends one event; nil data sends an event without data.
+func (c *connection) writeBy(deadline time.Time, eventType string, data any, payload []byte) error {
+	event := &Event{Type: eventType, Payload: payload}
+	if data != nil {
+		raw, err := json.Marshal(data)
+		if err != nil {
+			return fmt.Errorf("encoding %s: %w", eventType, err)
+		}
+		event.Data = raw
 	}
 
-	if deadlineErr := c.conn.SetWriteDeadline(deadline); deadlineErr != nil {
-		return deadlineErr
+	if err := c.conn.SetWriteDeadline(deadline); err != nil {
+		return err
 	}
 
-	return WriteEvent(c.conn, &Event{Type: eventType, Data: raw})
+	return WriteEvent(c.conn, event)
 }
 
 // beginRequest records a request before it is admitted, so a refused one
@@ -304,9 +336,11 @@ func (c *connection) beginRequest(eventType string) {
 // A hook that has started may not have closed the connection yet, and its
 // close would then land on whatever request comes next. So whoever disarms
 // the hook too late closes the connection itself, and it is never reused.
+//
+// Once Shutdown has begun, no request is admitted.
 func (c *connection) admit(work pipeline.Work) error {
 	p := c.server.pipeline
-	if !p.Enter() {
+	if !c.server.beginWork(c.conn) || !p.Enter() {
 		return pipeline.ErrShuttingDown
 	}
 
@@ -321,13 +355,15 @@ func (c *connection) admit(work pipeline.Work) error {
 	// the hook would then close a connection that is still in use. The stop
 	// result is kept because a second stop call always reports false.
 	disarm := sync.OnceValue(context.AfterFunc(ctx, func() { c.server.closeConn(c.conn) }))
-	c.request.ctx = ctx
-	c.request.deadline = deadline
-	c.request.disarm = disarm
-	c.request.cleanup = sync.OnceFunc(func() {
+	req := c.request
+	req.ctx = ctx
+	req.deadline = deadline
+	req.disarm = disarm
+	req.cleanup = sync.OnceFunc(func() {
 		if !disarm() {
 			c.server.closeConn(c.conn)
 		}
+		c.server.closeSpeech(req)
 		release()
 		p.Leave()
 	})
@@ -353,7 +389,7 @@ func (c *connection) endRequest(outcome string) {
 		slog.String("request_id", req.id),
 		slog.String("protocol", protocolWyoming),
 		slog.String("event", req.event),
-		slog.String("voice", ""),
+		slog.String("voice", req.voice),
 		slog.Int64("duration_ms", time.Since(req.started).Milliseconds()),
 		slog.String("outcome", outcome),
 	)

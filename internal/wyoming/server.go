@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mniehe/llama-swap-voice/internal/pipeline"
@@ -18,6 +19,17 @@ const (
 	idleTimeout  = 60 * time.Second
 	writeTimeout = 10 * time.Second
 )
+
+// The wait before Serve accepts again after a retried accept error doubles
+// from acceptRetryMin to acceptRetryMax, as net/http's does.
+const (
+	acceptRetryMin = 5 * time.Millisecond
+	acceptRetryMax = time.Second
+)
+
+// retriedAcceptErrors name resources that run out and come back, such as
+// file descriptors and memory.
+var retriedAcceptErrors = []error{syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM}
 
 const (
 	programName     = "llama-swap-voice"
@@ -55,16 +67,24 @@ type Server struct {
 	idleTimeout  time.Duration
 	writeTimeout time.Duration
 
-	mu        sync.Mutex
-	closed    bool
+	mu     sync.Mutex
+	closed bool
+	// stopped is closed together with the first change of closed to true,
+	// which ends a Serve call's wait before it accepts again.
+	stopped   chan struct{}
 	listeners map[net.Listener]struct{}
-	conns     map[net.Conn]struct{}
+	// conns says for each connection whether it is busy: a request is open
+	// or its reply is being written. Shutdown keeps busy connections open.
+	conns map[net.Conn]bool
+
+	goroutines sync.WaitGroup
+	drained    func() <-chan struct{}
 }
 
 // New returns a server whose request contexts all derive from base, so
 // cancelling base ends every request.
 func New(base context.Context, cfg *Config, p *pipeline.Pipeline, log *slog.Logger) *Server {
-	return &Server{
+	s := &Server{
 		base:         base,
 		cfg:          *cfg,
 		pipeline:     p,
@@ -72,25 +92,40 @@ func New(base context.Context, cfg *Config, p *pipeline.Pipeline, log *slog.Logg
 		transcribe:   p.Transcribe,
 		idleTimeout:  idleTimeout,
 		writeTimeout: writeTimeout,
+		stopped:      make(chan struct{}),
 		listeners:    map[net.Listener]struct{}{},
-		conns:        map[net.Conn]struct{}{},
+		conns:        map[net.Conn]bool{},
 	}
+	s.drained = sync.OnceValue(s.waitGoroutines)
+
+	return s
 }
 
-// Serve accepts connections on l until Close, when it returns nil. Any
-// other accept error ends Serve and is returned, joined with any error from
+// Serve accepts connections on l until Shutdown or Close, when it returns
+// nil. An accept error in retriedAcceptErrors is logged and Serve accepts
+// again after a wait that grows with each such error in a row. Any other
+// accept error ends Serve and is returned, joined with any error from
 // closing l, even when Close runs meanwhile. Serve closes l whenever it
 // returns.
 func (s *Server) Serve(l net.Listener) error {
 	if !s.trackListener(l) {
 		return closeIgnoringClosed(l)
 	}
+	defer s.goroutines.Done()
 
+	var retryDelay time.Duration
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			return s.stopServing(l, err)
+			if s.isClosed() || !isRetriedAcceptError(err) {
+				return s.stopServing(l, err)
+			}
+			retryDelay = nextRetryDelay(retryDelay)
+			s.log.Warn("wyoming accept failed, retrying", slog.Any("error", err), slog.Duration("delay", retryDelay))
+			s.waitUnlessStopped(retryDelay)
+			continue
 		}
+		retryDelay = 0
 
 		if !s.trackConn(conn) {
 			s.log.Warn("wyoming connection refused", slog.String("remote", conn.RemoteAddr().String()), slog.Int("max_connections", maxConns))
@@ -98,8 +133,124 @@ func (s *Server) Serve(l net.Listener) error {
 			continue
 		}
 
-		go s.serveConn(conn)
+		go func() {
+			defer s.goroutines.Done()
+			s.serveConn(conn)
+		}()
 	}
+}
+
+// isRetriedAcceptError reports whether err is in retriedAcceptErrors.
+func isRetriedAcceptError(err error) bool {
+	for _, target := range retriedAcceptErrors {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func nextRetryDelay(previous time.Duration) time.Duration {
+	if previous == 0 {
+		return acceptRetryMin
+	}
+
+	return min(2*previous, acceptRetryMax)
+}
+
+// waitUnlessStopped returns after delay, or at once when Shutdown or Close
+// runs.
+func (s *Server) waitUnlessStopped(delay time.Duration) {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+	case <-s.stopped:
+	}
+}
+
+// Shutdown stops every Serve call, closes idle connections and refuses new
+// requests on the others. It then waits until each Serve call, each of the
+// requests and each connection's goroutine has returned, or until ctx ends,
+// when it returns ctx.Err(); Close then ends the connections that remain.
+// After Close, Shutdown waits for the goroutines that Close did not.
+func (s *Server) Shutdown(ctx context.Context) error {
+	closeErr := s.closeIdle()
+
+	select {
+	case <-s.drained():
+		return closeErr
+	case <-ctx.Done():
+		return errors.Join(ctx.Err(), closeErr)
+	}
+}
+
+// markClosed runs with s.mu held.
+func (s *Server) markClosed() {
+	if !s.closed {
+		close(s.stopped)
+	}
+	s.closed = true
+}
+
+func (s *Server) closeIdle() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.markClosed()
+
+	errs := make([]error, 0, len(s.listeners)+len(s.conns))
+	for l := range s.listeners {
+		errs = append(errs, closeIgnoringClosed(l))
+	}
+	for conn, busy := range s.conns {
+		if !busy {
+			errs = append(errs, closeIgnoringClosed(conn))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// waitGoroutines runs once, after closed is set, so no Serve call or
+// connection goroutine can start while it waits.
+func (s *Server) waitGoroutines() <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		s.goroutines.Wait()
+		close(done)
+	}()
+
+	return done
+}
+
+// beginWork marks conn busy, unless Shutdown or Close has begun.
+func (s *Server) beginWork(conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return false
+	}
+	if _, tracked := s.conns[conn]; tracked {
+		s.conns[conn] = true
+	}
+
+	return true
+}
+
+// markIdle marks conn idle and reports whether the server still serves.
+func (s *Server) markIdle(conn net.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, tracked := s.conns[conn]; tracked {
+		s.conns[conn] = false
+	}
+
+	return !s.closed
 }
 
 // Close stops every Serve call and closes every open connection. It does not
@@ -108,7 +259,7 @@ func (s *Server) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.closed = true
+	s.markClosed()
 
 	errs := make([]error, 0, len(s.listeners)+len(s.conns))
 	for l := range s.listeners {
@@ -122,14 +273,16 @@ func (s *Server) Close() error {
 }
 
 // stopServing closes l before forgetting it, so Close cannot miss a listener
-// that is still open. A close error never hides the accept error. Only the
-// accept error that Close itself causes means Serve was stopped: Close can
-// also run while a real accept failure is being handled.
+// that is still open. A close error never hides the accept error. Serve was
+// stopped only when the server is closed and the accept error is one that
+// Close causes or one that Serve would have retried: Close can also run
+// while a real accept failure is being handled.
 func (s *Server) stopServing(l net.Listener, acceptErr error) error {
 	closeErr := closeIgnoringClosed(l)
 	s.forgetListener(l)
 
-	if !s.isClosed() || !errors.Is(acceptErr, net.ErrClosed) {
+	stopped := errors.Is(acceptErr, net.ErrClosed) || isRetriedAcceptError(acceptErr)
+	if !s.isClosed() || !stopped {
 		return errors.Join(fmt.Errorf("wyoming accept: %w", acceptErr), closeErr)
 	}
 
@@ -147,6 +300,8 @@ func (s *Server) isClosed() bool {
 	return s.closed
 }
 
+// trackListener counts the Serve call among the goroutines, so Shutdown also
+// waits for a connection that Serve has accepted but not yet tracked.
 func (s *Server) trackListener(l net.Listener) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -155,6 +310,7 @@ func (s *Server) trackListener(l net.Listener) bool {
 		return false
 	}
 	s.listeners[l] = struct{}{}
+	s.goroutines.Add(1)
 
 	return true
 }
@@ -173,7 +329,8 @@ func (s *Server) trackConn(conn net.Conn) bool {
 	if s.closed || len(s.conns) >= maxConns {
 		return false
 	}
-	s.conns[conn] = struct{}{}
+	s.conns[conn] = false
+	s.goroutines.Add(1)
 
 	return true
 }

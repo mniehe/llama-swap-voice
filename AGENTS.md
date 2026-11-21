@@ -1,14 +1,17 @@
 # Project Context
 
 llama-swap-voice is a Go HTTP service that puts OpenAI's audio API
-(`/v1/audio/speech`, `/v1/audio/transcriptions`) in front of llama-swap. It
-decodes uploads, encodes replies (mp3, opus, wav, pcm) and changes speech speed
-in-process; it runs no external programs. `README.md` and the three pages
-under `docs/` are the user-facing contract. `README.md` holds the quick start,
-voices, the common options and the licences. `docs/options.md` holds every
-module option and every environment variable. `docs/api.md` holds the
-endpoints, status codes, formats, limits and shutdown. `docs/qwen-tts-server.md`
-holds the Python server's configuration keys, endpoints and errors.
+(`/v1/audio/speech`, `/v1/audio/transcriptions`) in front of llama-swap. When
+enabled, it also serves the Wyoming protocol on a second TCP port, for Home
+Assistant, through the same pipeline. It decodes uploads, encodes replies
+(mp3, opus, wav, pcm) and changes speech speed in-process; it runs no
+external programs. `README.md` and the three pages under `docs/` are the
+user-facing contract. `README.md` holds the quick start, voices, the common
+options and the licences. `docs/options.md` holds every module option and
+every environment variable. `docs/api.md` holds the endpoints, status codes,
+formats, limits and shutdown of both the HTTP API and the Wyoming listener.
+`docs/qwen-tts-server.md` holds the Python server's configuration keys,
+endpoints and errors.
 
 `python/` holds a second program, `qwen-tts-server`: the Python
 faster-qwen3-tts server that the `qwentts` backend calls on a GPU. Its
@@ -77,7 +80,7 @@ the list above needs confirmation even when it is only a file edit.
   /observability  # slog logger construction (json or console)
   /openai         # OpenAI HTTP entrypoint: handlers, request bounds, response encoding, panic recovery, request log, JSON errors
   /pipeline       # Transport-neutral steps every entrypoint calls: admission pools, request bounds (input characters, upload size, decoded duration), request deadline, the TTS queue, shutdown admission, upload decoding, upstream calls, time-stretch, typed errors
-  /wyoming        # Wyoming TCP entrypoint: bounded event codec, connection state machine, deadlines, describe, ping, transcription
+  /wyoming        # Wyoming TCP entrypoint: bounded event codec, connection state machine, deadlines, describe, ping, transcription, single-event synthesis, Shutdown
   /upstream       # llama-swap client: TTS backends (llamacpp, qwentts), transcription, one retry, no redirects
   /voices         # Finds and checks voice clips at startup; the llamacpp backend reopens the clip on each request
 /nix                    # packages.nix (the build), checks.nix (what nix flake check runs), devshells.nix (nix develop), module.nix (nixosModules.default), llama-swap.nix (the module's llama-swap entries and unit changes), models.nix (pinned GGUFs), qwen-tts-config.nix (the TTS server's generated config)
@@ -243,7 +246,7 @@ hole, or silently corrupts audio:
 - `internal/voices/**`: reads operator files and follows symlinks
 - `internal/upstream/**`: retry, redirect refusal and response bounds
 - `internal/openai/**`: request bounds, response commitment, panic recovery
-- `internal/wyoming/**`: parses untrusted frames, connection bounds (count, idle, read and write deadlines), request cleanup
+- `internal/wyoming/**`: parses untrusted frames, connection bounds (count, idle, read and write deadlines), request cleanup, synthesis and its TTS slot
 - `internal/pipeline/**`: the admission pools, the request bounds (input characters, upload size, decoded duration), the TTS queue, the request deadline, shutdown admission
 - `cmd/llama-swap-voice/**`: limit validation, connection deadlines, the three-step shutdown
 - `go.mod`, `go.sum`, `.golangci.yaml` and `.claude/review/review.yaml`, which holds shell commands that review prep runs

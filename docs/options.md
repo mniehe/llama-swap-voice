@@ -391,7 +391,8 @@ The service reads all its configuration from environment variables. The
 module writes them for you, so you need this table only when you run the
 service by hand or use `extraEnvironment`. Each name starts with
 `LLAMA_SWAP_VOICE_`; the table and the rest of this page leave the prefix
-out. Only `VOICES_DEFAULT` is required.
+out. Only `VOICES_DEFAULT` is required. The service checks the `WYOMING_`
+variables only when `WYOMING_ENABLED` is `true`.
 
 | Variable (`LLAMA_SWAP_VOICE_…`) | Module option | Default | Effect |
 |---|---|---|---|
@@ -415,6 +416,13 @@ out. Only `VOICES_DEFAULT` is required.
 | `SHUTDOWN_GRACE` | `shutdown.grace` | `0s` | Step 1 of [shutdown](api.md#shutdown). |
 | `SHUTDOWN_TOTAL` | `shutdown.total` | `15s` | Step 2 of shutdown. |
 | `SHUTDOWN_HARD` | `shutdown.hard` | `3s` | Step 3 of shutdown. |
+| `WYOMING_ENABLED` | none | `false` | `true` also serves the [Wyoming protocol](api.md#wyoming) on a second port. |
+| `WYOMING_HOST` | none | `127.0.0.1` | The address the Wyoming listener binds. Write an IPv6 address without brackets, such as `::1`. |
+| `WYOMING_PORT` | none | `10300` | The Wyoming port, 1 to 65535. The host and port together must differ from `HOST` and `PORT`. |
+| `WYOMING_LANGUAGES` | none | `en` | The languages that `info` lists for the ASR model and each voice, separated by commas. |
+| `WYOMING_SPEED` | none | `1.0` | The speech speed for every Wyoming synthesis, 0.25 to 4. |
+| `WYOMING_STREAMING` | none | `sentences` | `sentences` or `whole`. The service checks it but does not use it yet: it does not offer streamed synthesis. |
+| `WYOMING_STREAMINGMAXCHARS` | none | `300` | 1 to `TTS_MAXINPUTCHARS`. The service checks it but does not use it yet. |
 
 Set a variable that has no option through `extraEnvironment`:
 
