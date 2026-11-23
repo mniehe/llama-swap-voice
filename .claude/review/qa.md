@@ -40,7 +40,7 @@ frames.
   `TestNormaliseUpload_OpusAtLimit_Passes` next to `..._OpusOverLimit_TooLong`
   is the shape.
 - `tools/test.txt` is `go test ./...`; `tools/race.txt` is
-  `go test -race ./...`, every package, `internal/audio` included.
+  `go test -race -timeout 30m ./...`, every package, `internal/audio` included.
 
 ## Lenses, in priority order
 
