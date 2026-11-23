@@ -11,6 +11,14 @@ reads every voice clip as the real engine does, and answers JSON /v1/tts
 with a fixed WAV. Its record goes in the cache root the module must
 create; it never creates that directory itself.
 
+Each request record also holds how the request was framed: its HTTP
+version, Content-Length, Transfer-Encoding and Connection headers and the
+bytes read, and the system-wide monotonic clock when it was read, which the
+test compares with its client's. Each reply to a request adds a response
+record: the declared Content-Length, whether the headers went out, the body
+bytes the kernel accepted and the write error, if any, so a broken reply
+shows which side closed first.
+
 A request body goes to its own file, named by its SHA-256, in the directory
 `<record>.bodies`, and the record holds only the digest. The test driver
 reads guest output over a console that drops bytes when the host is slow,
@@ -24,6 +32,7 @@ import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TRANSCRIPT = "language English<asr_text>The kitchen lights are off."
@@ -84,19 +93,37 @@ class Handler(BaseHTTPRequestHandler):
             "path": self.path,
             "content_type": content_type,
             "body_sha256": recorder.keep_body(body),
+            "monotonic": time.monotonic(),
+            "framing": {
+                "version": self.request_version,
+                "content_length": self.headers.get("Content-Length"),
+                "transfer_encoding": self.headers.get("Transfer-Encoding"),
+                "connection": self.headers.get("Connection"),
+                "bytes_read": len(body),
+            },
         })
         route = self.server.routes.get(self.path)
         if route is None:
-            self.reply(404, "application/json", b'{"error":{"message":"no route"}}')
-            return
-        self.reply(*route(content_type, body))
+            response = self.reply(404, "application/json", b'{"error":{"message":"no route"}}')
+        else:
+            response = self.reply(*route(content_type, body))
+        recorder.write({"event": "response", "path": self.path, **response})
 
     def reply(self, code, content_type, body):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        response = {"status": code, "content_length": len(body), "headers_sent": False, "bytes_written": 0, "error": None}
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            response["headers_sent"] = True
+            # send, not sendall, so a failed write still says how far it got.
+            view = memoryview(body)
+            while response["bytes_written"] < len(body):
+                response["bytes_written"] += self.connection.send(view[response["bytes_written"]:])
+        except OSError as err:
+            response["error"] = f"{type(err).__name__}: {err}"
+        return response
 
     def log_message(self, *_args):
         pass

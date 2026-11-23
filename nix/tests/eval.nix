@@ -57,13 +57,16 @@
   };
   failsWith = failsWithIn {};
 
+  # A value its option's type refuses throws while the assertions are read,
+  # so that is caught too, and the case fails rather than the whole check.
   evaluates = name: settings: let
-    failures = moduleFailures settings;
+    messages = moduleFailures settings;
+    failures = builtins.tryEval (builtins.deepSeq messages messages);
     built = builtins.tryEval (evaluate settings).config.system.build.toplevel.drvPath;
   in {
     inherit name;
-    ok = failures == [] && built.success;
-    detail = "failed: ${show failures}; toplevel evaluated: ${show built.success}";
+    ok = failures.success && failures.value == [] && built.success;
+    detail = "assertions evaluated: ${show failures.success}; failed: ${show (lib.optionals failures.success failures.value)}; toplevel evaluated: ${show built.success}";
   };
 
   holds = name: ok: detail: {inherit name ok detail;};
@@ -78,6 +81,28 @@
     inherit name;
     ok = !forced.success && !(option.type.check value);
     detail = "evaluation succeeded: ${show forced.success}; the option's type accepts ${show value}: ${show (option.type.check value)}";
+  };
+
+  # A list type checks only that the value is a list; its elements are
+  # checked when the definitions merge, so the element type is asked here.
+  refusesElement = name: path: element: let
+    evaluated = evaluate (lib.recursiveUpdate base (lib.setAttrByPath path [element]));
+    elementType = (lib.getAttrFromPath path evaluated.options.services.llama-swap-voice).type.nestedTypes.elemType;
+    forced = builtins.tryEval (builtins.deepSeq (lib.getAttrFromPath path evaluated.config.services.llama-swap-voice) true);
+  in {
+    inherit name;
+    ok = !forced.success && !(elementType.check element);
+    detail = "evaluation succeeded: ${show forced.success}; the element type accepts ${show element}: ${show (elementType.check element)}";
+  };
+
+  acceptsElement = name: path: element: let
+    evaluated = evaluate (lib.recursiveUpdate base (lib.setAttrByPath path [element]));
+    elementType = (lib.getAttrFromPath path evaluated.options.services.llama-swap-voice).type.nestedTypes.elemType;
+    forced = builtins.tryEval (builtins.deepSeq (lib.getAttrFromPath path evaluated.config.services.llama-swap-voice) true);
+  in {
+    inherit name;
+    ok = forced.success && elementType.check element;
+    detail = "evaluation succeeded: ${show forced.success}; the element type accepts ${show element}: ${show (elementType.check element)}";
   };
 
   serviceConfig = settings: (evaluate settings).config.systemd.services.llama-swap-voice.serviceConfig;
@@ -868,13 +893,144 @@
       "cpu: ${chosen "cpu"}; vulkan: ${chosen "vulkan"}; cuda: ${chosen "cuda"}")
   ];
 
+  wyomingPrefix = "${prefix}WYOMING_";
+  wyomingEnv = settings: lib.filterAttrs (name: _: lib.hasPrefix wyomingPrefix name) (serviceEnv settings);
+  wyomingOn = settings: lib.recursiveUpdate base {wyoming = {enable = true;} // settings;};
+  firewallPorts = settings: (evaluate settings).config.networking.firewall.allowedTCPPorts;
+  # Nix strings have no \u escape; JSON's gives the character from its code point.
+  character = code: builtins.fromJSON ''"\u${code}"'';
+  otherWyomingPort = 10301;
+
+  wyomingCases = [
+    (let
+      env = wyomingEnv base;
+    in
+      holds "wyoming.enable = false sets no WYOMING_ variable" (env == {}) "WYOMING_ variables are ${show env}")
+
+    (let
+      env = wyomingEnv (wyomingOn {
+        host = "0.0.0.0";
+        port = 10400;
+        languages = ["en" "de"];
+        speed = 1.5;
+        streaming = "whole";
+        streamingMaxChars = 200;
+      });
+      want = {
+        "${wyomingPrefix}ENABLED" = "true";
+        "${wyomingPrefix}HOST" = "0.0.0.0";
+        "${wyomingPrefix}PORT" = "10400";
+        "${wyomingPrefix}LANGUAGES" = "en,de";
+        "${wyomingPrefix}SPEED" = "1.5";
+        "${wyomingPrefix}STREAMING" = "whole";
+        "${wyomingPrefix}STREAMINGMAXCHARS" = "200";
+      };
+    in
+      holds "wyoming.enable = true sets all seven WYOMING_ variables from the options, with the languages comma-joined"
+      (env == want)
+      "WYOMING_ variables are ${show env}, want ${show want}")
+
+    (let
+      env = wyomingEnv (wyomingOn {});
+      want = {
+        "${wyomingPrefix}ENABLED" = "true";
+        "${wyomingPrefix}HOST" = "127.0.0.1";
+        "${wyomingPrefix}PORT" = "10300";
+        "${wyomingPrefix}LANGUAGES" = "en";
+        "${wyomingPrefix}SPEED" = "1.0";
+        "${wyomingPrefix}STREAMING" = "sentences";
+        "${wyomingPrefix}STREAMINGMAXCHARS" = "300";
+      };
+    in
+      holds "the wyoming defaults match the service's defaults" (env == want) "WYOMING_ variables are ${show env}, want ${show want}")
+
+    (refuses "wyoming.streaming refuses a value outside sentences and whole" ["wyoming" "streaming"] "other")
+    (refuses "wyoming.speed 5 is refused" ["wyoming" "speed"] 5)
+    (refuses "wyoming.speed below 0.25 is refused" ["wyoming" "speed"] 0.2)
+    (refusesElement "an empty wyoming language is refused" ["wyoming" "languages"] "")
+    (refuses "an empty wyoming.languages list is refused" ["wyoming" "languages"] [])
+    (refusesElement "a wyoming language holding a comma is refused" ["wyoming" "languages"] "en,")
+    (refusesElement "a wyoming language of only a carriage return is refused" ["wyoming" "languages"] "\r")
+    (refusesElement "a wyoming language of only a no-break space is refused" ["wyoming" "languages"] (character "00a0"))
+    (acceptsElement "the wyoming language en is accepted" ["wyoming" "languages"] "en")
+    (refuses "wyoming.port 0 is refused" ["wyoming" "port"] 0)
+    (refuses "wyoming.streamingMaxChars 0 is refused" ["wyoming" "streamingMaxChars"] 0)
+
+    (failsWith "a wyoming.port equal to port on the same host fails naming both"
+      (wyomingOn {port = 8920;})
+      ["${opt}.wyoming.port" "${opt}.port"])
+
+    (evaluates "a wyoming.port equal to port on another host evaluates" (wyomingOn {
+      host = "::1";
+      port = 8920;
+    }))
+
+    (evaluates "wyoming.speed 0.25 evaluates" (wyomingOn {speed = 0.25;}))
+    (evaluates "wyoming.speed 4.0 evaluates" (wyomingOn {speed = 4.0;}))
+
+    (evaluates "wyoming.enable = false skips the Wyoming assertions, so tts.maxInputChars below wyoming.streamingMaxChars evaluates"
+      (lib.recursiveUpdate base {tts.maxInputChars = 200;}))
+
+    (evaluates "wyoming.streamingMaxChars equal to the default TTS_MAXINPUTCHARS evaluates"
+      (wyomingOn {streamingMaxChars = 4096;}))
+
+    (failsWith "wyoming.streamingMaxChars above tts.maxInputChars fails"
+      (lib.recursiveUpdate (wyomingOn {}) {tts.maxInputChars = 200;})
+      ["${opt}.wyoming.streamingMaxChars" "${opt}.tts.maxInputChars" "TTS_MAXINPUTCHARS"])
+
+    (failsWith "wyoming.streamingMaxChars above the default TTS_MAXINPUTCHARS fails"
+      (wyomingOn {streamingMaxChars = 5000;})
+      ["${opt}.wyoming.streamingMaxChars" "TTS_MAXINPUTCHARS"])
+
+    (failsWith "an extraEnvironment TTS_MAXINPUTCHARS below wyoming.streamingMaxChars fails"
+      (lib.recursiveUpdate (wyomingOn {}) {extraEnvironment."${prefix}TTS_MAXINPUTCHARS" = "100";})
+      ["${opt}.wyoming.streamingMaxChars" "TTS_MAXINPUTCHARS"])
+
+    (evaluates "an extraEnvironment TTS_MAXINPUTCHARS that raises the limit allows a larger wyoming.streamingMaxChars"
+      (lib.recursiveUpdate (wyomingOn {streamingMaxChars = 5000;}) {extraEnvironment."${prefix}TTS_MAXINPUTCHARS" = "8000";}))
+
+    (failsWith "an extraEnvironment WYOMING_STREAMINGMAXCHARS above the effective TTS_MAXINPUTCHARS fails"
+      (lib.recursiveUpdate (wyomingOn {}) {extraEnvironment."${wyomingPrefix}STREAMINGMAXCHARS" = "5000";})
+      ["${opt}.wyoming.streamingMaxChars" "TTS_MAXINPUTCHARS"])
+
+    (failsWith "an invalid WYOMING_STREAMINGMAXCHARS override fails naming the variable"
+      (base // {extraEnvironment."${wyomingPrefix}STREAMINGMAXCHARS" = "lots";})
+      ["${opt}.extraEnvironment.${wyomingPrefix}STREAMINGMAXCHARS" "lots"])
+
+    (evaluates "wyoming.host ::1 evaluates" (wyomingOn {host = "::1";}))
+
+    (failsWith "a bracketed wyoming.host fails naming the option"
+      (wyomingOn {host = "[::1]";})
+      ["${opt}.wyoming.host" "[::1]"])
+
+    (let
+      ports = firewallPorts (wyomingOn {
+        port = otherWyomingPort;
+        openFirewall = true;
+      });
+    in
+      holds "wyoming.openFirewall = true opens wyoming.port and nothing else" (ports == [otherWyomingPort]) "allowedTCPPorts is ${show ports}, want ${show [otherWyomingPort]}")
+
+    (let
+      ports = firewallPorts (wyomingOn {});
+    in
+      holds "wyoming.openFirewall = false opens no port" (ports == []) "allowedTCPPorts is ${show ports}")
+
+    (let
+      ports = firewallPorts (lib.recursiveUpdate base {wyoming.openFirewall = true;});
+    in
+      holds "wyoming.openFirewall without wyoming.enable opens no port" (ports == []) "allowedTCPPorts is ${show ports}")
+  ];
+
+  allCases = cases ++ swapCases ++ wyomingCases;
+
   report = lib.concatMapStrings (c:
     if c.ok
     then "PASS ${c.name}\n"
     else "FAIL ${c.name}: ${c.detail}\n")
-  (cases ++ swapCases);
+  allCases;
 
-  failed = lib.count (c: !c.ok) (cases ++ swapCases);
+  failed = lib.count (c: !c.ok) allCases;
 in
   pkgs.runCommand "llama-swap-voice-module-eval" {
     inherit report;

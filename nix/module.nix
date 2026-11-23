@@ -118,6 +118,7 @@ flakeSelf: {
     TTS_MAXINPUTCHARS = positiveInteger;
     UPSTREAM_TTSCONCURRENCY = positiveInteger;
     REQUEST_MAXCONCURRENT = positiveInteger;
+    WYOMING_STREAMINGMAXCHARS = positiveInteger;
   };
 
   # The service's own defaults (cmd/llama-swap-voice/config.go), for the
@@ -126,6 +127,7 @@ flakeSelf: {
     TTS_MAXINPUTCHARS = 4096;
     UPSTREAM_TTSCONCURRENCY = 1;
     REQUEST_MAXCONCURRENT = 4;
+    WYOMING_STREAMINGMAXCHARS = 300;
   };
 
   rawValue = name: environment."${envPrefix}${name}" or null;
@@ -298,24 +300,90 @@ flakeSelf: {
     }
   ];
 
-  generated = {
-    HOST = cfg.host;
-    PORT = toString cfg.port;
-    UPSTREAM_URL = cfg.upstreamURL;
-    UPSTREAM_TTSBACKEND = cfg.tts.backend;
-    UPSTREAM_TTSCONCURRENCY = cfg.upstream.ttsConcurrency;
-    UPSTREAM_TTSMODEL = whenIntegrated ttsModelName;
-    UPSTREAM_ASRMODEL = whenIntegrated cfg.models.asr.name;
-    VOICES_DIR = voicesDir;
-    VOICES_DEFAULT = cfg.defaultVoice;
-    TTS_MAXINPUTCHARS = cfg.tts.maxInputChars;
-    REQUEST_TIMEOUT = cfg.request.timeout;
-    REQUEST_MAXCONCURRENT = cfg.request.maxConcurrent;
-    REQUEST_MAXCONCURRENTTTS = cfg.request.maxConcurrentTTS;
-    SHUTDOWN_GRACE = cfg.shutdown.grace;
-    SHUTDOWN_TOTAL = cfg.shutdown.total;
-    SHUTDOWN_HARD = cfg.shutdown.hard;
-  };
+  generated =
+    {
+      HOST = cfg.host;
+      PORT = toString cfg.port;
+      UPSTREAM_URL = cfg.upstreamURL;
+      UPSTREAM_TTSBACKEND = cfg.tts.backend;
+      UPSTREAM_TTSCONCURRENCY = cfg.upstream.ttsConcurrency;
+      UPSTREAM_TTSMODEL = whenIntegrated ttsModelName;
+      UPSTREAM_ASRMODEL = whenIntegrated cfg.models.asr.name;
+      VOICES_DIR = voicesDir;
+      VOICES_DEFAULT = cfg.defaultVoice;
+      TTS_MAXINPUTCHARS = cfg.tts.maxInputChars;
+      REQUEST_TIMEOUT = cfg.request.timeout;
+      REQUEST_MAXCONCURRENT = cfg.request.maxConcurrent;
+      REQUEST_MAXCONCURRENTTTS = cfg.request.maxConcurrentTTS;
+      SHUTDOWN_GRACE = cfg.shutdown.grace;
+      SHUTDOWN_TOTAL = cfg.shutdown.total;
+      SHUTDOWN_HARD = cfg.shutdown.hard;
+    }
+    // lib.optionalAttrs cfg.wyoming.enable {
+      WYOMING_ENABLED = "true";
+      WYOMING_HOST = cfg.wyoming.host;
+      WYOMING_PORT = cfg.wyoming.port;
+      WYOMING_LANGUAGES = lib.concatStringsSep "," cfg.wyoming.languages;
+      # toString would round the speed to six decimals; JSON keeps it exact.
+      WYOMING_SPEED = builtins.toJSON cfg.wyoming.speed;
+      WYOMING_STREAMING = cfg.wyoming.streaming;
+      WYOMING_STREAMINGMAXCHARS = cfg.wyoming.streamingMaxChars;
+    };
+
+  # Every character Go's unicode.IsSpace accepts. Nix strings have no \u
+  # escape, so JSON decodes each code point.
+  goSpaces = map (code: builtins.fromJSON ''"\u${code}"'') [
+    "0009"
+    "000a"
+    "000b"
+    "000c"
+    "000d"
+    "0020"
+    "0085"
+    "00a0"
+    "1680"
+    "2000"
+    "2001"
+    "2002"
+    "2003"
+    "2004"
+    "2005"
+    "2006"
+    "2007"
+    "2008"
+    "2009"
+    "200a"
+    "2028"
+    "2029"
+    "202f"
+    "205f"
+    "3000"
+  ];
+  onlySpace = value: builtins.replaceStrings goSpaces (map (_: "") goSpaces) value == "";
+
+  # The service splits WYOMING_LANGUAGES at commas, trims each part with
+  # strings.TrimSpace and refuses an empty one.
+  languageTag =
+    types.addCheck types.str (value: !lib.hasInfix "," value && !onlySpace value)
+    // {description = "string without a comma that is not empty or only whitespace";};
+
+  wyomingAssertions = let
+    wyomingOpt = "${opt}.wyoming";
+    w = cfg.wyoming;
+  in [
+    {
+      assertion = !(w.host == cfg.host && w.port == cfg.port);
+      message = "${wyomingOpt}.host and ${wyomingOpt}.port must differ from ${opt}.host and ${opt}.port; both are ${w.host} port ${toString w.port}, and the service refuses to start with one address for both listeners.";
+    }
+    {
+      assertion = !(lib.hasInfix "[" w.host || lib.hasInfix "]" w.host);
+      message = "${wyomingOpt}.host is \"${w.host}\"; write an IPv6 address without brackets, such as ::1.";
+    }
+    {
+      assertion = effectiveInteger "WYOMING_STREAMINGMAXCHARS" <= effectiveInteger "TTS_MAXINPUTCHARS";
+      message = "${wyomingOpt}.streamingMaxChars (WYOMING_STREAMINGMAXCHARS, ${toString (effectiveInteger "WYOMING_STREAMINGMAXCHARS")}) must be at most ${opt}.tts.maxInputChars (TTS_MAXINPUTCHARS, ${toString (effectiveInteger "TTS_MAXINPUTCHARS")}), extraEnvironment included.";
+    }
+  ];
 
   environment =
     lib.mapAttrs' (name: value: lib.nameValuePair "${envPrefix}${name}" (toString value))
@@ -431,6 +499,9 @@ in {
         loopback, in systemd's IPAddressAllow= syntax. Everything else is
         denied, in both directions. Name resolution goes through the
         resolver's address, so a DNS upstream name needs that allowed too.
+        With wyoming.enable, list the Wyoming clients' network here. The list
+        covers the whole unit, so an address allowed for Wyoming may also
+        reach the HTTP port when host is a reachable address.
       '';
     };
 
@@ -469,6 +540,86 @@ in {
       grace = durationLimit duration "How long readiness reports 503 before the listener closes (SHUTDOWN_GRACE).";
       total = durationLimit positiveDuration "How long in-flight requests get to finish (SHUTDOWN_TOTAL).";
       hard = durationLimit positiveDuration "How long cancelled requests get to wind down (SHUTDOWN_HARD).";
+    };
+
+    wyoming = {
+      enable = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Also serve the Wyoming protocol, which Home Assistant speaks, on a
+          second TCP port (WYOMING_ENABLED). Clients on another host need
+          their network in ipAddressAllow and an open firewall port. The
+          allow list is unit-wide, so an address allowed for Wyoming may
+          also reach the HTTP port when host is a reachable address.
+        '';
+      };
+
+      host = mkOption {
+        type = types.str;
+        default = "127.0.0.1";
+        example = "0.0.0.0";
+        description = ''
+          Address the Wyoming listener binds (WYOMING_HOST). An IPv6 address
+          is written without brackets, such as ::1. A non-loopback address
+          also needs the clients' network in ipAddressAllow.
+        '';
+      };
+
+      port = mkOption {
+        type = types.ints.between 1 65535;
+        default = 10300;
+        description = "Port the Wyoming listener binds (WYOMING_PORT). The pair wyoming.host and wyoming.port must differ from the pair host and port.";
+      };
+
+      languages = mkOption {
+        type = types.nonEmptyListOf languageTag;
+        default = ["en"];
+        example = ["en" "de"];
+        description = "Languages that the info event lists for the ASR model and for each voice (WYOMING_LANGUAGES).";
+      };
+
+      speed = mkOption {
+        type = types.numbers.between 0.25 4.0;
+        default = 1.0;
+        description = "Speech speed for every Wyoming synthesis (WYOMING_SPEED). The service changes the tempo and keeps the pitch; 1.0 leaves the audio untouched.";
+      };
+
+      streaming = mkOption {
+        type = types.enum ["sentences" "whole"];
+        default = "sentences";
+        description = ''
+          How a streamed synthesis is spoken (WYOMING_STREAMING). sentences
+          speaks each sentence as it completes and advertises streaming in
+          the info event; whole speaks the text after synthesize-stop and
+          advertises no streaming. Home Assistant reads this from info,
+          which it polls every 30 seconds, so a change reaches it within
+          about 30 seconds without a reload.
+        '';
+      };
+
+      streamingMaxChars = mkOption {
+        type = types.ints.positive;
+        default = 300;
+        description = ''
+          In sentences mode, the most characters of the sentences that one
+          synthesize-chunk completes to join into one request
+          (WYOMING_STREAMINGMAXCHARS). At most TTS_MAXINPUTCHARS, which also
+          bounds a stream's unspoken text plus an arriving chunk.
+        '';
+      };
+
+      openFirewall = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Open wyoming.port, and no other port, in the NixOS firewall. The
+          clients' network must also be in ipAddressAllow. The rule follows
+          wyoming.port and wyoming.enable only: an extraEnvironment override
+          of LLAMA_SWAP_VOICE_WYOMING_PORT or LLAMA_SWAP_VOICE_WYOMING_ENABLED
+          does not change it.
+        '';
+      };
     };
 
     voices = mkOption {
@@ -510,10 +661,15 @@ in {
       example = {LLAMA_SWAP_VOICE_LOG_LEVEL = "debug";};
       description = ''
         Extra environment variables for the service, by full name. They win
-        over the variables the module generates. The module reads the
-        shutdown durations, TTS_MAXINPUTCHARS, UPSTREAM_TTSCONCURRENCY and
-        REQUEST_MAXCONCURRENT after this merge, and evaluation fails when an
-        override is not a value the matching option accepts.
+        over the variables the module generates. Evaluation checks only the
+        variables the module reads back after this merge: the shutdown
+        durations, TTS_MAXINPUTCHARS, UPSTREAM_TTSCONCURRENCY,
+        REQUEST_MAXCONCURRENT and WYOMING_STREAMINGMAXCHARS. It fails when
+        one of them is not a value the matching option accepts. The service
+        checks every other override, the Wyoming variables included, when it
+        starts, and refuses to start on a bad value. The check that the
+        Wyoming host and port differ from the HTTP ones compares the
+        options, not overrides.
       '';
     };
   };
@@ -531,7 +687,10 @@ in {
         }
       ]
       ++ lib.concatLists (lib.mapAttrsToList voiceAssertions cfg.voices)
-      ++ checkedAssertions;
+      ++ checkedAssertions
+      ++ lib.optionals cfg.wyoming.enable wyomingAssertions;
+
+    networking.firewall.allowedTCPPorts = lib.mkIf (cfg.wyoming.enable && cfg.wyoming.openFirewall) [cfg.wyoming.port];
 
     users.users = lib.mkIf (cfg.user == defaultName) {
       ${defaultName} = {

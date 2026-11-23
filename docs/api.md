@@ -138,7 +138,8 @@ because the system is short of file descriptors, buffers or memory, the
 listener logs a warning and tries again after a pause that grows from 5 ms
 to 1 s, and the service keeps running.
 [Environment variables](options.md#environment-variables) lists the
-`WYOMING_` settings. Both listeners share one pipeline, so a Wyoming request
+`WYOMING_` settings, and [Wyoming](options.md#wyoming) the module options
+that set them. Both listeners share one pipeline, so a Wyoming request
 takes the same transcription or speech slot as an HTTP request.
 
 ### Events

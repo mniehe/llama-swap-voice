@@ -33,7 +33,7 @@ All options are under `services.llama-swap-voice`. Related pages:
 
 The sandbox lets the service exchange packets with loopback only. A remote
 llama-swap, the DNS resolver that finds it, and each client of a non-loopback
-`host` must be in `ipAddressAllow`.
+`host` or `wyoming.host` must be in `ipAddressAllow`.
 
 The module derives `upstreamURL` from `services.llama-swap`. A wildcard
 listen address, such as `0.0.0.0` or `[::]`, becomes loopback. The URL uses
@@ -173,6 +173,63 @@ The module sets the unit's `TimeoutStopSec` to cover all three steps. The
 value is the sum of the durations you set, plus 30 seconds, and at least 90
 seconds.
 
+## Wyoming
+
+These options run the [Wyoming listener](api.md#wyoming), which Home
+Assistant connects to. [Home Assistant](../README.md#home-assistant) in the
+README shows a complete setup.
+
+| Option | Type | Default | Effect |
+|---|---|---|---|
+| `wyoming.enable` | boolean | `false` | Serves the Wyoming protocol on a second TCP port. |
+| `wyoming.host` | string | `"127.0.0.1"` | The address the listener binds. Write an IPv6 address without brackets, such as `"::1"`. |
+| `wyoming.port` | integer, 1 to 65535 | `10300` | The port the listener binds. |
+| `wyoming.languages` | non-empty list of strings | `["en"]` | The languages that `info` lists for the ASR model and for each voice. |
+| `wyoming.speed` | number, 0.25 to 4 | `1.0` | The speed of every Wyoming synthesis. The service changes the tempo and keeps the pitch. At 1.0 it leaves the audio as the model made it. |
+| `wyoming.streaming` | `"sentences"` or `"whole"` | `"sentences"` | How the service speaks a [streamed synthesis](api.md#streamed-synthesis). `"sentences"` speaks each sentence as it completes and advertises streaming in `info`. `"whole"` speaks the whole text after `synthesize-stop` and advertises no streaming. |
+| `wyoming.streamingMaxChars` | integer, 1 or more | `300` | In `"sentences"` mode, the most characters of the sentences that one `synthesize-chunk` completes to join into one request. A longer sentence is spoken whole. |
+| `wyoming.openFirewall` | boolean | `false` | Opens `wyoming.port`, and no other port, in the NixOS firewall. The rule follows `wyoming.port` and `wyoming.enable` only: an `extraEnvironment` override of `LLAMA_SWAP_VOICE_WYOMING_PORT` or `LLAMA_SWAP_VOICE_WYOMING_ENABLED` does not change it. |
+
+Home Assistant asks for `info` every 30 seconds and replaces its speech
+service when the answer changes. It reads whether the service streams from
+that answer. A change to `wyoming.streaming` therefore reaches Home
+Assistant within about 30 seconds, without a reload. Home Assistant sorts
+the voices by description or name, so the order in `info` does not control
+its list. The default voice is the one whose description ends in
+`(default)`.
+
+`wyoming.streamingMaxChars` must be at most `tts.maxInputChars`, 4096 by
+default. `tts.maxInputChars` also bounds a stream: the text not yet spoken
+plus an arriving `synthesize-chunk` may not exceed it.
+
+A stream holds no speech slot. Each sentence takes one of the
+`request.maxConcurrentTTS` slots, 8 by default, which HTTP speech requests
+share. When every slot is held, a sentence fails with the error `busy`.
+Raise `request.maxConcurrentTTS` if many satellites speak at once.
+
+The sandbox applies one `ipAddressAllow` list to the whole unit, so it
+cannot tell the two ports apart. An address that you allow for Wyoming can
+also reach the HTTP port when `host` is an address that it can reach. Keep
+`host` on loopback if only Home Assistant should come in from outside.
+
+Evaluation fails, and names the option, in these cases:
+
+- `wyoming.host` and `wyoming.port` are the same as `host` and `port`.
+- `wyoming.host` contains `[` or `]`.
+- `wyoming.streamingMaxChars` is above `tts.maxInputChars`. Both values
+  are read after `extraEnvironment` is merged.
+- `wyoming.languages` is empty, or one of its entries is empty, is only
+  whitespace or contains a comma.
+- `wyoming.speed` is outside 0.25 to 4, or `wyoming.streaming` is not
+  `"sentences"` or `"whole"`.
+
+Except for `wyoming.streamingMaxChars`, these checks read the options, not
+`extraEnvironment`. The service checks an override of a Wyoming variable when
+it starts, and refuses to start on a bad value. The host and port check
+compares the options only: an override that gives both listeners one address
+passes evaluation and fails at start, and an override that separates two equal
+options does not clear the evaluation error.
+
 ## Packages, accounts, paths and model files
 
 | Option | Type | Default | Effect |
@@ -181,7 +238,7 @@ seconds.
 | `user` | string | `"llama-swap-voice"` | The user the service runs as. The module creates it only under the default name. |
 | `group` | string | `"llama-swap-voice"` | The group the service runs as. The module creates it only under the default name. Under `qwentts`, llama-swap's user joins it, so do not share it with other services. |
 | `stateDir` | string | `"/var/lib/llama-swap-voice"` | A directory for this module alone. The voices directory is `<stateDir>/voices`. Use an absolute path with no `%` and no slash at the end. |
-| `extraEnvironment` | attribute set of strings | `{}` | Extra [environment variables](#environment-variables) for the service, by full name. They override the variables the module writes. |
+| `extraEnvironment` | attribute set of strings | `{}` | Extra [environment variables](#environment-variables) for the service, by full name. They override the variables the module writes. Evaluation checks only the [variables the module reads back](#variables-the-module-reads-back). The service checks every other override, the Wyoming variables included, when it starts, and refuses to start on a bad value. |
 | `voiceNames` | list of strings, read-only | the declared names | The names of the declared voices, sorted. Other modules can read it. |
 | `llamaSwap.group.name` | string | `"voice"` | The name of the group. |
 | `llamaSwap.group.location` | `"legacy"` or `"routing"` | `"legacy"` | Where the module writes the group: the top-level `groups` key, or `routing.router.settings.groups`. llama-swap refuses a configuration that uses both, so match the rest of your settings. |
@@ -206,13 +263,15 @@ is a build number passes unchecked.
 
 ### Variables the module reads back
 
-The module reads six [environment variables](#environment-variables) after
-it merges `extraEnvironment`:
+The module reads seven [environment variables](#environment-variables)
+after it merges `extraEnvironment`:
 
 - `SHUTDOWN_GRACE`, `SHUTDOWN_TOTAL` and `SHUTDOWN_HARD` set the unit's
   `TimeoutStopSec`.
 - `TTS_MAXINPUTCHARS`, `UPSTREAM_TTSCONCURRENCY` and `REQUEST_MAXCONCURRENT`
   set values in the llama-swap entries.
+- `TTS_MAXINPUTCHARS` and `WYOMING_STREAMINGMAXCHARS` are compared with
+  each other when `wyoming.enable` is on.
 
 A value from `extraEnvironment` therefore replaces the option it overrides.
 Evaluation fails, and names the variable, if the option would not accept the
@@ -232,6 +291,7 @@ These cases always fail:
 - A clip path is relative or does not end in `.wav` or `.mp3`.
 - Under `qwentts`: a clip does not end in `.wav`, a transcript is empty, or a
   voice has an `instruct` but no transcript.
+- With `wyoming.enable` on: a setting in the list under [Wyoming](#wyoming).
 
 With `llamaSwap.enable` on, evaluation also fails in these cases:
 
@@ -416,13 +476,13 @@ variables only when `WYOMING_ENABLED` is `true`.
 | `SHUTDOWN_GRACE` | `shutdown.grace` | `0s` | Step 1 of [shutdown](api.md#shutdown). |
 | `SHUTDOWN_TOTAL` | `shutdown.total` | `15s` | Step 2 of shutdown. |
 | `SHUTDOWN_HARD` | `shutdown.hard` | `3s` | Step 3 of shutdown. |
-| `WYOMING_ENABLED` | none | `false` | `true` also serves the [Wyoming protocol](api.md#wyoming) on a second port. |
-| `WYOMING_HOST` | none | `127.0.0.1` | The address the Wyoming listener binds. Write an IPv6 address without brackets, such as `::1`. |
-| `WYOMING_PORT` | none | `10300` | The Wyoming port, 1 to 65535. The host and port together must differ from `HOST` and `PORT`. |
-| `WYOMING_LANGUAGES` | none | `en` | The languages that `info` lists for the ASR model and each voice, separated by commas. |
-| `WYOMING_SPEED` | none | `1.0` | The speech speed for every Wyoming synthesis, 0.25 to 4. |
-| `WYOMING_STREAMING` | none | `sentences` | How the service speaks a [streamed synthesis](api.md#streamed-synthesis): `sentences` speaks each sentence as it completes and advertises streaming in `info`; `whole` speaks the whole text after `synthesize-stop` and advertises no streaming. |
-| `WYOMING_STREAMINGMAXCHARS` | none | `300` | 1 to `TTS_MAXINPUTCHARS`. In `sentences` mode, the most characters of the sentences that one `synthesize-chunk` completes to join into one request. A longer sentence is spoken whole. |
+| `WYOMING_ENABLED` | `wyoming.enable` | `false` | `true` also serves the [Wyoming protocol](api.md#wyoming) on a second port. |
+| `WYOMING_HOST` | `wyoming.host` | `127.0.0.1` | The address the Wyoming listener binds. Write an IPv6 address without brackets, such as `::1`. |
+| `WYOMING_PORT` | `wyoming.port` | `10300` | The Wyoming port, 1 to 65535. The host and port together must differ from `HOST` and `PORT`. |
+| `WYOMING_LANGUAGES` | `wyoming.languages` | `en` | The languages that `info` lists for the ASR model and each voice, separated by commas. |
+| `WYOMING_SPEED` | `wyoming.speed` | `1.0` | The speech speed for every Wyoming synthesis, 0.25 to 4. |
+| `WYOMING_STREAMING` | `wyoming.streaming` | `sentences` | How the service speaks a [streamed synthesis](api.md#streamed-synthesis): `sentences` speaks each sentence as it completes and advertises streaming in `info`; `whole` speaks the whole text after `synthesize-stop` and advertises no streaming. |
+| `WYOMING_STREAMINGMAXCHARS` | `wyoming.streamingMaxChars` | `300` | 1 to `TTS_MAXINPUTCHARS`. In `sentences` mode, the most characters of the sentences that one `synthesize-chunk` completes to join into one request. A longer sentence is spoken whole. The text of a stream not yet spoken plus an arriving chunk may not exceed `TTS_MAXINPUTCHARS`. |
 
 Set a variable that has no option through `extraEnvironment`:
 
@@ -430,5 +490,6 @@ Set a variable that has no option through `extraEnvironment`:
 services.llama-swap-voice.extraEnvironment.LLAMA_SWAP_VOICE_LOG_LEVEL = "debug";
 ```
 
-The module writes the two model names only when `llamaSwap.enable` is on. If
+The module writes the two model names only when `llamaSwap.enable` is on,
+and the `WYOMING_` variables only when `wyoming.enable` is on. If
 a value is wrong at startup, the service lists every problem and exits.
