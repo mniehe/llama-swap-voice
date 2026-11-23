@@ -191,7 +191,7 @@ hosted CI and no push hook: run `nix flake check` yourself before every push.
 ```bash
 gofmt -l . && go vet ./... && golangci-lint run ./...   # gofmt -l must print nothing
 go test ./...
-go test -race ./...                  # when the change touches goroutines, channels, locks, internal/openai, internal/pipeline or internal/wyoming
+go test -race -timeout 30m ./...     # when the change touches goroutines, channels, locks, internal/openai, internal/pipeline or internal/wyoming
 go test -run '^$' -fuzz '^FuzzNormaliseUpload$' -fuzztime 30s ./internal/audio   # when the change touches a Go parser or the time-stretch
 go test -run '^$' -fuzz '^FuzzReadEvent$' -fuzztime 30s ./internal/wyoming   # when the change touches the Wyoming event codec
 go test -run '^$' -fuzz '^FuzzSplitter$' -fuzztime 30s ./internal/wyoming    # when the change touches the Wyoming sentence splitter

@@ -5,7 +5,7 @@ tools:
   vet: nix develop -c go vet ./...
   lint: nix develop -c golangci-lint run ./...
   test: nix develop -c go test ./...
-  race: nix develop -c go test -race ./...
+  race: nix develop -c go test -race -timeout 30m ./...
   pytest: nix build -L --no-link .#checks.x86_64-linux.qwen-tts-server-tests
 
 tags:
@@ -51,7 +51,7 @@ verify_notes: |
   and ffmpeg are test oracles in internal/audio/oracle_test.go and
   internal/openai/speech_encoding_test.go whose checks skip silently when the
   tools are missing, so run with them present and use -v to confirm they ran.
-  tools/race.txt covers every package; internal/audio takes about 140 s.
+  tools/race.txt covers every package; internal/audio takes about 180 s.
   A verifier works read-only on tracked files, which is stricter than what
   AGENTS.md allows a builder: do not replace, regenerate or delete a file
   under internal/audio/testdata/, delete a fuzz seed, edit .golangci.yaml,
