@@ -22,7 +22,7 @@ const (
 	stretchWindow       = 2 * stretchHop
 	stretchSearch       = outputRate * stretchSearchMillis / millisPerSecond
 	searchStride        = 1
-	correlationStride   = 4
+	correlationStride   = 1
 	correlationEpsilon  = 1e-15
 	stretchReadBytes    = 4096
 	unstretchedSpeed    = 1

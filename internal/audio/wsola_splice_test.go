@@ -28,6 +28,11 @@ var (
 	// and even, on both sides of the old 240-sample search span.
 	splicePeriods = []int{400, 343, 320, 300, 282, 260, 241, 240, 200, 161, 120, 93}
 	spliceSpeeds  = []float64{1.15, 0.85, 1.5}
+	// highTonePeriods are 6 kHz, 4.8 kHz and 3 kHz, the sibilant range.
+	highTonePeriods = []int{4, 5, 8}
+	// sinePhases put the 4-sample tone on its zero crossings at 0 and off
+	// them at 0.7 radians.
+	sinePhases = []float64{0, 0.7}
 )
 
 // harmonicTone is a steady voiced tone whose period is a whole number of
@@ -65,11 +70,43 @@ func spliceSNR(samples []int16, period int) float64 {
 	return decibelsPerDecade * math.Log10(signal/noise)
 }
 
+// sineTone is a pure tone whose period is a whole number of samples,
+// starting at the given phase in radians.
+func sineTone(period int, startPhase float64) []float32 {
+	samples := make([]float32, spliceToneSeconds*outputRate)
+	for i := range samples {
+		phase := 2*math.Pi*float64(i)/float64(period) + startPhase
+		samples[i] = float32(toneAmplitude * math.Sin(phase))
+	}
+
+	return samples
+}
+
 func TestNewStretcher_LowPitchedTones_SpliceCleanly(t *testing.T) {
-	for _, period := range splicePeriods {
-		input := s16le(harmonicTone(period))
+	assertSplicesCleanly(t, harmonicTone, splicePeriods)
+}
+
+// A correlation that skips samples is blind to tones near its own sampling
+// rate, so high tones catch a matcher that does not use every sample. Which
+// tone a skipping matcher gets wrong depends on where the samples fall on the
+// waveform, so each tone is tried at two phases.
+func TestNewStretcher_HighTones_SpliceCleanly(t *testing.T) {
+	for _, startPhase := range sinePhases {
+		t.Run("phase "+strconv.FormatFloat(startPhase, 'f', -1, 64), func(t *testing.T) {
+			tone := func(period int) []float32 { return sineTone(period, startPhase) }
+			assertSplicesCleanly(t, tone, highTonePeriods)
+		})
+	}
+}
+
+func assertSplicesCleanly(t *testing.T, tone func(period int) []float32, periods []int) {
+	t.Helper()
+
+	for _, period := range periods {
+		input := s16le(tone(period))
 		for _, speed := range spliceSpeeds {
 			t.Run(strconv.Itoa(period)+"@"+speedName(speed), func(t *testing.T) {
+				t.Parallel()
 				out := samplesOf(t, stretch(t, input, speed))
 
 				snr := spliceSNR(out, period)

@@ -193,7 +193,7 @@ func TestNewStretcher_NormalSpeed_IsIdentity(t *testing.T) {
 
 // prototypeStretch is the WSOLA prototype that passed the blind listening
 // test, with its search widened from 5 ms at every other sample to 15 ms at
-// every sample.
+// every sample, and its correlation taken over every sample, not every fourth.
 func prototypeStretch(x []float32, rate int, speed float64) []float32 {
 	hop := rate / 100
 	window := 2 * hop
@@ -212,7 +212,7 @@ func prototypeStretch(x []float32, rate int, speed float64) []float32 {
 		bestScore := -math.MaxFloat64
 		for j := lo; j <= hi; j++ {
 			var dot, energy float64
-			for k := 0; k < hop; k += 4 {
+			for k := 0; k < hop; k++ {
 				a := float64(y[out+k])
 				b := float64(x[j+k])
 				dot += a * b
@@ -255,7 +255,7 @@ func trackedPrototype(x []float32, speed float64) (y []float32, lastEnd, segEnd 
 		bestScore := -math.MaxFloat64
 		for j := lo; j <= hi; j++ {
 			var dot, energy float64
-			for k := 0; k < hop; k += 4 {
+			for k := 0; k < hop; k++ {
 				a := float64(y[out+k])
 				b := float64(x[j+k])
 				dot += a * b
@@ -417,22 +417,33 @@ func TestNewStretcher_MatchesExactOracle(t *testing.T) {
 		lengths = append(lengths, rng.IntN(maxRandomLength))
 	}
 
+	// Parallel, because under the race detector the cases one after another
+	// outlast go test's default ten-minute timeout.
 	for _, length := range lengths {
 		for name, in := range oracleSignals(t, length) {
-			pcm := pcmOf(t, in)
-			for _, speed := range oracleSpeeds {
-				want := exactOracle(in, speed)
-				for mode := range readModeCount {
-					if mode == oneByteReads && length > oneByteMaxSamples {
-						continue
-					}
+			t.Run(name+"/"+strconv.Itoa(length), func(t *testing.T) {
+				t.Parallel()
+				matchesExactOracle(t, in)
+			})
+		}
+	}
+}
 
-					got, err := stretchWith(t, pcm, speed, mode)
-					require.NoError(t, err)
-					index := firstDifference(want, got)
-					require.Equal(t, -1, index, "%s, %d samples, speed %g, read mode %d: first difference at %d (want %d samples, got %d)", name, length, speed, mode, index, len(want), len(got))
-				}
+func matchesExactOracle(t *testing.T, in []int16) {
+	t.Helper()
+
+	pcm := pcmOf(t, in)
+	for _, speed := range oracleSpeeds {
+		want := exactOracle(in, speed)
+		for mode := range readModeCount {
+			if mode == oneByteReads && len(in) > oneByteMaxSamples {
+				continue
 			}
+
+			got, err := stretchWith(t, pcm, speed, mode)
+			require.NoError(t, err)
+			index := firstDifference(want, got)
+			require.Equal(t, -1, index, "%d samples, speed %g, read mode %d: first difference at %d (want %d samples, got %d)", len(in), speed, mode, index, len(want), len(got))
 		}
 	}
 }
