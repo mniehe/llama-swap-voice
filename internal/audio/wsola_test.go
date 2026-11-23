@@ -20,7 +20,7 @@ import (
 const (
 	stretchToneSeconds     = 2
 	stretchLengthTolerance = 0.02
-	maxShortfallSamples    = outputRate / 20
+	maxShortfallSamples    = outputRate / 100
 	pitchSliceSamples      = outputRate
 	tailWindowSamples      = outputRate / 100
 	tailCheckSamples       = outputRate / 10
@@ -92,9 +92,8 @@ func speechPCM(t *testing.T) []byte {
 	return fixture(t, "speech.wav")[wavHeaderBytes:]
 }
 
-// lengthContract is the stretcher's length contract: at slow speeds the
-// output can stop up to 50 ms short of input/speed, where the prototype
-// padded with silence.
+// lengthContract is the stretcher's length contract: the output can stop up
+// to 10 ms short of input/speed, where the prototype padded with silence.
 func lengthContract(want float64) float64 {
 	return max(want*stretchLengthTolerance, maxShortfallSamples)
 }
@@ -145,7 +144,7 @@ func TestNewStretcher_ShortInputs_StopShortOrPassThrough(t *testing.T) {
 		speed   float64
 		want    int
 	}{
-		{samples: stretchWindow, speed: 0.25, want: 2 * stretchWindow},
+		{samples: stretchWindow, speed: 0.25, want: 4 * stretchWindow},
 		{samples: 100, speed: 0.25, want: 100},
 		{samples: 100, speed: 0.5, want: 100},
 		{samples: 100, speed: 2, want: 50},
@@ -193,11 +192,12 @@ func TestNewStretcher_NormalSpeed_IsIdentity(t *testing.T) {
 }
 
 // prototypeStretch is the WSOLA prototype that passed the blind listening
-// test, kept verbatim.
+// test, with its search widened from 5 ms at every other sample to 15 ms at
+// every sample.
 func prototypeStretch(x []float32, rate int, speed float64) []float32 {
 	hop := rate / 100
 	window := 2 * hop
-	search := rate / 200
+	search := rate * 15 / 1000
 	n := int(float64(len(x)) / speed)
 	y := make([]float32, n+window)
 	copy(y, x[:min(window, len(x))])
@@ -210,7 +210,7 @@ func prototypeStretch(x []float32, rate int, speed float64) []float32 {
 		}
 		best := lo
 		bestScore := -math.MaxFloat64
-		for j := lo; j <= hi; j += 2 {
+		for j := lo; j <= hi; j++ {
 			var dot, energy float64
 			for k := 0; k < hop; k += 4 {
 				a := float64(y[out+k])
@@ -239,7 +239,7 @@ func trackedPrototype(x []float32, speed float64) (y []float32, lastEnd, segEnd 
 	rate := outputRate
 	hop := rate / 100
 	window := 2 * hop
-	search := rate / 200
+	search := rate * 15 / 1000
 	n := int(float64(len(x)) / speed)
 	y = make([]float32, n+window)
 	copy(y, x[:min(window, len(x))])
@@ -253,7 +253,7 @@ func trackedPrototype(x []float32, speed float64) (y []float32, lastEnd, segEnd 
 		}
 		best := lo
 		bestScore := -math.MaxFloat64
-		for j := lo; j <= hi; j += 2 {
+		for j := lo; j <= hi; j++ {
 			var dot, energy float64
 			for k := 0; k < hop; k += 4 {
 				a := float64(y[out+k])

@@ -17,11 +17,11 @@ const (
 const (
 	millisPerSecond     = 1000
 	stretchHopMillis    = 10
-	stretchSearchMillis = 5
+	stretchSearchMillis = 15
 	stretchHop          = outputRate * stretchHopMillis / millisPerSecond
 	stretchWindow       = 2 * stretchHop
 	stretchSearch       = outputRate * stretchSearchMillis / millisPerSecond
-	searchStride        = 2
+	searchStride        = 1
 	correlationStride   = 4
 	correlationEpsilon  = 1e-15
 	stretchReadBytes    = 4096
@@ -30,11 +30,12 @@ const (
 
 // NewStretcher time-stretches s16le 24 kHz mono samples by speed, keeping
 // the pitch, with WSOLA: 20 ms windows placed every 10 ms of output, each
-// taken from within 5 ms of its nominal input position where it best
-// continues the previous one. Output starts after a few tens of milliseconds
-// of input rather than at the end. At slow speeds it can stop up to 50 ms
-// short of input/speed, and input shorter than one window is not stretched.
-// Speed 1 returns r unchanged.
+// taken from within 15 ms of its nominal input position where it best
+// continues the previous one. The 30 ms search range must hold a whole
+// pitch period, or a low voice's windows splice out of phase and crackle.
+// Output starts after a few tens of milliseconds of input rather than at the
+// end. It can stop up to 10 ms short of input/speed, and input shorter than
+// one window is not stretched. Speed 1 returns r unchanged.
 func NewStretcher(r io.Reader, speed float64) (io.Reader, error) {
 	if math.IsNaN(speed) || speed < MinSpeed || speed > MaxSpeed {
 		return nil, fmt.Errorf("speed must be between %g and %g, got %g", MinSpeed, MaxSpeed, speed)

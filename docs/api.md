@@ -48,8 +48,8 @@ An unknown path gets a 404 and a wrong method gets a 405.
 A request for `aac` or `flac` gets a 400.
 
 A time-stretch changes the speed, so the voice keeps its pitch and the reply
-still streams. At speed 1 the service does not touch the samples. At a slow
-speed, a reply can end up to 50 ms short of its exact length. The service
+still streams. At speed 1 the service does not touch the samples. At any
+other speed, a reply can end up to 10 ms short of its exact length. The service
 returns a reply shorter than 20 ms without a speed change.
 
 ## Transcriptions
