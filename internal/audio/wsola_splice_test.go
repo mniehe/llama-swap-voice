@@ -24,9 +24,10 @@ const (
 )
 
 var (
-	// splicePeriods are pitch periods in samples from 60 Hz to 258 Hz, odd
-	// and even, on both sides of the old 240-sample search span.
-	splicePeriods = []int{400, 343, 320, 300, 282, 260, 241, 240, 200, 161, 120, 93}
+	// splicePeriods are pitch periods in samples from 46 Hz to 258 Hz, odd
+	// and even, on both sides of the old 240-sample search span, and two
+	// longer than a 20 ms (480-sample) search range.
+	splicePeriods = []int{520, 500, 400, 343, 320, 300, 282, 260, 241, 240, 200, 161, 120, 93}
 	spliceSpeeds  = []float64{1.15, 0.85, 1.5}
 	// highTonePeriods are 6 kHz, 4.8 kHz and 3 kHz, the sibilant range.
 	highTonePeriods = []int{4, 5, 8}

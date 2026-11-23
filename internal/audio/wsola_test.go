@@ -20,7 +20,7 @@ import (
 const (
 	stretchToneSeconds     = 2
 	stretchLengthTolerance = 0.02
-	shortfallSamples       = outputRate / 100
+	maxShortfallSamples    = outputRate / 100
 	pitchSliceSamples      = outputRate
 	tailWindowSamples      = outputRate / 100
 	tailCheckSamples       = outputRate / 10
@@ -94,10 +94,9 @@ func speechPCM(t *testing.T) []byte {
 }
 
 // lengthContract is the stretcher's length contract: the output can stop up
-// to 10 ms short of input/speed, or 10 ms/speed - 10 ms below speed 0.5,
-// where the prototype padded with silence.
-func lengthContract(want, speed float64) float64 {
-	return max(want*stretchLengthTolerance, shortfallSamples, shortfallSamples/speed-shortfallSamples)
+// to 10 ms short of input/speed, where the prototype padded with silence.
+func lengthContract(want float64) float64 {
+	return max(want*stretchLengthTolerance, maxShortfallSamples)
 }
 
 func TestNewStretcher_RejectsSpeedsOutsideRange(t *testing.T) {
@@ -132,7 +131,7 @@ func TestNewStretcher_Tone_KeepsPitchAndScalesLength(t *testing.T) {
 			peak := peakFrequency(out[start:start+slice], outputRate)
 			t.Logf("speed %g: %d samples, want %.0f (%+.2f%%), peak %.2f Hz over %d samples", speed, len(out), want, 100*(float64(len(out))-want)/want, peak, slice)
 
-			assert.InDelta(t, want, float64(len(out)), lengthContract(want, speed))
+			assert.InDelta(t, want, float64(len(out)), lengthContract(want))
 			assert.InDelta(t, toneHz, peak, frequencyTolerance)
 		})
 	}
@@ -146,7 +145,7 @@ func TestNewStretcher_ShortInputs_StopShortOrPassThrough(t *testing.T) {
 		speed   float64
 		want    int
 	}{
-		{samples: stretchWindow, speed: 0.25, want: 3 * stretchWindow},
+		{samples: stretchWindow, speed: 0.25, want: 4 * stretchWindow},
 		{samples: 100, speed: 0.25, want: 100},
 		{samples: 100, speed: 0.5, want: 100},
 		{samples: 100, speed: 2, want: 50},
@@ -216,7 +215,7 @@ func checkLengths(t *testing.T, input []byte, speed float64, first, end int) sho
 		want := int(float64(samples) / speed)
 
 		require.LessOrEqual(t, out, want, "%d samples", samples)
-		require.InDelta(t, want, out, lengthContract(float64(want), speed), "%d samples", samples)
+		require.InDelta(t, want, out, lengthContract(float64(want)), "%d samples", samples)
 		if want-out > worst.samples {
 			worst = shortfall{samples: want - out, at: samples}
 		}
@@ -232,14 +231,14 @@ func TestNewStretcher_NormalSpeed_IsIdentity(t *testing.T) {
 }
 
 // prototypeStretch is an offline reference copy of the stretcher's WSOLA:
-// the whole input in memory, a 10 ms search at every sample, the correlation
+// the whole input in memory, a 15 ms search at every sample, the correlation
 // over every sample, and the same weak-match guard. The bit-exact oracle and
 // FuzzStretcher compare the streaming stretcher against it; the splice and
 // gap tests check the algorithm itself.
 func prototypeStretch(x []float32, rate int, speed float64) []float32 {
 	hop := rate / 100
 	window := 2 * hop
-	search := rate * 10 / 1000
+	search := rate * 15 / 1000
 	n := int(float64(len(x)) / speed)
 	y := make([]float32, n+window)
 	copy(y, x[:min(window, len(x))])
@@ -268,7 +267,7 @@ func trackedPrototype(x []float32, speed float64) (y []float32, lastEnd, segEnd 
 	rate := outputRate
 	hop := rate / 100
 	window := 2 * hop
-	search := rate * 10 / 1000
+	search := rate * 15 / 1000
 	n := int(float64(len(x)) / speed)
 	y = make([]float32, n+window)
 	copy(y, x[:min(window, len(x))])

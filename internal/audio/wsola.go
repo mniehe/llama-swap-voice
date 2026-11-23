@@ -17,7 +17,7 @@ const (
 const (
 	millisPerSecond     = 1000
 	stretchHopMillis    = 10
-	stretchSearchMillis = 10
+	stretchSearchMillis = 15
 	stretchHop          = outputRate * stretchHopMillis / millisPerSecond
 	stretchWindow       = 2 * stretchHop
 	stretchSearch       = outputRate * stretchSearchMillis / millisPerSecond
@@ -34,24 +34,25 @@ const (
 
 // NewStretcher time-stretches s16le 24 kHz mono samples by speed, keeping
 // the pitch, with WSOLA: 20 ms windows placed every 10 ms of output, each
-// taken from within 10 ms of its nominal input position where it best
-// continues the previous one. The 20 ms search range must hold a whole
+// taken from within 15 ms of its nominal input position where it best
+// continues the previous one. The 30 ms search range must hold a whole
 // pitch period, or a low voice's windows splice out of phase and crackle.
 // Up to speed 2 only a strong match may skip input; after a weak one, such
 // as in a consonant or noise, the window starts no later than the previous
 // one ends.
 //
-// The first output comes once one window of input is in hand, 20 ms, or one
-// hop of output times speed if that is longer. The source is read up to
-// stretchReadBytes (85 ms) at a time, so a source that fills each read may
-// have delivered up to that much more input by then.
+// The first output comes once the input reaches one window, 20 ms, or one
+// hop of output times speed if that is longer; an input that ends before
+// then comes out when it ends. The source is read up to stretchReadBytes
+// (85 ms) at a time, so a source that fills each read may have delivered up
+// to that much more input by then.
 //
-// From input of at least one window the output ends up to 10 ms short of
-// input/speed samples, and below speed 0.5 up to 10 ms/speed - 10 ms short,
-// 30 ms at 0.25, where the last windows' search ranges run past the input.
-// Input shorter than one window, or than one hop of output, is not
-// stretched but cut to input/speed samples: a slow speed returns all of it,
-// a fast one its start. Speed 1 returns r unchanged.
+// Input of n samples is stretched to floor(n/speed) samples, and the output
+// is never longer and at most 10 ms shorter. Input shorter than one window,
+// or whose floor(n/speed) is shorter than one hop, is not stretched: the
+// output is its first min(n, floor(n/speed)) samples, so a slow speed
+// returns all of it, a fast one its start, and fewer than speed samples
+// none. Speed 1 returns r unchanged.
 func NewStretcher(r io.Reader, speed float64) (io.Reader, error) {
 	if math.IsNaN(speed) || speed < MinSpeed || speed > MaxSpeed {
 		return nil, fmt.Errorf("speed must be between %g and %g, got %g", MinSpeed, MaxSpeed, speed)
