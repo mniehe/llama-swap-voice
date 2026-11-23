@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -11,14 +12,17 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/mniehe/llama-swap-voice/internal/server"
+	"github.com/mniehe/llama-swap-voice/internal/openai"
+	"github.com/mniehe/llama-swap-voice/internal/pipeline"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
+	"github.com/mniehe/llama-swap-voice/internal/wyoming"
 )
 
 const (
@@ -35,29 +39,76 @@ const (
 	halfSecondSamples = 12000
 	stretchedSpeed    = 1.5
 	lengthTolerance   = 0.02
+
+	// heldWindow is how long a test watches serve not return while a
+	// Wyoming request is held.
+	heldWindow = 300 * time.Millisecond
+	// unreadReplyBytes is far more than the loopback socket buffers hold for
+	// a client that does not read.
+	unreadReplyBytes = 8 << 20
+	ipv6Loopback     = "::1"
+	// loopbackHost is where tests bind the listeners they pass to serveOn.
+	loopbackHost = "127.0.0.1"
+	// graceWindow is the shutdown.grace of the test that serves a new
+	// Wyoming connection during the grace period.
+	graceWindow = time.Second
+	// requestLogMessage is the msg of the Wyoming request log line.
+	requestLogMessage = "request"
+	// drainLogMessage is the msg of the line serve logs after
+	// shutdown.grace, before it shuts the listeners down.
+	drainLogMessage = "waiting for ongoing requests to finish"
+
+	eventSynthesize = "synthesize"
+	eventAudioStart = "audio-start"
+	eventAudioChunk = "audio-chunk"
+	eventAudioStop  = "audio-stop"
+	eventDescribe   = "describe"
+	eventInfo       = "info"
+	eventPing       = "ping"
+	eventPong       = "pong"
 )
 
-func freePort(t *testing.T) int {
+// listenLoopback binds a port on host that the test owns until it hands the
+// listener to serveOn, whose servers close it.
+func listenLoopback(t *testing.T, host string) net.Listener {
 	t.Helper()
 
-	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", net.JoinHostPort(host, "0"))
 	require.NoError(t, err)
+	closeOnCleanup(t, listener)
+
+	return listener
+}
+
+// closeOnCleanup closes listener when the test ends unless something else
+// already has.
+func closeOnCleanup(t *testing.T, listener net.Listener) {
+	t.Helper()
+
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("closing the test listener: %v", err)
+		}
+	})
+}
+
+func portOf(t *testing.T, listener net.Listener) int {
+	t.Helper()
 
 	addr, ok := listener.Addr().(*net.TCPAddr)
 	require.True(t, ok)
-	require.NoError(t, listener.Close())
 
 	return addr.Port
 }
 
-func newService(t *testing.T, respond http.HandlerFunc) *server.Server {
+func newService(t *testing.T, respond http.HandlerFunc) *services {
 	t.Helper()
 
 	cfg := validConfig(t)
 	return serviceFor(t, &cfg, respond, &http.Client{})
 }
 
-func serviceFor(t *testing.T, cfg *ServiceConfig, respond http.HandlerFunc, httpClient *http.Client) *server.Server {
+func serviceFor(t *testing.T, cfg *ServiceConfig, respond http.HandlerFunc, httpClient *http.Client) *services {
 	t.Helper()
 
 	fake := httptest.NewServer(respond)
@@ -67,10 +118,10 @@ func serviceFor(t *testing.T, cfg *ServiceConfig, respond http.HandlerFunc, http
 	require.NoError(t, err)
 
 	serverCfg := cfg.serverConfig(map[string]string{"alice": filepath.Join(cfg.Voices.Dir, "alice.mp3")})
-	service, err := server.New(&serverCfg, client, slog.New(slog.DiscardHandler))
+	pipe, err := pipeline.New(&serverCfg, client, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
-	return service
+	return &services{api: openai.New(pipe, slog.New(slog.DiscardHandler)), pipeline: pipe}
 }
 
 func get(ctx context.Context, url string) (int, error) {
@@ -96,30 +147,76 @@ func waitReady(t *testing.T, base string) {
 	}, probeTimeout, probeEvery)
 }
 
-func startServe(t *testing.T, cfg *ServiceConfig, service *server.Server) (cancel context.CancelFunc, done <-chan error) {
+// served is a serveOn running on listeners the test bound itself.
+type served struct {
+	cancel context.CancelFunc
+	done   <-chan error
+	// base is the HTTP listener's URL.
+	base string
+	// wyoming is the Wyoming listener's address, empty when it is disabled.
+	wyoming string
+}
+
+func startServe(t *testing.T, cfg *ServiceConfig, service *services) *served {
 	t.Helper()
+
+	return startServeLogged(t, cfg, service, slog.New(slog.DiscardHandler))
+}
+
+// startServeLogged binds the HTTP listener, and the Wyoming one when cfg
+// enables it, on loopback port 0 and serves them.
+func startServeLogged(t *testing.T, cfg *ServiceConfig, service *services, logger *slog.Logger) *served {
+	t.Helper()
+
+	ls := &listeners{http: listenLoopback(t, loopbackHost)}
+	if cfg.Wyoming.Enabled {
+		ls.wyoming = listenLoopback(t, loopbackHost)
+	}
+
+	return startServeOn(t, cfg, service, ls, logger)
+}
+
+func startServeOn(t *testing.T, cfg *ServiceConfig, service *services, ls *listeners, logger *slog.Logger) *served {
+	t.Helper()
+
+	s := &served{base: "http://" + ls.http.Addr().String()}
+	if ls.wyoming != nil {
+		s.wyoming = ls.wyoming.Addr().String()
+	}
 
 	ctx, cancel := context.WithCancel(t.Context())
 	result := make(chan error, 1)
 	go func() {
-		result <- serve(ctx, cfg, service, slog.New(slog.DiscardHandler))
+		result <- serveOn(ctx, cfg, service, ls, logger)
+	}()
+	s.cancel, s.done = cancel, result
+
+	return s
+}
+
+// launchServe runs serve, which binds the addresses in cfg itself; tests
+// use it only where a bind fails.
+func launchServe(t *testing.T, cfg *ServiceConfig, service *services) <-chan error {
+	t.Helper()
+
+	result := make(chan error, 1)
+	go func() {
+		result <- serve(t.Context(), cfg, service, slog.New(slog.DiscardHandler))
 	}()
 
-	return cancel, result
+	return result
 }
 
 func TestServe_Signal_ShutsDownCleanly(t *testing.T) {
 	cfg := validConfig(t)
-	cfg.Port = freePort(t)
-	base := "http://" + net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 
-	cancel, done := startServe(t, &cfg, newService(t, http.NotFound))
-	waitReady(t, base)
+	s := startServe(t, &cfg, newService(t, http.NotFound))
+	waitReady(t, s.base)
 
-	cancel()
+	s.cancel()
 
 	select {
-	case err := <-done:
+	case err := <-s.done:
 		require.NoError(t, err)
 	case <-time.After(probeTimeout):
 		require.Fail(t, "serve did not return after the signal")
@@ -128,8 +225,6 @@ func TestServe_Signal_ShutsDownCleanly(t *testing.T) {
 
 func TestServe_Signal_DrainsInFlightRequest(t *testing.T) {
 	cfg := validConfig(t)
-	cfg.Port = freePort(t)
-	base := "http://" + net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 
 	reached := make(chan struct{})
 	release := make(chan struct{})
@@ -140,8 +235,8 @@ func TestServe_Signal_DrainsInFlightRequest(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
-	cancel, done := startServe(t, &cfg, service)
-	waitReady(t, base)
+	s := startServe(t, &cfg, service)
+	waitReady(t, s.base)
 
 	type result struct {
 		body string
@@ -149,32 +244,31 @@ func TestServe_Signal_DrainsInFlightRequest(t *testing.T) {
 	}
 	finished := make(chan result, 1)
 	go func() {
-		body, err := postSpeech(t.Context(), base)
+		body, err := postSpeech(t.Context(), s.base)
 		finished <- result{body: body, err: err}
 	}()
 
 	<-reached
-	cancel()
+	s.cancel()
 	time.Sleep(probeEvery * 5)
 	close(release)
 
 	got := <-finished
 	require.NoError(t, got.err)
 	assert.Equal(t, slowAudio, got.body, "the in-flight stream must complete during shutdown")
-	require.NoError(t, <-done)
+	require.NoError(t, <-s.done)
 }
 
 // stuckSpeech starts a speech request through service and returns once the
 // upstream reply has paused mid-body.
-func stuckSpeech(t *testing.T, cfg *ServiceConfig, service *server.Server, paused <-chan struct{}) (cancel context.CancelFunc, done <-chan error) {
+func stuckSpeech(t *testing.T, cfg *ServiceConfig, service *services, paused <-chan struct{}) *served {
 	t.Helper()
 
-	base := "http://" + net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-	cancel, done = startServe(t, cfg, service)
-	waitReady(t, base)
+	s := startServe(t, cfg, service)
+	waitReady(t, s.base)
 
 	go func() {
-		_, err := postSpeechBody(t.Context(), base, `{"input":"hi","response_format":"mp3"}`)
+		_, err := postSpeechBody(t.Context(), s.base, `{"input":"hi","response_format":"mp3"}`)
 		assert.Error(t, err, "a cancelled stream must not end cleanly")
 	}()
 
@@ -184,12 +278,11 @@ func stuckSpeech(t *testing.T, cfg *ServiceConfig, service *server.Server, pause
 		require.FailNow(t, "the upstream reply never started")
 	}
 
-	return cancel, done
+	return s
 }
 
 func TestServe_StuckRequest_IsCancelledWithinHard(t *testing.T) {
 	cfg := validConfig(t)
-	cfg.Port = freePort(t)
 	cfg.ShutdownTiming = ShutdownTimingConfig{Total: forcedTotal, Hard: cancelledHard}
 
 	paused := make(chan struct{})
@@ -203,12 +296,12 @@ func TestServe_StuckRequest_IsCancelledWithinHard(t *testing.T) {
 		close(upstreamCancelled)
 	}, &http.Client{})
 
-	cancel, done := stuckSpeech(t, &cfg, service, paused)
+	s := stuckSpeech(t, &cfg, service, paused)
 	signalled := time.Now()
-	cancel()
+	s.cancel()
 
 	select {
-	case err := <-done:
+	case err := <-s.done:
 		require.NoError(t, err, "every handler returned within shutdown.hard")
 	case <-time.After(cfg.ShutdownTiming.Total + cfg.ShutdownTiming.Hard + shutdownSlack):
 		require.Fail(t, "serve did not return within total+hard")
@@ -273,7 +366,6 @@ func (s stubbornTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 
 func TestServe_HandlersOutliveHard_ReturnsError(t *testing.T) {
 	cfg := validConfig(t)
-	cfg.Port = freePort(t)
 	cfg.ShutdownTiming = ShutdownTimingConfig{Total: forcedTotal, Hard: forcedTotal}
 
 	paused := make(chan struct{})
@@ -282,11 +374,11 @@ func TestServe_HandlersOutliveHard_ReturnsError(t *testing.T) {
 	body := &stubbornBody{audio: []byte(slowAudio), paused: paused, release: release}
 	service := serviceFor(t, &cfg, http.NotFound, &http.Client{Transport: stubbornTransport{body: body}})
 
-	cancel, done := stuckSpeech(t, &cfg, service, paused)
-	cancel()
+	s := stuckSpeech(t, &cfg, service, paused)
+	s.cancel()
 
 	select {
-	case err := <-done:
+	case err := <-s.done:
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "still running")
 	case <-time.After(cfg.ShutdownTiming.Total + cfg.ShutdownTiming.Hard + shutdownSlack):
@@ -301,8 +393,6 @@ func TestServe_EmptyPATH_StartsAndStretchesSpeech(t *testing.T) {
 
 	cfg, err := loadConfig()
 	require.NoError(t, err, "nothing on PATH must be needed to start")
-	cfg.Port = freePort(t)
-	base := "http://" + net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 
 	silence := wavHeader + strings.Repeat("\x00", halfSecondSamples*sampleBytes)
 	service := serviceFor(t, &cfg, func(w http.ResponseWriter, _ *http.Request) {
@@ -310,30 +400,23 @@ func TestServe_EmptyPATH_StartsAndStretchesSpeech(t *testing.T) {
 		assert.NoError(t, writeErr)
 	}, &http.Client{})
 
-	cancel, done := startServe(t, &cfg, service)
-	waitReady(t, base)
+	s := startServe(t, &cfg, service)
+	waitReady(t, s.base)
 
-	pcm, err := postSpeechBody(t.Context(), base, `{"input":"hi","response_format":"pcm","speed":1.5}`)
+	pcm, err := postSpeechBody(t.Context(), s.base, `{"input":"hi","response_format":"pcm","speed":1.5}`)
 	require.NoError(t, err)
 	want := halfSecondSamples / stretchedSpeed
 	assert.InDelta(t, want, float64(len(pcm)/sampleBytes), want*lengthTolerance)
 
-	cancel()
-	require.NoError(t, <-done)
+	s.cancel()
+	require.NoError(t, <-s.done)
 }
 
 func TestServe_PortInUse_ReturnsError(t *testing.T) {
-	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, listener.Close()) })
-
-	addr, ok := listener.Addr().(*net.TCPAddr)
-	require.True(t, ok)
-
 	cfg := validConfig(t)
-	cfg.Port = addr.Port
+	cfg.Port = portOf(t, listenLoopback(t, loopbackHost))
 
-	_, done := startServe(t, &cfg, newService(t, http.NotFound))
+	done := launchServe(t, &cfg, newService(t, http.NotFound))
 
 	select {
 	case err := <-done:
@@ -360,4 +443,632 @@ func postSpeechBody(ctx context.Context, base, body string) (string, error) {
 	}
 	data, err := io.ReadAll(resp.Body)
 	return string(data), errors.Join(err, resp.Body.Close())
+}
+
+// wyomingEnabled is a valid configuration with the Wyoming listener on.
+func wyomingEnabled(t *testing.T) ServiceConfig {
+	t.Helper()
+
+	cfg := validConfig(t)
+	cfg.Wyoming.Enabled = true
+
+	return cfg
+}
+
+type wyomingClient struct {
+	t    *testing.T
+	conn net.Conn
+	in   *bufio.Reader
+}
+
+// dialWyoming connects once serveOn reports ready.
+func dialWyoming(t *testing.T, s *served) *wyomingClient {
+	t.Helper()
+
+	waitReady(t, s.base)
+
+	return connectWyoming(t, s)
+}
+
+func connectWyoming(t *testing.T, s *served) *wyomingClient {
+	t.Helper()
+
+	conn, err := (&net.Dialer{Timeout: probeTimeout}).DialContext(t.Context(), "tcp", s.wyoming)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		if closeErr := conn.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			t.Errorf("closing the Wyoming client: %v", closeErr)
+		}
+	})
+
+	return &wyomingClient{t: t, conn: conn, in: bufio.NewReader(conn)}
+}
+
+func (c *wyomingClient) send(eventType, data string) {
+	c.t.Helper()
+
+	event := &wyoming.Event{Type: eventType}
+	if data != "" {
+		event.Data = []byte(data)
+	}
+	require.NoError(c.t, c.conn.SetWriteDeadline(time.Now().Add(probeTimeout)))
+	require.NoError(c.t, wyoming.WriteEvent(c.conn, event))
+}
+
+func (c *wyomingClient) read() *wyoming.Event {
+	c.t.Helper()
+
+	require.NoError(c.t, c.conn.SetReadDeadline(time.Now().Add(probeTimeout)))
+	event, err := wyoming.ReadEvent(c.in)
+	require.NoError(c.t, err)
+
+	return event
+}
+
+func (c *wyomingClient) readType(eventType string) *wyoming.Event {
+	c.t.Helper()
+
+	event := c.read()
+	require.Equal(c.t, eventType, event.Type, "event data %s", event.Data)
+
+	return event
+}
+
+// readSpeech reads audio-start, the chunks and audio-stop, and returns the
+// PCM.
+func (c *wyomingClient) readSpeech() []byte {
+	c.t.Helper()
+
+	c.readType(eventAudioStart)
+	var pcm []byte
+	for {
+		event := c.read()
+		if event.Type == eventAudioStop {
+			return pcm
+		}
+		require.Equal(c.t, eventAudioChunk, event.Type, "event data %s", event.Data)
+		pcm = append(pcm, event.Payload...)
+	}
+}
+
+// requireClosed reads until the service closes the connection.
+func (c *wyomingClient) requireClosed() {
+	c.t.Helper()
+
+	require.NoError(c.t, c.conn.SetReadDeadline(time.Now().Add(probeTimeout)))
+	_, err := io.Copy(io.Discard, c.in)
+	var timeout net.Error
+	assert.False(c.t, errors.As(err, &timeout) && timeout.Timeout(), "the Wyoming connection is still open")
+}
+
+func requireServeReturns(t *testing.T, done <-chan error, within time.Duration) error {
+	t.Helper()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(within):
+		require.FailNow(t, "serve did not return", "within %s", within)
+		return nil
+	}
+}
+
+func TestServe_Wyoming_DrainsInFlightRequest(t *testing.T) {
+	cfg := wyomingEnabled(t)
+	pcm := strings.Repeat("\x01\x02", halfSecondSamples)
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	releaseUpstream := sync.OnceFunc(func() { close(release) })
+	service := serviceFor(t, &cfg, func(w http.ResponseWriter, _ *http.Request) {
+		close(reached)
+		<-release
+		_, err := io.WriteString(w, wavHeader+pcm)
+		assert.NoError(t, err)
+	}, &http.Client{})
+	t.Cleanup(releaseUpstream)
+
+	s := startServe(t, &cfg, service)
+	c := dialWyoming(t, s)
+	c.send(eventSynthesize, `{"text":"hi"}`)
+	select {
+	case <-reached:
+	case <-time.After(probeTimeout):
+		require.FailNow(t, "the synthesis never reached the upstream")
+	}
+
+	s.cancel()
+	select {
+	case err := <-s.done:
+		require.FailNow(t, "serve returned while a Wyoming synthesis was held", "error: %v", err)
+	case <-time.After(heldWindow):
+	}
+	releaseUpstream()
+
+	assert.Equal(t, pcm, string(c.readSpeech()), "the held synthesis completes during shutdown")
+	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+}
+
+// stuckSynthesis starts a Wyoming synthesis through service and returns once
+// the upstream reply has paused mid-body.
+func stuckSynthesis(t *testing.T, cfg *ServiceConfig, service *services, paused <-chan struct{}) *served {
+	t.Helper()
+
+	s := startServe(t, cfg, service)
+	c := dialWyoming(t, s)
+	c.send(eventSynthesize, `{"text":"hi"}`)
+
+	select {
+	case <-paused:
+	case <-time.After(probeTimeout):
+		require.FailNow(t, "the upstream reply never started")
+	}
+
+	return s
+}
+
+func TestServe_Wyoming_StuckRequest_IsCancelledWithinHard(t *testing.T) {
+	cfg := wyomingEnabled(t)
+	cfg.ShutdownTiming = ShutdownTimingConfig{Total: forcedTotal, Hard: cancelledHard}
+
+	paused := make(chan struct{})
+	upstreamCancelled := make(chan struct{})
+	service := serviceFor(t, &cfg, func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.WriteString(w, slowAudio)
+		assert.NoError(t, err)
+		assert.NoError(t, http.NewResponseController(w).Flush())
+		close(paused)
+		<-r.Context().Done()
+		close(upstreamCancelled)
+	}, &http.Client{})
+
+	s := stuckSynthesis(t, &cfg, service, paused)
+	signalled := time.Now()
+	s.cancel()
+
+	budget := cfg.ShutdownTiming.Total + cfg.ShutdownTiming.Hard + shutdownSlack
+	require.NoError(t, requireServeReturns(t, s.done, budget), "every handler returned within shutdown.hard")
+	assert.Less(t, time.Since(signalled), budget)
+	select {
+	case <-upstreamCancelled:
+	case <-time.After(probeTimeout):
+		assert.Fail(t, "the upstream request outlived serve")
+	}
+}
+
+func TestServe_Wyoming_HandlerOutlivesHard_ReturnsError(t *testing.T) {
+	cfg := wyomingEnabled(t)
+	cfg.ShutdownTiming = ShutdownTimingConfig{Total: forcedTotal, Hard: forcedTotal}
+
+	paused := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	body := &stubbornBody{audio: []byte(slowAudio), paused: paused, release: release}
+	service := serviceFor(t, &cfg, http.NotFound, &http.Client{Transport: stubbornTransport{body: body}})
+
+	s := stuckSynthesis(t, &cfg, service, paused)
+	s.cancel()
+
+	err := requireServeReturns(t, s.done, cfg.ShutdownTiming.Total+cfg.ShutdownTiming.Hard+shutdownSlack)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "still running")
+}
+
+// The reply is far larger than the socket buffers and the client never
+// reads it, so the service's write blocks; cancelling the request cannot
+// unblock it, but closing the connection does.
+func TestServe_Wyoming_UnreadReply_IsClosedWithinHard(t *testing.T) {
+	cfg := wyomingEnabled(t)
+	cfg.ShutdownTiming = ShutdownTimingConfig{Total: forcedTotal, Hard: cancelledHard}
+	reply := wavHeader + strings.Repeat("\x00", unreadReplyBytes)
+	written := make(chan struct{})
+	service := serviceFor(t, &cfg, func(w http.ResponseWriter, _ *http.Request) {
+		defer close(written)
+		if _, err := io.WriteString(w, reply); err != nil {
+			t.Logf("fake upstream: writing speech: %v", err)
+		}
+	}, &http.Client{})
+
+	s := startServe(t, &cfg, service)
+	c := dialWyoming(t, s)
+	c.send(eventSynthesize, `{"text":"hi"}`)
+	c.readType(eventAudioStart)
+	signalled := time.Now()
+	s.cancel()
+
+	budget := cfg.ShutdownTiming.Total + cfg.ShutdownTiming.Hard + shutdownSlack
+	require.NoError(t, requireServeReturns(t, s.done, budget))
+	elapsed := time.Since(signalled)
+	assert.Less(t, elapsed, budget)
+	assert.GreaterOrEqual(t, elapsed, cfg.ShutdownTiming.Total, "the reply was not blocked: its request ended before shutdown.total")
+	<-written
+}
+
+// gatedHandler discards every record but holds each record with message
+// until open runs. held is closed when the first one arrives.
+type gatedHandler struct {
+	message string
+	first   sync.Once
+	held    chan struct{}
+	gate    chan struct{}
+	open    func()
+}
+
+func newGatedHandler(t *testing.T, message string) *gatedHandler {
+	g := &gatedHandler{message: message, held: make(chan struct{}), gate: make(chan struct{})}
+	g.open = sync.OnceFunc(func() { close(g.gate) })
+	t.Cleanup(g.open)
+
+	return g
+}
+
+func (*gatedHandler) Enabled(context.Context, slog.Level) bool {
+	return true
+}
+
+//nolint:gocritic // hugeParam: slog.Handler fixes the record's type.
+func (g *gatedHandler) Handle(_ context.Context, record slog.Record) error {
+	if record.Message != g.message {
+		return nil
+	}
+
+	g.first.Do(func() { close(g.held) })
+	<-g.gate
+
+	return nil
+}
+
+func (g *gatedHandler) WithAttrs([]slog.Attr) slog.Handler {
+	return g
+}
+
+func (g *gatedHandler) WithGroup(string) slog.Handler {
+	return g
+}
+
+// The Wyoming request has left the pipeline, so Drain returns, but its
+// connection goroutine is held writing the request log line; shutdown.hard
+// must also bound the wait for that goroutine.
+func TestServe_Wyoming_GoroutineOutlivesHard_ReturnsError(t *testing.T) {
+	cfg := wyomingEnabled(t)
+	cfg.ShutdownTiming = ShutdownTimingConfig{Total: forcedTotal, Hard: cancelledHard}
+	reached := make(chan struct{})
+	service := serviceFor(t, &cfg, func(_ http.ResponseWriter, r *http.Request) {
+		// The server notices a dropped client only once the body is read.
+		_, err := io.Copy(io.Discard, r.Body)
+		assert.NoError(t, err)
+		close(reached)
+		<-r.Context().Done()
+	}, &http.Client{})
+	logs := newGatedHandler(t, requestLogMessage)
+
+	s := startServeLogged(t, &cfg, service, slog.New(logs))
+	c := dialWyoming(t, s)
+	c.send(eventSynthesize, `{"text":"hi"}`)
+	select {
+	case <-reached:
+	case <-time.After(probeTimeout):
+		require.FailNow(t, "the synthesis never reached the upstream")
+	}
+	s.cancel()
+
+	err := requireServeReturns(t, s.done, cfg.ShutdownTiming.Total+cfg.ShutdownTiming.Hard+shutdownSlack)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "still running")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	select {
+	case <-logs.held:
+	default:
+		require.FailNow(t, "the request log line was never written")
+	}
+	assert.NoError(t, service.pipeline.Drain(t.Context()), "the request still holds its pipeline admission")
+}
+
+// stoppedListener fails every Accept with err.
+type stoppedListener struct {
+	err error
+}
+
+func (l stoppedListener) Accept() (net.Conn, error) {
+	return nil, l.err
+}
+
+func (stoppedListener) Close() error {
+	return nil
+}
+
+func (stoppedListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
+}
+
+func TestServeWyoming_AcceptError_IsReturnedWrapped(t *testing.T) {
+	cfg := validConfig(t)
+	service := newService(t, http.NotFound)
+	wyomingCfg := cfg.wyomingConfig(Version)
+	server := wyoming.New(t.Context(), &wyomingCfg, service.pipeline, slog.New(slog.DiscardHandler))
+	acceptErr := errors.New("accept broke")
+
+	err := serveWyoming(server, stoppedListener{err: acceptErr})
+
+	require.ErrorIs(t, err, acceptErr)
+	assert.True(t, strings.HasPrefix(err.Error(), "wyoming server: wyoming accept"), "error %q", err)
+}
+
+// When one server's Serve fails, serveOn returns before the other server's
+// goroutine may have registered its listener; that listener must still be
+// closed when serveOn returns.
+func TestServeOn_AcceptFails_ClosesThePeerListener(t *testing.T) {
+	acceptErr := errors.New("accept broke")
+	tests := map[string]func(peer net.Listener) *listeners{
+		"http fails": func(peer net.Listener) *listeners {
+			return &listeners{http: stoppedListener{err: acceptErr}, wyoming: peer}
+		},
+		"wyoming fails": func(peer net.Listener) *listeners {
+			return &listeners{http: peer, wyoming: stoppedListener{err: acceptErr}}
+		},
+	}
+
+	for name, handed := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := wyomingEnabled(t)
+			peer := listenLoopback(t, loopbackHost)
+
+			err := serveOn(t.Context(), &cfg, newService(t, http.NotFound), handed(peer), slog.New(slog.DiscardHandler))
+
+			require.ErrorIs(t, err, acceptErr)
+			assert.ErrorIs(t, peer.Close(), net.ErrClosed, "serveOn returned with the peer listener open")
+		})
+	}
+}
+
+// During shutdown.grace the Wyoming listener still accepts connections and
+// serves them, as the HTTP listener does. The log line that ends the grace
+// period is held, so the listeners stay as the grace period left them until
+// the test has checked them.
+func TestServe_Wyoming_GraceKeepsServingNewConnections(t *testing.T) {
+	cfg := wyomingEnabled(t)
+	cfg.ShutdownTiming.Grace = graceWindow
+	logs := newGatedHandler(t, drainLogMessage)
+	s := startServeLogged(t, &cfg, newService(t, http.NotFound), slog.New(logs))
+	waitReady(t, s.base)
+
+	signalled := time.Now()
+	s.cancel()
+	select {
+	case <-logs.held:
+	case <-time.After(cfg.ShutdownTiming.Grace + probeTimeout):
+		require.FailNow(t, "the grace period never ended")
+	}
+	assert.GreaterOrEqual(t, time.Since(signalled), cfg.ShutdownTiming.Grace, "the listeners were shut down before shutdown.grace ended")
+	status, err := get(t.Context(), s.base+"/internal/readiness")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusServiceUnavailable, status, "the readiness probe did not report the shutdown")
+	c := connectWyoming(t, s)
+	c.send(eventDescribe, "")
+	c.readType(eventInfo)
+
+	select {
+	case err = <-s.done:
+		require.FailNow(t, "serve returned during shutdown.grace", "error: %v", err)
+	default:
+	}
+	logs.open()
+	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+	c.requireClosed()
+}
+
+func TestServe_Wyoming_SilentRecording_DoesNotDelayShutdown(t *testing.T) {
+	cfg := wyomingEnabled(t)
+	cfg.ShutdownTiming = ShutdownTimingConfig{Total: forcedTotal, Hard: cancelledHard}
+
+	s := startServe(t, &cfg, newService(t, http.NotFound))
+	c := dialWyoming(t, s)
+	c.send(eventAudioStart, `{"rate":16000,"width":2,"channels":1}`)
+	c.send(eventPing, "")
+	c.readType(eventPong)
+	signalled := time.Now()
+	s.cancel()
+
+	budget := cfg.ShutdownTiming.Total + cfg.ShutdownTiming.Hard + shutdownSlack
+	require.NoError(t, requireServeReturns(t, s.done, budget))
+	assert.Less(t, time.Since(signalled), budget)
+	c.requireClosed()
+}
+
+// listenRecorder binds as serve does and records every address it was asked
+// for and every listener it opened.
+type listenRecorder struct {
+	addrs []string
+	// ctxErrs holds each call's ctx.Err() at the time of the call.
+	ctxErrs   []error
+	listeners []net.Listener
+}
+
+func (r *listenRecorder) listen(ctx context.Context, network, addr string) (net.Listener, error) {
+	r.addrs = append(r.addrs, addr)
+	r.ctxErrs = append(r.ctxErrs, ctx.Err())
+	listener, err := (&net.ListenConfig{}).Listen(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	r.listeners = append(r.listeners, listener)
+
+	return listener, nil
+}
+
+// A stop signal while the HTTP address resolves must end in the grace
+// period, not in a failed start, so the HTTP bind ignores cancellation.
+func TestBind_CancelledContext_BindsHTTP(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Host = loopbackHost
+	cfg.Port = 0
+	recorder := &listenRecorder{}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	ls, err := bind(ctx, &cfg, slog.New(slog.DiscardHandler), recorder.listen)
+
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, ls.http.Close()) })
+	assert.Equal(t, []error{nil}, recorder.ctxErrs, "the HTTP bind was given a cancelled context")
+}
+
+func TestBind_WyomingDisabled_OpensNoPort(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Host = loopbackHost
+	cfg.Port = 0
+	recorder := &listenRecorder{}
+
+	ls, err := bind(t.Context(), &cfg, slog.New(slog.DiscardHandler), recorder.listen)
+
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, ls.http.Close()) })
+	assert.Nil(t, ls.wyoming, "a Wyoming listener was opened while it is disabled")
+	assert.Equal(t, []string{net.JoinHostPort(loopbackHost, "0")}, recorder.addrs, "bind must open the HTTP listener alone")
+}
+
+func TestServe_WyomingPortInUse_ReturnsError(t *testing.T) {
+	cfg := wyomingEnabled(t)
+	cfg.Host = loopbackHost
+	cfg.Port = portOf(t, listenLoopback(t, loopbackHost))
+	cfg.Wyoming.Host = loopbackHost
+	cfg.Wyoming.Port = portOf(t, listenLoopback(t, loopbackHost))
+	recorder := &listenRecorder{}
+
+	ls, err := bind(t.Context(), &cfg, slog.New(slog.DiscardHandler), recorder.listen)
+
+	require.Error(t, err)
+	assert.Nil(t, ls)
+	assert.Equal(t, []string{net.JoinHostPort(cfg.Wyoming.Host, strconv.Itoa(cfg.Wyoming.Port))}, recorder.addrs,
+		"bind tried the HTTP port after the Wyoming bind failed")
+
+	err = requireServeReturns(t, launchServe(t, &cfg, newService(t, http.NotFound)), probeTimeout)
+	require.Error(t, err)
+	assert.True(t, strings.HasPrefix(err.Error(), "wyoming listener: "), "error %q", err)
+	assert.Contains(t, err.Error(), "address already in use")
+}
+
+func TestBind_HTTPPortInUse_ClosesTheWyomingListener(t *testing.T) {
+	cfg := wyomingEnabled(t)
+	cfg.Host = loopbackHost
+	cfg.Port = portOf(t, listenLoopback(t, loopbackHost))
+	cfg.Wyoming.Host = loopbackHost
+	cfg.Wyoming.Port = 0
+	recorder := &listenRecorder{}
+
+	ls, err := bind(t.Context(), &cfg, slog.New(slog.DiscardHandler), recorder.listen)
+
+	require.Error(t, err)
+	assert.True(t, strings.HasPrefix(err.Error(), "http listener: "), "error %q", err)
+	assert.Contains(t, err.Error(), "address already in use")
+	assert.Nil(t, ls)
+	require.Len(t, recorder.listeners, 1, "only the Wyoming bind succeeds")
+	assert.ErrorIs(t, recorder.listeners[0].Close(), net.ErrClosed, "bind returned with the Wyoming listener open")
+}
+
+func TestServe_HTTPPortInUse_ReturnsError(t *testing.T) {
+	cfg := wyomingEnabled(t)
+	cfg.Host = loopbackHost
+	cfg.Port = portOf(t, listenLoopback(t, loopbackHost))
+	cfg.Wyoming.Host = loopbackHost
+	cfg.Wyoming.Port = 0
+
+	err := requireServeReturns(t, launchServe(t, &cfg, newService(t, http.NotFound)), probeTimeout)
+
+	require.Error(t, err)
+	assert.True(t, strings.HasPrefix(err.Error(), "http listener: "), "error %q", err)
+	assert.Contains(t, err.Error(), "address already in use")
+}
+
+func TestServe_Wyoming_IPv6Loopback_Binds(t *testing.T) {
+	probe, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", net.JoinHostPort(ipv6Loopback, "0"))
+	if err != nil {
+		t.Skipf("no IPv6 loopback here: %v", err)
+	}
+	require.NoError(t, probe.Close())
+
+	cfg := wyomingEnabled(t)
+	cfg.Wyoming.Host = ipv6Loopback
+	require.NoError(t, cfg.Validate())
+	cfg.Host = loopbackHost
+	cfg.Port = 0
+	cfg.Wyoming.Port = 0
+
+	ls, err := bind(t.Context(), &cfg, slog.New(slog.DiscardHandler), (&net.ListenConfig{}).Listen)
+	require.NoError(t, err)
+	closeOnCleanup(t, ls.http)
+	closeOnCleanup(t, ls.wyoming)
+	wyomingAddr, ok := ls.wyoming.Addr().(*net.TCPAddr)
+	require.True(t, ok)
+	assert.True(t, wyomingAddr.IP.Equal(net.IPv6loopback), "the Wyoming listener bound %s", wyomingAddr)
+	httpAddr, ok := ls.http.Addr().(*net.TCPAddr)
+	require.True(t, ok)
+	assert.True(t, httpAddr.IP.Equal(net.ParseIP(loopbackHost)), "the HTTP listener bound %s", httpAddr)
+
+	s := startServeOn(t, &cfg, newService(t, http.NotFound), ls, slog.New(slog.DiscardHandler))
+	c := dialWyoming(t, s)
+	c.send(eventDescribe, "")
+	c.readType(eventInfo)
+
+	s.cancel()
+	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+}
+
+func TestServeWith_BindsAndServes(t *testing.T) {
+	tests := map[string]bool{"wyoming disabled": false, "wyoming enabled": true}
+
+	for name, wyomingOn := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.Host = loopbackHost
+			cfg.Port = 0
+			cfg.Wyoming.Enabled = wyomingOn
+			cfg.Wyoming.Host = loopbackHost
+			cfg.Wyoming.Port = 0
+			bound := make(chan net.Listener, 2)
+			listen := func(ctx context.Context, network, addr string) (net.Listener, error) {
+				listener, err := (&net.ListenConfig{}).Listen(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				bound <- listener
+
+				return listener, nil
+			}
+
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() {
+				done <- serveWith(ctx, &cfg, newService(t, http.NotFound), slog.New(slog.DiscardHandler), listen)
+			}()
+
+			s := &served{cancel: cancel, done: done}
+			if wyomingOn {
+				s.wyoming = nextListener(t, bound).Addr().String()
+			}
+			s.base = "http://" + nextListener(t, bound).Addr().String()
+			waitReady(t, s.base)
+			if wyomingOn {
+				c := connectWyoming(t, s)
+				c.send(eventDescribe, "")
+				c.readType(eventInfo)
+			}
+
+			s.cancel()
+			require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+		})
+	}
+}
+
+// nextListener returns the next listener serveWith's listen function opened;
+// bind opens Wyoming before HTTP.
+func nextListener(t *testing.T, bound <-chan net.Listener) net.Listener {
+	t.Helper()
+
+	select {
+	case listener := <-bound:
+		return listener
+	case <-time.After(probeTimeout):
+		require.FailNow(t, "serveWith did not bind")
+		return nil
+	}
 }

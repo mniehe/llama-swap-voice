@@ -3,15 +3,21 @@ package main
 import (
 	"errors"
 	"fmt"
+	"math"
+	"net"
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/mniehe/llama-swap-voice/internal/audio"
 	"github.com/mniehe/llama-swap-voice/internal/observability"
-	"github.com/mniehe/llama-swap-voice/internal/server"
+	"github.com/mniehe/llama-swap-voice/internal/pipeline"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 	"github.com/mniehe/llama-swap-voice/internal/voices"
+	"github.com/mniehe/llama-swap-voice/internal/wyoming"
 )
 
 var Version = "0.0.0-dev"
@@ -20,12 +26,15 @@ const (
 	minPort           = 1
 	maxPort           = 65535
 	minTTSConcurrency = 1
+	minStreamingChars = 1
+	languageSeparator = ","
 )
 
 var (
 	upstreamSchemes = []string{"http", "https"}
 	logLevels       = []string{observability.LevelDebug, observability.LevelInfo, observability.LevelWarn, observability.LevelError}
 	logFormats      = []string{observability.FormatJSON, observability.FormatConsole}
+	streamingModes  = []wyoming.Mode{wyoming.ModeSentences, wyoming.ModeWhole}
 )
 
 type ServiceConfig struct {
@@ -38,6 +47,7 @@ type ServiceConfig struct {
 	Request        RequestConfig        `koanf:"request"`
 	Logger         LoggerConfig         `koanf:"log"`
 	ShutdownTiming ShutdownTimingConfig `koanf:"shutdown"`
+	Wyoming        WyomingConfig        `koanf:"wyoming"`
 }
 
 type UpstreamConfig struct {
@@ -71,6 +81,18 @@ type RequestConfig struct {
 type LoggerConfig struct {
 	Level  string `koanf:"level"`
 	Format string `koanf:"format"`
+}
+
+// WyomingConfig is the Wyoming listener's. Host is a bare address, so an
+// IPv6 one is written without brackets. Languages is a comma-separated list.
+type WyomingConfig struct {
+	Enabled           bool         `koanf:"enabled"`
+	Host              string       `koanf:"host"`
+	Port              int          `koanf:"port"`
+	Languages         string       `koanf:"languages"`
+	Speed             float64      `koanf:"speed"`
+	Streaming         wyoming.Mode `koanf:"streaming"`
+	StreamingMaxChars int          `koanf:"streamingmaxchars"`
 }
 
 type ShutdownTimingConfig struct {
@@ -113,6 +135,15 @@ var defaultConfig = ServiceConfig{
 		Grace: 0,
 		Hard:  3 * time.Second,
 	},
+	Wyoming: WyomingConfig{
+		Enabled:           false,
+		Host:              "127.0.0.1",
+		Port:              10300,
+		Languages:         "en",
+		Speed:             1.0,
+		Streaming:         wyoming.ModeSentences,
+		StreamingMaxChars: 300,
+	},
 }
 
 func (c *ServiceConfig) Validate() error {
@@ -123,6 +154,7 @@ func (c *ServiceConfig) Validate() error {
 		c.validateLimits(),
 		c.validateLogger(),
 		c.validateShutdown(),
+		c.validateWyoming(),
 	}
 
 	return errors.Join(errs...)
@@ -237,8 +269,64 @@ func (c *ServiceConfig) validateShutdown() error {
 	return errors.Join(errs...)
 }
 
-func (c *ServiceConfig) serverConfig(voiceFiles map[string]string) server.Config {
-	return server.Config{
+func (c *ServiceConfig) validateWyoming() error {
+	w := &c.Wyoming
+	if !w.Enabled {
+		return nil
+	}
+
+	var errs []error
+
+	if w.Port < minPort || w.Port > maxPort {
+		errs = append(errs, fmt.Errorf("wyoming.port must be between %d and %d, got %d", minPort, maxPort, w.Port))
+	}
+
+	if w.Host == c.Host && w.Port == c.Port {
+		errs = append(errs, fmt.Errorf("wyoming.host and wyoming.port must differ from host and port, both %s", net.JoinHostPort(c.Host, strconv.Itoa(c.Port))))
+	}
+
+	if slices.Contains(splitLanguages(w.Languages), "") {
+		errs = append(errs, fmt.Errorf("wyoming.languages must be a comma-separated list of non-empty languages, got %q", w.Languages))
+	}
+
+	if math.IsNaN(w.Speed) || w.Speed < audio.MinSpeed || w.Speed > audio.MaxSpeed {
+		errs = append(errs, fmt.Errorf("wyoming.speed must be between %g and %g, got %g", audio.MinSpeed, audio.MaxSpeed, w.Speed))
+	}
+
+	if !slices.Contains(streamingModes, w.Streaming) {
+		errs = append(errs, fmt.Errorf("wyoming.streaming must be %s or %s, got %q", wyoming.ModeSentences, wyoming.ModeWhole, w.Streaming))
+	}
+
+	if w.StreamingMaxChars < minStreamingChars || w.StreamingMaxChars > c.TTS.MaxInputChars {
+		errs = append(errs, fmt.Errorf("wyoming.streamingmaxchars must be between %d and %d, got %d", minStreamingChars, c.TTS.MaxInputChars, w.StreamingMaxChars))
+	}
+
+	return errors.Join(errs...)
+}
+
+// splitLanguages splits a comma-separated list and trims each entry, so an
+// empty string gives one empty entry.
+func splitLanguages(list string) []string {
+	languages := strings.Split(list, languageSeparator)
+	for i, language := range languages {
+		languages[i] = strings.TrimSpace(language)
+	}
+
+	return languages
+}
+
+func (c *ServiceConfig) wyomingConfig(version string) wyoming.Config {
+	return wyoming.Config{
+		Languages:         splitLanguages(c.Wyoming.Languages),
+		Speed:             c.Wyoming.Speed,
+		Streaming:         c.Wyoming.Streaming,
+		StreamingMaxChars: c.Wyoming.StreamingMaxChars,
+		Version:           version,
+	}
+}
+
+func (c *ServiceConfig) serverConfig(voiceFiles map[string]string) pipeline.Config {
+	return pipeline.Config{
 		TTSModel:         c.Upstream.TTSModel,
 		ASRModel:         c.Upstream.ASRModel,
 		Voices:           voiceFiles,

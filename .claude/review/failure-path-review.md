@@ -20,27 +20,35 @@ termination owner.
 Go only. Intended outcomes, from the code and `docs/api.md`:
 
 - Before the response is committed (`committed`) a failure is a JSON error
-  through `writeError` (`internal/server/respond.go`); the readiness
+  through `writeError` (`internal/openai/respond.go`); the readiness
   probe's plain-text 503 while shutting down is the one exception. Opus
   construction writes headers and can commit the 200, so `encoderFailure`
   checks. After commitment `streamFailure` (`failure.go`) logs and panics
   `http.ErrAbortHandler`: a broken transfer is intended, not swallowed.
-- `upstreamFailure` passes a `StatusError` of 400 or more through with
-  `Retry-After` (lower codes become 502) before it looks at the context;
-  other errors answer 504 if the context ended (as `unlessRequestEnded`
-  does), else 502. Bad speech JSON or multipart is a 400 directly.
-- `decodeFailure`: an ended context is 504 first; `ErrTooLong` is a 400
+- `internal/pipeline` returns a `*pipeline.Error` with a `Kind`, and
+  `failure` in `internal/openai/failure.go` maps it: invalid 400, busy and
+  shutting down 503 with `Connection: close`, timeout 504, upstream the
+  `StatusError` code with `Retry-After` (codes below 400 become 502) or
+  502, internal 500. `Error.Message` is the client's text.
+- `upstreamFailure` (`internal/pipeline/errors.go`) gives a `StatusError`
+  kind upstream before it looks at the context; other errors are kind
+  timeout if the context ended (as `endedOr` does for the WAV header,
+  stretcher and first PCM steps), else upstream. Bad speech JSON or
+  multipart is a 400 directly in `internal/openai`.
+- `decodeFailure` (`internal/pipeline/errors.go`): an ended context is kind
+  timeout (504) first; `ErrTooLong` is a 400
   "audio is longer than 20 minutes"; `ErrUnsupported` and `ErrCorrupt` are
   400s via `rejectAudio` whose text keeps "unsupported" or "corrupted",
-  which a client retries on; anything else is logged, 500 `errInternal`.
+  which a client retries on; anything else is logged, kind internal (500).
   `guarded` turns a decoder panic into `ErrCorrupt`; `logDecodeError`
   logs its stack.
 - `upstream.Synthesize` retries once, only when `retryable` (transport error
   or 502 with the context alive), sending a body built once. `Transcribe`
   does not retry.
-- Named best-effort steps: `closeUpstream`, `logWriteFailure`,
+- Named best-effort steps: `closeSpeech`, `closeReply`, `logWriteFailure`,
   `removeUploads`, `setDeadlines`.
-- Termination owners: the `limited` deadline from `RequestTimeout`; the
+- Termination owners: the deadline `limited` passes to `pipeline.Admit`,
+  from `RequestTimeout`; the
   upstream `http.Client` built in `cmd/llama-swap-voice/main.go` has no
   `Timeout`, so that deadline is its only bound. `ttsGate.acquire`,
   `normaliser` and `contextReader` observe the context; shutdown is bounded

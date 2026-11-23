@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/mniehe/llama-swap-voice/internal/config"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
+	"github.com/mniehe/llama-swap-voice/internal/wyoming"
 )
 
 func voicesDir(t *testing.T, names ...string) string {
@@ -107,26 +109,33 @@ func TestServiceConfig_Validate_EmptyPrefixRegexIsAllowed(t *testing.T) {
 
 func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 	env := map[string]string{
-		"HOST":                     "0.0.0.0",
-		"PORT":                     "9001",
-		"UPSTREAM_URL":             "https://llama.example:8443",
-		"UPSTREAM_TTSMODEL":        "tts-alt",
-		"UPSTREAM_ASRMODEL":        "asr-alt",
-		"UPSTREAM_TTSBACKEND":      "qwentts",
-		"UPSTREAM_TTSCONCURRENCY":  "3",
-		"VOICES_DIR":               "/srv/voices",
-		"VOICES_DEFAULT":           "bm_fable",
-		"TTS_LANG":                 "de",
-		"TTS_MAXINPUTCHARS":        "512",
-		"ASR_PREFIXREGEX":          "^x",
-		"REQUEST_TIMEOUT":          "45s",
-		"REQUEST_MAXCONCURRENT":    "2",
-		"REQUEST_MAXCONCURRENTTTS": "6",
-		"LOG_LEVEL":                "debug",
-		"LOG_FORMAT":               "console",
-		"SHUTDOWN_TOTAL":           "20s",
-		"SHUTDOWN_GRACE":           "5s",
-		"SHUTDOWN_HARD":            "1s",
+		"HOST":                      "0.0.0.0",
+		"PORT":                      "9001",
+		"UPSTREAM_URL":              "https://llama.example:8443",
+		"UPSTREAM_TTSMODEL":         "tts-alt",
+		"UPSTREAM_ASRMODEL":         "asr-alt",
+		"UPSTREAM_TTSBACKEND":       "qwentts",
+		"UPSTREAM_TTSCONCURRENCY":   "3",
+		"VOICES_DIR":                "/srv/voices",
+		"VOICES_DEFAULT":            "bm_fable",
+		"TTS_LANG":                  "de",
+		"TTS_MAXINPUTCHARS":         "512",
+		"ASR_PREFIXREGEX":           "^x",
+		"REQUEST_TIMEOUT":           "45s",
+		"REQUEST_MAXCONCURRENT":     "2",
+		"REQUEST_MAXCONCURRENTTTS":  "6",
+		"LOG_LEVEL":                 "debug",
+		"LOG_FORMAT":                "console",
+		"SHUTDOWN_TOTAL":            "20s",
+		"SHUTDOWN_GRACE":            "5s",
+		"SHUTDOWN_HARD":             "1s",
+		"WYOMING_ENABLED":           "true",
+		"WYOMING_HOST":              "::1",
+		"WYOMING_PORT":              "10301",
+		"WYOMING_LANGUAGES":         "en,de",
+		"WYOMING_SPEED":             "1.25",
+		"WYOMING_STREAMING":         "whole",
+		"WYOMING_STREAMINGMAXCHARS": "120",
 	}
 	for key, value := range env {
 		t.Setenv(envPrefix+key, value)
@@ -145,6 +154,7 @@ func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 		Request:        RequestConfig{Timeout: 45 * time.Second, MaxConcurrent: 2, MaxConcurrentTTS: 6},
 		Logger:         LoggerConfig{Level: "debug", Format: "console"},
 		ShutdownTiming: ShutdownTimingConfig{Total: 20 * time.Second, Grace: 5 * time.Second, Hard: time.Second},
+		Wyoming:        WyomingConfig{Enabled: true, Host: "::1", Port: 10301, Languages: "en,de", Speed: 1.25, Streaming: wyoming.ModeWhole, StreamingMaxChars: 120},
 	}, cfg)
 }
 
@@ -170,6 +180,15 @@ func TestLoadConfig_NoEnvironment_ReturnsDefaults(t *testing.T) {
 	assert.Equal(t, 1, cfg.Upstream.TTSConcurrency)
 	assert.Equal(t, 8, cfg.Request.MaxConcurrentTTS)
 	assert.Equal(t, upstream.LlamaCPP, cfg.Upstream.TTSBackend)
+	assert.Equal(t, WyomingConfig{
+		Enabled:           false,
+		Host:              "127.0.0.1",
+		Port:              10300,
+		Languages:         "en",
+		Speed:             1.0,
+		Streaming:         wyoming.ModeSentences,
+		StreamingMaxChars: 300,
+	}, cfg.Wyoming)
 }
 
 func TestLoadConfig_UnknownTTSBackend_FailsStartup(t *testing.T) {
@@ -217,4 +236,112 @@ func TestServiceConfig_ServerConfig_CopiesSettings(t *testing.T) {
 	assert.Equal(t, cfg.Request.MaxConcurrentTTS, got.MaxConcurrentTTS)
 	assert.Equal(t, cfg.Upstream.TTSConcurrency, got.TTSConcurrency)
 	assert.Equal(t, cfg.ASR.PrefixRegex, got.ASRPrefixRegex)
+}
+
+// enabledWyoming is a valid configuration with the Wyoming listener on.
+func enabledWyoming(t *testing.T) ServiceConfig {
+	t.Helper()
+
+	cfg := validConfig(t)
+	cfg.Wyoming.Enabled = true
+
+	return cfg
+}
+
+func TestServiceConfig_Validate_WyomingAccepts(t *testing.T) {
+	tests := map[string]func(*ServiceConfig){
+		"defaults":                   func(*ServiceConfig) {},
+		"port 1":                     func(c *ServiceConfig) { c.Wyoming.Port = 1 },
+		"port 65535":                 func(c *ServiceConfig) { c.Wyoming.Port = 65535 },
+		"http port on another host":  func(c *ServiceConfig) { c.Wyoming.Host = "0.0.0.0"; c.Wyoming.Port = c.Port },
+		"ipv6 loopback":              func(c *ServiceConfig) { c.Wyoming.Host = "::1" },
+		"two languages":              func(c *ServiceConfig) { c.Wyoming.Languages = "en,de" },
+		"languages with spaces":      func(c *ServiceConfig) { c.Wyoming.Languages = "en, de" },
+		"slowest speed":              func(c *ServiceConfig) { c.Wyoming.Speed = 0.25 },
+		"fastest speed":              func(c *ServiceConfig) { c.Wyoming.Speed = 4 },
+		"whole":                      func(c *ServiceConfig) { c.Wyoming.Streaming = wyoming.ModeWhole },
+		"sentences":                  func(c *ServiceConfig) { c.Wyoming.Streaming = wyoming.ModeSentences },
+		"one streaming char":         func(c *ServiceConfig) { c.Wyoming.StreamingMaxChars = 1 },
+		"streaming chars at the max": func(c *ServiceConfig) { c.Wyoming.StreamingMaxChars = c.TTS.MaxInputChars },
+	}
+
+	for name, edit := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := enabledWyoming(t)
+			edit(&cfg)
+
+			require.NoError(t, cfg.Validate())
+		})
+	}
+}
+
+func TestServiceConfig_Validate_WyomingRejects(t *testing.T) {
+	tests := map[string]struct {
+		edit func(*ServiceConfig)
+		want string
+	}{
+		"port 0":                       {func(c *ServiceConfig) { c.Wyoming.Port = 0 }, "wyoming.port must be between 1 and 65535, got 0"},
+		"port 65536":                   {func(c *ServiceConfig) { c.Wyoming.Port = 65536 }, "wyoming.port must be between 1 and 65535, got 65536"},
+		"the http host and port":       {func(c *ServiceConfig) { c.Wyoming.Host = c.Host; c.Wyoming.Port = c.Port }, "wyoming.host and wyoming.port must differ from host and port"},
+		"no languages":                 {func(c *ServiceConfig) { c.Wyoming.Languages = "" }, "wyoming.languages"},
+		"blank language":               {func(c *ServiceConfig) { c.Wyoming.Languages = " " }, "wyoming.languages"},
+		"empty language between":       {func(c *ServiceConfig) { c.Wyoming.Languages = "en,,de" }, "wyoming.languages"},
+		"trailing comma":               {func(c *ServiceConfig) { c.Wyoming.Languages = "en," }, "wyoming.languages"},
+		"speed too slow":               {func(c *ServiceConfig) { c.Wyoming.Speed = 0.24 }, "wyoming.speed must be between 0.25 and 4, got 0.24"},
+		"speed too fast":               {func(c *ServiceConfig) { c.Wyoming.Speed = 4.01 }, "wyoming.speed must be between 0.25 and 4, got 4.01"},
+		"speed NaN":                    {func(c *ServiceConfig) { c.Wyoming.Speed = math.NaN() }, "wyoming.speed must be between 0.25 and 4, got NaN"},
+		"unknown streaming":            {func(c *ServiceConfig) { c.Wyoming.Streaming = "words" }, `wyoming.streaming must be sentences or whole, got "words"`},
+		"empty streaming":              {func(c *ServiceConfig) { c.Wyoming.Streaming = "" }, "wyoming.streaming"},
+		"no streaming chars":           {func(c *ServiceConfig) { c.Wyoming.StreamingMaxChars = 0 }, "wyoming.streamingmaxchars must be between 1 and 4096, got 0"},
+		"streaming chars over the max": {func(c *ServiceConfig) { c.Wyoming.StreamingMaxChars = c.TTS.MaxInputChars + 1 }, "wyoming.streamingmaxchars must be between 1 and 4096, got 4097"},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := enabledWyoming(t)
+			tt.edit(&cfg)
+
+			err := cfg.Validate()
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
+		})
+	}
+}
+
+func TestLoadConfig_WyomingSpeedNaN_FailsStartup(t *testing.T) {
+	t.Setenv(envPrefix+"VOICES_DIR", voicesDir(t, "alice.mp3"))
+	t.Setenv(envPrefix+"VOICES_DEFAULT", "alice")
+	t.Setenv(envPrefix+"WYOMING_ENABLED", "true")
+	t.Setenv(envPrefix+"WYOMING_SPEED", "NaN")
+
+	_, err := loadConfig()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "wyoming.speed must be between 0.25 and 4, got NaN")
+}
+
+func TestServiceConfig_Validate_WyomingDisabledIsNotChecked(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Wyoming = WyomingConfig{Port: 0, Languages: "", Speed: 0, Streaming: "words", StreamingMaxChars: 0}
+
+	require.NoError(t, cfg.Validate())
+}
+
+func TestServiceConfig_WyomingConfig_CopiesSettings(t *testing.T) {
+	cfg := enabledWyoming(t)
+	cfg.Wyoming.Languages = "en, de"
+	cfg.Wyoming.Speed = 1.5
+	cfg.Wyoming.Streaming = wyoming.ModeWhole
+	cfg.Wyoming.StreamingMaxChars = 42
+
+	got := cfg.wyomingConfig("9.9.9")
+
+	assert.Equal(t, wyoming.Config{
+		Languages:         []string{"en", "de"},
+		Speed:             1.5,
+		Streaming:         wyoming.ModeWhole,
+		StreamingMaxChars: 42,
+		Version:           "9.9.9",
+	}, got)
 }

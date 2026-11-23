@@ -13,6 +13,8 @@ copies from a short recording you supply. This is voice cloning.
 You get:
 
 - one HTTP service with `/v1/audio/speech` and `/v1/audio/transcriptions`;
+- an optional Wyoming listener in the same service, so Home Assistant
+  connects directly;
 - a NixOS module that runs the service, adds both models to llama-swap and
   connects the two;
 - replies that stream as MP3, Opus, WAV or PCM, at any speed from 0.25 to 4;
@@ -104,8 +106,7 @@ llama-swap runs one server process for each model.
 
 ```mermaid
 flowchart LR
-  ha[Home Assistant] -->|Wyoming, TCP 10300| bridge[wyoming_openai bridge]
-  bridge -->|HTTP 8920| svc
+  ha[Home Assistant] -->|Wyoming, TCP 10300| svc
   hermes[Hermes] -->|HTTP 8920| svc
   other[Other OpenAI clients] -->|HTTP 8920| svc
   svc[llama-swap-voice service] -->|HTTP 8080| swap[llama-swap]
@@ -116,12 +117,13 @@ flowchart LR
   clips -.->|read under qwentts| ttsq
 ```
 
-Clients use OpenAI's audio API on port 8920. The ports in the diagram are
-the defaults, and llama-swap gives each model server its own port. Only one
-of the two TTS servers runs: the `tts.backend` option selects it.
-`llama-server` is the HTTP server from llama.cpp, and the Qwen TTS server is
-a Python program. Home Assistant speaks its own voice protocol, Wyoming, so
-it connects through a bridge.
+The service has two entrypoints. Clients use OpenAI's audio API on port
+8920. Home Assistant speaks its own voice protocol, Wyoming, and connects to
+port 10300 when `wyoming.enable` is on. Both entrypoints share one pipeline
+and one set of limits. The ports in the diagram are the defaults, and
+llama-swap gives each model server its own port. Only one of the two TTS
+servers runs: the `tts.backend` option selects it. `llama-server` is the
+HTTP server from llama.cpp, and the Qwen TTS server is a Python program.
 
 **A speech request**
 
@@ -335,27 +337,76 @@ tts:
 
 ### Home Assistant
 
-Home Assistant speaks the Wyoming protocol, which the service does not. Run
-the [wyoming_openai](https://github.com/roryeckel/wyoming_openai) bridge
-between them.
+Home Assistant speaks the Wyoming protocol. The service serves it on a
+second port, so Home Assistant connects to the service directly.
 
-1. Start the bridge with these environment variables:
+1. Set `wyoming.enable = true`.
+2. Set `wyoming.host` to an address of this machine that Home Assistant can
+   reach.
+3. Add Home Assistant's address or network to `ipAddressAllow`.
+4. Open the port in the firewall: set `wyoming.openFirewall = true`, or
+   open port 10300 for one interface.
+5. In Home Assistant, add the Wyoming Protocol integration with that host
+   and port 10300. It finds speech to text and text to speech.
+6. In the voice assistant settings, select a voice, or leave it unset for
+   `defaultVoice`.
 
-   ```sh
-   STT_BACKEND=OPENAI  STT_OPENAI_URL=http://localhost:8920/v1  STT_MODELS=qwen3-asr
-   TTS_BACKEND=OPENAI  TTS_OPENAI_URL=http://localhost:8920/v1  TTS_MODELS=qwen3-tts
-   TTS_VOICES=sample
-   ```
+This example is for Home Assistant in Docker on the default bridge network.
+The container reaches the host at `172.17.0.1`.
 
-2. In Home Assistant, add a Wyoming integration that points at the bridge.
-   Port 10300 is the bridge's own default.
+```nix
+services.llama-swap-voice = {
+  wyoming = {
+    enable = true;
+    host = "172.17.0.1";
+    # Speak a little faster. 1.0 leaves the speech as the model made it.
+    speed = 1.1;
+  };
+  ipAddressAllow = ["172.17.0.0/16"];
+};
+
+# Docker creates 172.17.0.1 when it starts, so bind after it.
+systemd.services.llama-swap-voice.after = ["docker.service"];
+
+# Open the port on the bridge only.
+networking.firewall.interfaces.docker0.allowedTCPPorts = [10300];
+```
+
+`ipAddressAllow = ["172.17.0.0/16"]` admits every container on the default
+bridge, not only Home Assistant. To admit Home Assistant alone, allow its
+container's own address, or put it on a user-defined Docker network and
+allow that network.
+
+`wyoming.speed` sets the speed of every reply over Wyoming. The voice keeps
+its pitch.
+
+Some details of how Home Assistant uses the service:
+
+- Home Assistant asks for the service's description every 30 seconds and
+  replaces its speech service when the description changes. A change to
+  `wyoming.streaming` therefore reaches it within about 30 seconds. To pick
+  up a new model name at once, reload the Wyoming integration.
+- Home Assistant sorts the voices by description or name. The default voice
+  is the one marked `(default)`.
+- With `wyoming.streaming = "sentences"`, the default, Home Assistant sends
+  the reply of a language model as it is written, and the service speaks
+  each sentence as soon as it is complete.
+- Each sentence takes one speech slot. Eight sentences in progress at once
+  fill the slots, and the next one fails with `busy`. Raise
+  `request.maxConcurrentTTS` if many satellites speak at the same time.
+- `ipAddressAllow` applies to the whole unit. An address that you allow for
+  Wyoming can also reach the HTTP port if `host` is an address that it can
+  reach. With `host` on its default, `127.0.0.1`, it cannot.
+
+[Wyoming](docs/options.md#wyoming) lists every option and what evaluation
+refuses.
 
 ## Reference
 
 | Page | Contents |
 |---|---|
-| [Module options](docs/options.md) | Every option; what the module refuses and what it adds to llama-swap; when the models unload; concurrency; the sandbox and the GPU; the environment variables |
-| [The HTTP API](docs/api.md) | Endpoints, audio formats, errors and status codes, limits and shutdown |
+| [Module options](docs/options.md) | Every option, the Wyoming options included; what the module refuses and what it adds to llama-swap; when the models unload; concurrency; the sandbox and the GPU; the environment variables |
+| [The HTTP API](docs/api.md) | Endpoints, audio formats, errors and status codes, limits and shutdown; the Wyoming listener's events, limits and errors |
 | [The Qwen TTS server](docs/qwen-tts-server.md) | The Python server of the `qwentts` backend: startup and exit, behaviour under llama-swap, the configuration file, endpoints and errors |
 
 ## Running without Nix

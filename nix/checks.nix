@@ -95,7 +95,7 @@
     extract ${rfc8251Vectors} $out/rfc8251 36
   '';
 in {
-  inherit (moduleChecks) module-eval module-vm module-llama-swap-vm module-model-pins duration-corpus;
+  inherit (moduleChecks) module-eval module-vm module-llama-swap-vm module-wyoming-vm module-model-pins duration-corpus;
   # Defined only where the TTS server builds; a null name adds no attribute.
   ${
     if moduleChecks ? ${qwenConfigCheck}

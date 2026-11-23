@@ -7,14 +7,20 @@ streams, so trace across files rather than reading hunks alone.
 
 ## Project shape
 
-- `cmd/llama-swap-voice/main.go` wires `voices.Discover`, `upstream.New` and
-  `server.New`, then runs `serve` and `shutdown`; `config.go` holds
-  `ServiceConfig`, `Validate` and `serverConfig`.
-- `internal/server/server.go` `Handler` composes
+- `cmd/llama-swap-voice/main.go` wires `voices.Discover`, `upstream.New`,
+  `pipeline.New` and `openai.New`, then runs `serve` and `shutdown`;
+  `config.go` holds `ServiceConfig`, `Validate` and `serverConfig`, which
+  builds the `pipeline.Config`.
+- `internal/openai/server.go` `Handler` composes
   `logged(recovered(bounded(admitted(mux))))`. `limited` wraps the two audio
-  routes: a non-blocking slot from `ttsSlots` (speech) or `slots`
-  (transcriptions), a request deadline of `RequestTimeout`, and a write
-  deadline `responseWriteSlack` later so a 504 still reaches the client.
+  routes: it takes `pipeline.RequestDeadline`, sets the connection deadlines
+  (write deadline `responseWriteSlack` later so a 504 still reaches the
+  client) before it calls `pipeline.Admit`, which takes a non-blocking slot
+  from `ttsSlots` (speech) or `slots` (transcriptions) and applies the
+  deadline. `failure` in `failure.go` maps each `pipeline.Kind` to a status.
+- `internal/pipeline` holds every step that does not depend on HTTP:
+  admission, the TTS queue, `PrepareSpeech`, `Speak`, `Transcribe`, and the
+  typed `*pipeline.Error` its callers map to their protocol.
 - `internal/audio` decodes uploads into a `normaliser` and encodes replies
   through `NewEncoder`; `libopus.go` is the only cgo file.
 - `internal/upstream/upstream.go` talks to llama-swap; `Synthesize` retries once.
@@ -24,24 +30,25 @@ streams, so trace across files rather than reading hunks alone.
 
 ## Concurrency: open these together
 
-- `internal/server/admission.go`: `enter` calls `active.Add` under the same
+- `internal/pipeline/admission.go`: `enter` calls `active.Add` under the same
   lock `close` sets `closed` with, so no handler starts once `Drain` waits.
   An `Add` outside that lock races `Wait`.
-- `internal/server/ttsgate.go`: FIFO. `acquire` takes a free slot only when
+- `internal/pipeline/ttsgate.go`: FIFO. `acquire` takes a free slot only when
   `waiters` is empty; `release` and `abandon` call `handOver`, which closes
   the oldest waiter's channel instead of incrementing `free`. A waiter whose
   context ends after it was handed the slot is gone from `waiters` and must
   pass the slot on. Every acquired slot is released once: `synthesize` in
-  `speech.go` releases on upstream error, otherwise `gatedBody` releases
-  through `once` on EOF or `Close`, and `encoded` closes the body on every
-  path through `closeUpstream`.
-- `internal/server/recovery.go`: `http.ErrAbortHandler` is re-panicked; once
+  `internal/pipeline/speech.go` releases on upstream error, otherwise
+  `gatedBody` releases through `once` on EOF or `Close`; `Speak` closes the
+  body on every failure, and `handleSpeech` closes `Speech.PCM` on every
+  path after success through `closeSpeech`.
+- `internal/openai/recovery.go`: `http.ErrAbortHandler` is re-panicked; once
   `committed` (`trackingWriter.wroteHeader`, `requestlog.go`) a recovered
   panic becomes `ErrAbortHandler`, never a JSON body appended to audio.
 - `cmd/llama-swap-voice/main.go` shutdown, three steps: `SetShuttingDown`
   and a `Grace` sleep; `drain` (`httpServer.Shutdown` bounded by `Total`);
   on timeout `cancelRequests` cancels the `BaseContext`, `httpServer.Close`,
-  then `awaitHandlers` runs `Server.Drain` bounded by `Hard`. Request
+  then `awaitHandlers` runs `pipeline.Drain` bounded by `Hard`. Request
   contexts descend from that `BaseContext`, not from the signal context.
 
 ## Lenses, in priority order
@@ -68,7 +75,8 @@ streams, so trace across files rather than reading hunks alone.
    MP3, and expect the M4A fixture to be rejected.
 5. Release: `libopus.destroy` on every path (`newOpusEncoder` `handedOver`,
    `opusEncoder.Close`); `streamEncoded` closes the encoder after a failed
-   write; `removeUploads` after `ParseMultipartForm`; slots in `limited`.
+   write; `removeUploads` after `ParseMultipartForm`; the slot release
+   `pipeline.Admit` returns, deferred in `limited`.
 6. Contracts: an endpoint, status, limit or environment variable changed
    without the page that documents it (`docs/api.md`, `docs/options.md`,
    `docs/qwen-tts-server.md`); an error body not written through `writeError` in
@@ -80,7 +88,7 @@ streams, so trace across files rather than reading hunks alone.
 - Every successful `ttsGate.acquire` meets exactly one release on every
   path: upstream error, body never read. A failed acquire holds no slot.
 - Every new `ServiceConfig` field is validated and reaches the component
-  that owns it; only server settings go through `serverConfig`.
+  that owns it; only pipeline settings go through `serverConfig`.
 - Every new third-party call that parses untrusted compressed data sits
   inside `guarded` in `audio.go`; setup from validated values and plain
   accessors (`opus.NewDecoderWithOutput`, `SampleRate`) need not.

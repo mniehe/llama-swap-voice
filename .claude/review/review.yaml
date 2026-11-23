@@ -12,7 +12,7 @@ tags:
   audio: [internal/audio/**]
   voices: [internal/voices/**]
   upstream: [internal/upstream/**]
-  server: [internal/server/**]
+  server: [internal/openai/**, internal/pipeline/**, internal/wyoming/**]
   runtime: [cmd/llama-swap-voice/**]
   tts-server: [python/**, nix/qwen-tts-server/**]
   build: [go.mod, go.sum, .golangci.yaml, .claude/review/review.yaml, flake.nix, flake.lock, gomod2nix.toml, nix/**, .cog.toml]
@@ -44,10 +44,12 @@ verify_notes: |
   Run every Go command inside the flake's dev shell,
   `nix develop -c <command>`;
   outside it cgo fails with "could not import C". Tests need no GPU, model or
-  running llama-swap: server tests drive the real handlers against the fake
-  upstream in internal/server/harness_test.go. opus-tools (opusinfo, opusdec)
+  running llama-swap: HTTP tests drive the real handlers against the fake
+  upstream in internal/openai/harness_test.go, pipeline tests use their
+  own fake in internal/pipeline/fake_test.go, and Wyoming tests use a fake
+  client and their own fake upstream in internal/wyoming/harness_test.go. opus-tools (opusinfo, opusdec)
   and ffmpeg are test oracles in internal/audio/oracle_test.go and
-  internal/server/speech_encoding_test.go whose checks skip silently when the
+  internal/openai/speech_encoding_test.go whose checks skip silently when the
   tools are missing, so run with them present and use -v to confirm they ran.
   tools/race.txt covers every package; internal/audio takes about 100 s.
   A verifier works read-only on tracked files, which is stricter than what

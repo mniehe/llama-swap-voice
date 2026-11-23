@@ -12,14 +12,17 @@ frames.
 
 - testify `require` and/or `assert` in every test file; test names read
   `TestUnit_Condition_Result` (`TestTTSGate_Abandon_HandedSlotPassesOn`).
-- Server tests drive the real handlers through `newHarness` and
-  `newBackendHarness` in `internal/server/harness_test.go`, against
+- HTTP tests drive the real handlers through `newHarness` and
+  `newBackendHarness` in `internal/openai/harness_test.go`, against
   `fakeUpstream`; assert what upstream received with `lastCall`, `callsTo`
   and `callCount`, and the client's error text with `errorMessage`.
+  Pipeline tests build a `Pipeline` with `newPipeline` in
+  `internal/pipeline/fake_test.go` and assert the error's kind and message
+  with `requireKind`.
   `speech_encoding_test.go` swaps the package variable `newEncoder` to
   force encoder failures.
 - Oracles: `requireTool` in `internal/audio/oracle_test.go` and the helper
-  in `internal/server/speech_encoding_test.go` skip when `opusinfo`,
+  in `internal/openai/speech_encoding_test.go` skip when `opusinfo`,
   `opusdec` or `ffmpeg` is missing. A new encoder assertion that only an
   oracle checks passes silently without those tools; say so in the
   Verification hint.
@@ -29,8 +32,10 @@ frames.
   README update and a stated reason is a finding.
 - `opusCreated` and `opusDestroyed` (`libopus.go`) let tests prove every C
   encoder is freed; `encoder_test.go` shows the pattern.
-- Fuzz targets `FuzzNormaliseUpload`, `FuzzOpusPacket` (`fuzz_test.go`) and
-  `FuzzStretcher` (`wsola_test.go`). Deleting a seed needs confirmation.
+- Fuzz targets `FuzzNormaliseUpload`, `FuzzOpusPacket` (`fuzz_test.go`),
+  `FuzzStretcher` (`wsola_test.go`), `FuzzReadEvent`
+  (`internal/wyoming/fuzz_test.go`) and `FuzzSplitter`
+  (`internal/wyoming/sentences_test.go`). Deleting a seed needs confirmation.
 - A new input gets a named limit and a test at the limit, per AGENTS.md;
   `TestNormaliseUpload_OpusAtLimit_Passes` next to `..._OpusOverLimit_TooLong`
   is the shape.

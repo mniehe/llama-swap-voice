@@ -8,6 +8,7 @@
   module-eval = import ./eval.nix {inherit pkgs module;};
   module-vm = import ./vm.nix {inherit pkgs module;};
   module-llama-swap-vm = import ./llama-swap-vm.nix {inherit pkgs module;};
+  module-wyoming-vm = import ./wyoming-vm.nix {inherit pkgs module;};
   module-model-pins = import ./model-pins.nix {inherit pkgs module;};
 }
 # The server's test environment, which this check borrows, exists only where

@@ -1,14 +1,17 @@
 # Project Context
 
 llama-swap-voice is a Go HTTP service that puts OpenAI's audio API
-(`/v1/audio/speech`, `/v1/audio/transcriptions`) in front of llama-swap. It
-decodes uploads, encodes replies (mp3, opus, wav, pcm) and changes speech speed
-in-process; it runs no external programs. `README.md` and the three pages
-under `docs/` are the user-facing contract. `README.md` holds the quick start,
-voices, the common options and the licences. `docs/options.md` holds every
-module option and every environment variable. `docs/api.md` holds the
-endpoints, status codes, formats, limits and shutdown. `docs/qwen-tts-server.md`
-holds the Python server's configuration keys, endpoints and errors.
+(`/v1/audio/speech`, `/v1/audio/transcriptions`) in front of llama-swap. When
+enabled, it also serves the Wyoming protocol on a second TCP port, for Home
+Assistant, through the same pipeline. It decodes uploads, encodes replies
+(mp3, opus, wav, pcm) and changes speech speed in-process; it runs no
+external programs. `README.md` and the three pages under `docs/` are the
+user-facing contract. `README.md` holds the quick start, voices, the common
+options and the licences. `docs/options.md` holds every module option and
+every environment variable. `docs/api.md` holds the endpoints, status codes,
+formats, limits and shutdown of both the HTTP API and the Wyoming listener.
+`docs/qwen-tts-server.md` holds the Python server's configuration keys,
+endpoints and errors.
 
 `python/` holds a second program, `qwen-tts-server`: the Python
 faster-qwen3-tts server that the `qwentts` backend calls on a GPU. Its
@@ -75,11 +78,13 @@ the list above needs confirmation even when it is only a file edit.
     /testdata     # Reference clips and the commands that produced them
   /config         # Generic koanf loading from LLAMA_SWAP_VOICE_* environment variables
   /observability  # slog logger construction (json or console)
-  /server         # HTTP handlers, admission pools, the TTS queue, panic recovery, request log, JSON errors
+  /openai         # OpenAI HTTP entrypoint: handlers, request bounds, response encoding, panic recovery, request log, JSON errors
+  /pipeline       # Transport-neutral steps every entrypoint calls: admission pools, request bounds (input characters, upload size, decoded duration), request deadline, the TTS queue, shutdown admission, upload decoding, upstream calls, time-stretch, typed errors
+  /wyoming        # Wyoming TCP entrypoint: bounded event codec, connection state machine, deadlines, describe, ping, transcription, single-event and streamed synthesis, the sentence splitter, Shutdown
   /upstream       # llama-swap client: TTS backends (llamacpp, qwentts), transcription, one retry, no redirects
   /voices         # Finds and checks voice clips at startup; the llamacpp backend reopens the clip on each request
 /nix                    # packages.nix (the build), checks.nix (what nix flake check runs), devshells.nix (nix develop), module.nix (nixosModules.default), llama-swap.nix (the module's llama-swap entries and unit changes), models.nix (pinned GGUFs), qwen-tts-config.nix (the TTS server's generated config)
-  /tests                # NixOS module checks: default.nix (lists them), eval.nix (assertions, generated environment, llama-swap settings), vm.nix (VM test against fake-upstream.py, a strict fake TTS and ASR upstream), llama-swap-vm.nix (VM test under nixpkgs' llama-swap with the fakes in fakes.nix and fake-model-server.py), qwen-tts-config.nix (config.py loads the generated config), model-pins.nix (default GGUF pins, evaluation only), duration-corpus.nix with durations.nix and testdata/parse-duration.go (durations compared with Go)
+  /tests                # NixOS module checks: default.nix (lists them), eval.nix (assertions, generated environment, llama-swap settings), vm.nix (VM test against fake-upstream.py, a strict fake TTS and ASR upstream), llama-swap-vm.nix (VM test under nixpkgs' llama-swap with the fakes in fakes.nix and fake-model-server.py, and a Wyoming round trip), wyoming-vm.nix (Wyoming from a client VM: the address allow list and the firewall, one control at a time), wyoming-client.py (stdlib Wyoming client both VM tests drive), qwen-tts-config.nix (config.py loads the generated config), model-pins.nix (default GGUF pins, evaluation only), duration-corpus.nix with durations.nix and testdata/parse-duration.go (durations compared with Go)
   /qwen-tts-server      # The TTS server's CUDA environment (uv2nix), wheel overrides, weights pin, tests and launcher
 /python                 # qwen-tts-server: the faster-qwen3-tts HTTP server the qwentts backend calls; pyproject.toml and uv.lock pin its environment
   /qwen_tts_server      # app.py (endpoints), config.py, engine.py (the model), worker.py (the one CUDA thread), text.py, wav.py
@@ -106,8 +111,11 @@ them present, or a broken encoder passes.
 
 The Go tests and the GPU-free Python suite need no GPU, model or running
 llama-swap; the Python tokenizer test, which needs torch, is the one exception.
-Server tests drive the real handlers against the fake upstream in
-`internal/server/harness_test.go`.
+HTTP tests drive the real handlers against the fake upstream in
+`internal/openai/harness_test.go`; pipeline tests call `internal/pipeline`
+against their own fake upstream in `internal/pipeline/fake_test.go`; Wyoming
+tests drive a real loopback listener with a fake client and their own fake
+upstream in `internal/wyoming/harness_test.go`.
 
 The Python server under `python/` is built and tested through the flake, on
 x86_64 Linux only. Its tests run without torch against a fake engine; the
@@ -138,7 +146,7 @@ A suppression names the linter and states why.
 
 - Return errors wrapped with `%w`. `os.Exit` belongs to `main` alone, and the
   only panics outside tests are the `http.ErrAbortHandler` re-panics in
-  `internal/server`, which abort a response that has already started.
+  `internal/openai`, which abort a response that has already started.
 - Everything a client or the upstream sends is read through a bound: body
   size, decoded duration, transcript size, input characters. A new input
   gets a named limit and a test at the limit.
@@ -148,12 +156,13 @@ A suppression names the linter and states why.
   accessors run outside it.
 - Replies stream. Encode and write as audio arrives; do not buffer a whole
   reply to simplify a code path.
-- Error responses are JSON `{"error":{"message":"…"}}`, written with
-  `writeError` in `internal/server/respond.go`. Two exceptions: the readiness
+- HTTP error responses are JSON `{"error":{"message":"…"}}`, written with
+  `writeError` in `internal/openai/respond.go`. Two exceptions: the readiness
   probe answers a plain-text 503 while shutting down, and a failure after the
   response is committed aborts the transfer, because JSON appended to audio
   corrupts it. Writing the Opus headers commits the response before the
-  encoder constructor returns.
+  encoder constructor returns. A Wyoming failure is an `error` event with
+  `text` and `code`, sent before the connection closes.
 - Packages log through the `*slog.Logger` they were constructed with. Only
   `main` touches the default logger.
 - A change to an endpoint, status code, limit or environment variable updates
@@ -182,16 +191,20 @@ hosted CI and no push hook: run `nix flake check` yourself before every push.
 ```bash
 gofmt -l . && go vet ./... && golangci-lint run ./...   # gofmt -l must print nothing
 go test ./...
-go test -race ./...                  # when the change touches goroutines, channels, locks or internal/server
+go test -race ./...                  # when the change touches goroutines, channels, locks, internal/openai, internal/pipeline or internal/wyoming
 go test -run '^$' -fuzz '^FuzzNormaliseUpload$' -fuzztime 30s ./internal/audio   # when the change touches a Go parser or the time-stretch
-nix flake check                      # before a push: race tests, lint, gofmt, alejandra, Opus conformance, package version, gomod2nix sync, NixOS module eval, VM tests (with and without llama-swap), TTS server config and GGUF pins, duration corpus, the Python server's tests and weights pin
+go test -run '^$' -fuzz '^FuzzReadEvent$' -fuzztime 30s ./internal/wyoming   # when the change touches the Wyoming event codec
+go test -run '^$' -fuzz '^FuzzSplitter$' -fuzztime 30s ./internal/wyoming    # when the change touches the Wyoming sentence splitter
+nix flake check                      # before a push: race tests, lint, gofmt, alejandra, Opus conformance, package version, gomod2nix sync, NixOS module eval, VM tests (with and without llama-swap, the Wyoming round trip, the Wyoming address test), TTS server config and GGUF pins, duration corpus, the Python server's tests and weights pin
 nix build -L .#checks.x86_64-linux.qwen-tts-server-tests   # when the change touches python/ or nix/qwen-tts-server/
-nix build -L --no-link .#checks.x86_64-linux.module-eval .#checks.x86_64-linux.duration-corpus .#checks.x86_64-linux.module-model-pins .#checks.x86_64-linux.module-qwen-tts-config .#checks.x86_64-linux.module-vm .#checks.x86_64-linux.module-llama-swap-vm   # when the change touches nix/module.nix, nix/llama-swap.nix, nix/models.nix, nix/qwen-tts-config.nix, nix/tests/ or python/qwen_tts_server/config.py
+nix build -L --no-link .#checks.x86_64-linux.module-eval .#checks.x86_64-linux.duration-corpus .#checks.x86_64-linux.module-model-pins .#checks.x86_64-linux.module-qwen-tts-config .#checks.x86_64-linux.module-vm .#checks.x86_64-linux.module-llama-swap-vm .#checks.x86_64-linux.module-wyoming-vm   # when the change touches nix/module.nix, nix/llama-swap.nix, nix/models.nix, nix/qwen-tts-config.nix, nix/tests/ or python/qwen_tts_server/config.py
 nix build .#qwen-tts-server.env .#qwen-tts-server.tokenizer-test   # when the change touches python/pyproject.toml, python/uv.lock, nix/qwen-tts-server/overrides.nix, python/tests/test_tokenizer.py or python/qwen_tts_server/engine.py
 ```
 
 Run the fuzz target that reaches the changed code: `FuzzNormaliseUpload` for
-upload decoding, `FuzzOpusPacket` for Opus packets, `FuzzStretcher` for WSOLA.
+upload decoding, `FuzzOpusPacket` for Opus packets, `FuzzStretcher` for WSOLA,
+`FuzzReadEvent` (in `./internal/wyoming`) for the Wyoming event reader,
+`FuzzSplitter` (in `./internal/wyoming`) for the sentence splitter.
 A passing target that does not reach the change is not coverage. No target
 reaches `NewWAVReader` in `wavreader.go`; a change to its header parsing adds
 one.
@@ -234,7 +247,9 @@ hole, or silently corrupts audio:
 - `internal/audio/**`: parses untrusted uploads and calls libopus through cgo
 - `internal/voices/**`: reads operator files and follows symlinks
 - `internal/upstream/**`: retry, redirect refusal and response bounds
-- `internal/server/**`: request bounds, the admission pools, the TTS queue, response commitment, panic recovery
+- `internal/openai/**`: request bounds, response commitment, panic recovery
+- `internal/wyoming/**`: parses untrusted frames, connection bounds (count, idle, read and write deadlines), request cleanup, synthesis and streams with their TTS slots
+- `internal/pipeline/**`: the admission pools, the request bounds (input characters, upload size, decoded duration), the TTS queue, the request deadline, shutdown admission
 - `cmd/llama-swap-voice/**`: limit validation, connection deadlines, the three-step shutdown
 - `go.mod`, `go.sum`, `.golangci.yaml` and `.claude/review/review.yaml`, which holds shell commands that review prep runs
 - `flake.nix`, `flake.lock`, `gomod2nix.toml` and `nix/**`: the toolchain, the build and the checks that gate a push

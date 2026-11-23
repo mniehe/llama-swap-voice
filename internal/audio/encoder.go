@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 )
 
 // Format is a speech output encoding.
@@ -81,21 +82,47 @@ func (e *wavEncoder) start() error {
 	return err
 }
 
+// appendWAVHeader appends the header of 16-bit mono PCM at rate. The sizes
+// are given rather than derived so a streamed header can carry unknown ones.
 func appendWAVHeader(dst []byte, rate, riffBytes, dataBytes uint32) []byte {
+	return appendWAVFields(dst, wavFields{
+		channels:   targetChannels,
+		rate:       rate,
+		byteRate:   rate * targetChannels * sampleBytes,
+		blockAlign: targetChannels * sampleBytes,
+		bits:       targetBits,
+		riffBytes:  riffBytes,
+		dataBytes:  dataBytes,
+	})
+}
+
+// wavFields are the values of a canonical 44-byte PCM WAV header, already
+// sized to their fields.
+type wavFields struct {
+	channels   uint16
+	rate       uint32
+	byteRate   uint32
+	blockAlign uint16
+	bits       uint16
+	riffBytes  uint32
+	dataBytes  uint32
+}
+
+func appendWAVFields(dst []byte, f wavFields) []byte {
 	dst = append(dst, riffMagic...)
-	dst = binary.LittleEndian.AppendUint32(dst, riffBytes)
+	dst = binary.LittleEndian.AppendUint32(dst, f.riffBytes)
 	dst = append(dst, waveMagic...)
 	dst = append(dst, fmtChunkID...)
 	dst = binary.LittleEndian.AppendUint32(dst, fmtChunkBytes)
 	dst = binary.LittleEndian.AppendUint16(dst, formatPCM)
-	dst = binary.LittleEndian.AppendUint16(dst, targetChannels)
-	dst = binary.LittleEndian.AppendUint32(dst, rate)
-	dst = binary.LittleEndian.AppendUint32(dst, rate*targetChannels*sampleBytes)
-	dst = binary.LittleEndian.AppendUint16(dst, targetChannels*sampleBytes)
-	dst = binary.LittleEndian.AppendUint16(dst, targetBits)
+	dst = binary.LittleEndian.AppendUint16(dst, f.channels)
+	dst = binary.LittleEndian.AppendUint32(dst, f.rate)
+	dst = binary.LittleEndian.AppendUint32(dst, f.byteRate)
+	dst = binary.LittleEndian.AppendUint16(dst, f.blockAlign)
+	dst = binary.LittleEndian.AppendUint16(dst, f.bits)
 	dst = append(dst, dataChunkID...)
 
-	return binary.LittleEndian.AppendUint32(dst, dataBytes)
+	return binary.LittleEndian.AppendUint32(dst, f.dataBytes)
 }
 
 // framer gathers s16le bytes into frames of a fixed number of samples for a
@@ -154,4 +181,59 @@ func (f *framer) flush() error {
 	}
 
 	return f.emit(f.samples)
+}
+
+const maxHeaderSampleBytes = 4
+
+// WAVHeader returns the 44-byte header of a PCM WAV whose data chunk holds
+// dataBytes of interleaved little-endian samples width bytes wide.
+func WAVHeader(rate, width, channels, dataBytes int) ([]byte, error) {
+	sampleBits, bitsFit := fitUint16(int64(width) * bitsPerByte)
+	if !bitsFit || width < 1 || width > maxHeaderSampleBytes {
+		return nil, fmt.Errorf("WAV sample width of %d bytes is not 1 to %d", width, maxHeaderSampleBytes)
+	}
+
+	rate32, rateFits := fitUint32(int64(rate))
+	channels16, channelsFit := fitUint16(int64(channels))
+	blockAlign, blockFits := fitUint16(int64(channels) * int64(width))
+	byteRate, byteRateFits := fitUint32(int64(rate) * int64(channels) * int64(width))
+	data32, dataFits := fitUint32(int64(dataBytes))
+	riffBytes, riffFits := fitUint32(int64(dataBytes) + wavHeaderBytes - riffHeaderBytes)
+
+	switch {
+	case !rateFits || rate32 == 0:
+		return nil, fmt.Errorf("WAV sample rate %d does not fit the header", rate)
+	case !channelsFit || channels16 == 0 || !blockFits:
+		return nil, fmt.Errorf("WAV with %d channels of %d bytes does not fit the header", channels, width)
+	case !byteRateFits:
+		return nil, fmt.Errorf("WAV byte rate of %d Hz, %d channels and %d bytes does not fit the header", rate, channels, width)
+	case !dataFits || !riffFits:
+		return nil, fmt.Errorf("WAV data of %d bytes does not fit the header", dataBytes)
+	}
+
+	return appendWAVFields(make([]byte, 0, wavHeaderBytes), wavFields{
+		channels:   channels16,
+		rate:       rate32,
+		byteRate:   byteRate,
+		blockAlign: blockAlign,
+		bits:       sampleBits,
+		riffBytes:  riffBytes,
+		dataBytes:  data32,
+	}), nil
+}
+
+func fitUint32(value int64) (uint32, bool) {
+	if value < 0 || value > math.MaxUint32 {
+		return 0, false
+	}
+
+	return uint32(value), true
+}
+
+func fitUint16(value int64) (uint16, bool) {
+	if value < 0 || value > math.MaxUint16 {
+		return 0, false
+	}
+
+	return uint16(value), true
 }

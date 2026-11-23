@@ -10,6 +10,26 @@
   stateDir = "/var/lib/llama-swap-voice";
   transcript = "The kitchen lights are off.";
 
+  # A second voice with its own clip, so a recorded request shows which
+  # voice the service chose. A quarter second keeps the recorded body small
+  # enough for the driver's console.
+  narratorClip = "/srv/clips/narrator.wav";
+  narratorSource = pkgs.runCommand "narrator.wav" {nativeBuildInputs = [pkgs.python3];} ''
+    python3 -I - ${fixture} $out <<'EOF'
+    import sys, wave
+    with wave.open(sys.argv[1], "rb") as src:
+        params = src.getparams()
+        frames = src.readframes(params.framerate // 4)
+    with wave.open(sys.argv[2], "wb") as dst:
+        dst.setparams(params)
+        dst.writeframes(frames)
+    EOF
+  '';
+
+  wyomingClient = pkgs.writeShellScriptBin "wyoming-client" ''
+    exec ${pkgs.python3}/bin/python3 -I ${./wyoming-client.py} "$@"
+  '';
+
   # Not llama-swap's default port, so an upstreamURL that ignores
   # services.llama-swap misses it.
   llamaSwapPort = 8090;
@@ -22,6 +42,8 @@
       "C ${clip} - - - - ${fixture}"
       # Readable by the module's group and nobody else, as the docs ask.
       "z ${clip} 0640 root llama-swap-voice -"
+      "C ${narratorClip} - - - - ${narratorSource}"
+      "z ${narratorClip} 0640 root llama-swap-voice -"
     ];
 
     services.llama-swap = {
@@ -36,6 +58,7 @@
       voices.sample = {
         inherit clip transcript;
       };
+      voices.narrator.clip = narratorClip;
       llamaCpp.package = fakes.llamaServer;
       models = {
         asr.artifacts = fakes.artifacts.asr;
@@ -49,6 +72,16 @@
 
     environment.systemPackages = [pkgs.curl pkgs.jq];
     virtualisation.memorySize = 1024;
+  };
+
+  # The round trip stays on loopback; wyoming-vm.nix covers remote clients.
+  wyomingNode = backend: {
+    imports = [(node backend)];
+    services.llama-swap-voice.wyoming = {
+      enable = true;
+      speed = 1.0;
+    };
+    environment.systemPackages = [wyomingClient];
   };
 
   # The consumer's own model in no group, so llama-swap puts it in its
@@ -66,8 +99,8 @@ in
     name = "llama-swap-voice-llama-swap";
 
     nodes = {
-      llamacpp = node "llamacpp";
-      qwentts = node "qwentts";
+      llamacpp = wyomingNode "llamacpp";
+      qwentts = wyomingNode "qwentts";
       pinned = chatNode {};
       takeTurns = chatNode {llamaSwap.group.sharing = "takeTurns";};
     };
@@ -76,9 +109,12 @@ in
       models = node: node.services.llama-swap.settings.models;
     in ''
       import base64
+      import email.parser
+      import email.policy
       import hashlib
       import json
       import re
+      import wave
 
       FIXTURE = "${fixture}"
       STATE_DIR = "${stateDir}"
@@ -89,10 +125,14 @@ in
       TTS_MODEL = "${fakes.artifacts.tts.model.path}"
       QWEN_CMD = "${(models nodes.qwentts).qwen3-tts.cmd}"
       SPEECH = "http://127.0.0.1:8920/v1/audio/speech"
+      NARRATOR_CLIP = "${narratorClip}"
 
 
+      # Complete lines only: the fake appends a response record after its reply
+      # has gone, so a read can meet that line half-written.
       def records(machine, path):
-          return [json.loads(line) for line in machine.succeed(f"cat {path}").splitlines()]
+          lines = machine.succeed(f"cat {path}").split("\n")[:-1]
+          return [json.loads(line) for line in lines]
 
 
       def request_body(machine, path, request):
@@ -180,7 +220,8 @@ in
           assert voice["transcript"] == TRANSCRIPT, voice
           # The fake read the clip through the voices directory as llama-swap's user.
           clip_sha256 = qwentts.succeed(f"sha256sum {FIXTURE}").split()[0]
-          assert start["clips"] == {"sample": clip_sha256}, start["clips"]
+          narrator_sha256 = qwentts.succeed(f"sha256sum {NARRATOR_CLIP}").split()[0]
+          assert start["clips"] == {"sample": clip_sha256, "narrator": narrator_sha256}, start["clips"]
 
       with subtest("qwentts: speech posts JSON naming the voice, with no clip bytes"):
           status = speech(qwentts, "/tmp/out.wav")
@@ -204,6 +245,95 @@ in
           assert len(starts(llamacpp, LLAMA_RECORD, TTS_MODEL)) == 1
           assert len(starts(qwentts, LLAMA_RECORD, ASR_MODEL)) == 1
           assert len(starts(qwentts, QWEN_RECORD, None)) == 1
+
+
+      def wyoming(machine, args):
+          return json.loads(machine.succeed(f"wyoming-client {args}"))
+
+
+      def multipart_fields(content_type, raw):
+          head = f"Content-Type: {content_type}\r\n\r\n".encode()
+          message = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(head + raw)
+          return {part.get_param("name", header="content-disposition"): part.get_payload(decode=True) for part in message.iter_parts()}
+
+
+      with wave.open(FIXTURE, "rb") as reply_wav:
+          REPLY_PCM_SHA256 = hashlib.sha256(reply_wav.readframes(reply_wav.getnframes())).hexdigest()
+
+      # The Wyoming listener binds before the HTTP one, so the waits for port
+      # 8920 above already cover port 10300.
+      with subtest("wyoming: info names the declared voices, the default first"):
+          for machine in (llamacpp, qwentts):
+              info = wyoming(machine, "describe")
+              assert info["tts_voices"] == [
+                  {"name": "sample", "description": "sample (default)"},
+                  {"name": "narrator", "description": "narrator"},
+              ], info
+              assert info["asr_models"] == ["qwen3-asr"], info
+              assert info["supports_synthesize_streaming"] == [True], info
+
+      with subtest("wyoming: a transcription of the fixture returns the fake model's text"):
+          for machine in (llamacpp, qwentts):
+              reply = wyoming(machine, f"transcribe {FIXTURE}")
+              assert reply == {"text": TRANSCRIPT}, reply
+              asr = [r for r in records(machine, LLAMA_RECORD) if r["event"] == "request" and r["path"] == "/v1/audio/transcriptions"]
+              assert len(asr) == 2, asr
+
+      # Waits up to 5 s for a response record per request, then summarises both,
+      # so a broken reply shows how many bytes the fake wrote.
+      def wire(machine, path):
+          machine.execute(
+              f"for _ in $(seq 50); do "
+              f"[ $(grep -c '\"event\": \"response\"' {path}) -ge $(grep -c '\"event\": \"request\"' {path}) ] && break; "
+              f"sleep 0.1; done"
+          )
+          entries = records(machine, path)
+          return {
+              "requests": [(r["path"], r["framing"]) for r in entries if r["event"] == "request"],
+              "responses": [
+                  (r["path"], r["status"], r["content_length"], r["headers_sent"], r["bytes_written"], r["error"])
+                  for r in entries
+                  if r["event"] == "response"
+              ],
+          }
+
+
+      # The second chunk completes the sentence, so the service speaks it before
+      # synthesize-stop, and the client reads that audio before sending stop.
+      STREAM_CHUNKS = "'The kitchen ' 'lights are off. '"
+      STOP_SENT = {}
+
+      with subtest("wyoming: a streamed synthesis speaks the completed sentence before synthesize-stop"):
+          for machine in (llamacpp, qwentts):
+              status, output = machine.execute(f"wyoming-client synthesize-stream --out /tmp/wyoming.pcm narrator {STREAM_CHUNKS}")
+              record = QWEN_RECORD if machine is qwentts else LLAMA_RECORD
+              print(f"{machine.name}: wyoming-client status {status}, output {output.strip()}, wire {json.dumps(wire(machine, record))}")
+              assert status == 0, output
+              reply = json.loads(output)
+              assert reply["events"] == ["audio-start", "audio-chunk", "audio-stop", "synthesize-stopped"], reply
+              assert reply["audio_before_stop"] > 0, reply
+              STOP_SENT[machine.name] = reply["stop_sent_monotonic"]
+              assert reply["audio_start"] == {"rate": 24000, "width": 2, "channels": 1}, reply
+              assert reply["sha256"] == REPLY_PCM_SHA256, (reply, REPLY_PCM_SHA256)
+              on_disk = machine.succeed("sha256sum /tmp/wyoming.pcm").split()[0]
+              assert on_disk == REPLY_PCM_SHA256, on_disk
+
+      with subtest("llamacpp: the streamed synthesis sent the sentence with the narrator's clip in one request before stop"):
+          tts = [r for r in records(llamacpp, LLAMA_RECORD) if r["event"] == "request" and r["path"] == "/tts"]
+          assert len(tts) == 2, tts
+          assert tts[-1]["monotonic"] < STOP_SENT["llamacpp"], (tts[-1]["monotonic"], STOP_SENT["llamacpp"])
+          fields = multipart_fields(tts[-1]["content_type"], request_body(llamacpp, LLAMA_RECORD, tts[-1]))
+          assert fields.get("input") == TRANSCRIPT.encode(), fields.get("input")
+          narrator_sha256 = llamacpp.succeed(f"sha256sum {NARRATOR_CLIP}").split()[0]
+          speaker_ref = hashlib.sha256(fields.get("speaker_ref", b"")).hexdigest()
+          assert speaker_ref == narrator_sha256, (speaker_ref, narrator_sha256)
+
+      with subtest("qwentts: the streamed synthesis named the narrator voice in one request before stop"):
+          request = [r for r in records(qwentts, QWEN_RECORD) if r["event"] == "request"]
+          assert len(request) == 2, request
+          assert request[-1]["monotonic"] < STOP_SENT["qwentts"], (request[-1]["monotonic"], STOP_SENT["qwentts"])
+          raw = request_body(qwentts, QWEN_RECORD, request[-1])
+          assert json.loads(raw) == {"voice": "narrator", "input": TRANSCRIPT, "response_format": "wav"}, raw
 
 
       # Every curl below is bounded, so a hung load fails the subtest rather
