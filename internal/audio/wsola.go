@@ -228,9 +228,8 @@ func (s *stretcher) place() bool {
 // chooseStart takes the best match in [lo, hi] when it is strong. A weak
 // match is no sign that the input it skips repeats what is kept, so the
 // start then stays between the previous window's start and its end, which
-// skips nothing. Above
-// speed 2 [lo, hi] can lie wholly past the previous window, and the weak
-// match stands.
+// skips nothing. Above speed 2 [lo, hi] can lie wholly past the previous
+// window, and the weak match stands.
 func (s *stretcher) chooseStart(lo, hi int) int {
 	best, score := s.bestMatch(lo, hi)
 	if score/s.tailNorm() >= minMatchCorrelation {
@@ -252,11 +251,12 @@ func (s *stretcher) chooseStart(lo, hi int) int {
 }
 
 // tailNorm turns a bestMatch score into the normalised correlation between
-// the overlap and the candidate.
+// the overlap and the candidate. It reads the same samples as bestMatch.
 func (s *stretcher) tailNorm() float64 {
 	var energy float64
-	for _, overlap := range s.tail[:stretchHop] {
-		energy += float64(overlap) * float64(overlap)
+	for k := 0; k < stretchHop; k += correlationStride {
+		overlap := float64(s.tail[k])
+		energy += overlap * overlap
 	}
 
 	return math.Sqrt(energy + correlationEpsilon)
