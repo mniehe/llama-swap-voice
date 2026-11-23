@@ -111,7 +111,7 @@ in {
       # The tests read assets by path, which -trimpath would hide.
       export GOFLAGS=''${GOFLAGS//-trimpath/}
       set -o pipefail
-      go test -v -race ./... 2>&1 | tee $TMPDIR/go-test.log
+      go test -v -race -timeout 30m ./... 2>&1 | tee $TMPDIR/go-test.log
 
       # A test that cannot find its oracle skips, and then a broken encoder
       # passes; no skip is expected here.

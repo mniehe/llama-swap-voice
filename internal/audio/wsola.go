@@ -17,24 +17,42 @@ const (
 const (
 	millisPerSecond     = 1000
 	stretchHopMillis    = 10
-	stretchSearchMillis = 5
+	stretchSearchMillis = 15
 	stretchHop          = outputRate * stretchHopMillis / millisPerSecond
 	stretchWindow       = 2 * stretchHop
 	stretchSearch       = outputRate * stretchSearchMillis / millisPerSecond
-	searchStride        = 2
-	correlationStride   = 4
+	searchStride        = 1
+	correlationStride   = 1
 	correlationEpsilon  = 1e-15
 	stretchReadBytes    = 4096
 	unstretchedSpeed    = 1
+	// minMatchCorrelation is the normalised correlation below which a match
+	// may not skip input. Voiced speech and steady tones match near 1;
+	// consonants and noise match below it.
+	minMatchCorrelation = 0.8
 )
 
 // NewStretcher time-stretches s16le 24 kHz mono samples by speed, keeping
 // the pitch, with WSOLA: 20 ms windows placed every 10 ms of output, each
-// taken from within 5 ms of its nominal input position where it best
-// continues the previous one. Output starts after a few tens of milliseconds
-// of input rather than at the end. At slow speeds it can stop up to 50 ms
-// short of input/speed, and input shorter than one window is not stretched.
-// Speed 1 returns r unchanged.
+// taken from within 15 ms of its nominal input position where it best
+// continues the previous one. The 30 ms search range must hold a whole
+// pitch period, or a low voice's windows splice out of phase and crackle.
+// Up to speed 2 only a strong match may skip input; after a weak one, such
+// as in a consonant or noise, the window starts no later than the previous
+// one ends.
+//
+// The first output comes once the input reaches one window, 20 ms, or one
+// hop of output times speed if that is longer; an input that ends before
+// then comes out when it ends. The source is read up to stretchReadBytes
+// (85 ms) at a time, so a source that fills each read may have delivered up
+// to that much more input by then.
+//
+// Input of n samples is stretched to floor(n/speed) samples, and the output
+// is never longer and at most 10 ms shorter. Input shorter than one window,
+// or whose floor(n/speed) is shorter than one hop, is not stretched: the
+// output is its first min(n, floor(n/speed)) samples, so a slow speed
+// returns all of it, a fast one its start, and fewer than speed samples
+// none. Speed 1 returns r unchanged.
 func NewStretcher(r io.Reader, speed float64) (io.Reader, error) {
 	if math.IsNaN(speed) || speed < MinSpeed || speed > MaxSpeed {
 		return nil, fmt.Errorf("speed must be between %g and %g, got %g", MinSpeed, MaxSpeed, speed)
@@ -194,7 +212,7 @@ func (s *stretcher) place() bool {
 		return false
 	}
 
-	best := s.bestMatch(lo, hi)
+	best := s.chooseStart(lo, hi)
 	window := s.in[best-s.base : best-s.base+stretchWindow]
 	for k := range stretchHop {
 		weight := float32(k) / float32(stretchHop)
@@ -207,10 +225,47 @@ func (s *stretcher) place() bool {
 	return true
 }
 
-func (s *stretcher) bestMatch(lo, hi int) int {
+// chooseStart takes the best match in [lo, hi] when it is strong. A weak
+// match is no sign that the input it skips repeats what is kept, so the
+// start then stays between the previous window's start and its end, which
+// skips nothing. Above speed 2 [lo, hi] can lie wholly past the previous
+// window, and the weak match stands.
+func (s *stretcher) chooseStart(lo, hi int) int {
+	best, score := s.bestMatch(lo, hi)
+	if score/s.tailNorm() >= minMatchCorrelation {
+		return best
+	}
+
+	prevStart := s.segEnd - stretchWindow
+	if best >= prevStart && best <= s.segEnd {
+		return best
+	}
+
+	guardedLo, guardedHi := max(lo, prevStart), min(hi, s.segEnd)
+	if guardedLo > guardedHi {
+		return best
+	}
+
+	guarded, _ := s.bestMatch(guardedLo, guardedHi)
+	return guarded
+}
+
+// tailNorm turns a bestMatch score into the normalised correlation between
+// the overlap and the candidate. It reads the same samples as bestMatch.
+func (s *stretcher) tailNorm() float64 {
+	var energy float64
+	for k := 0; k < stretchHop; k += correlationStride {
+		overlap := float64(s.tail[k])
+		energy += overlap * overlap
+	}
+
+	return math.Sqrt(energy + correlationEpsilon)
+}
+
+func (s *stretcher) bestMatch(lo, hi int) (start int, score float64) {
 	best, bestScore := lo, -math.MaxFloat64
-	for start := lo; start <= hi; start += searchStride {
-		candidate := s.in[start-s.base:]
+	for candidateStart := lo; candidateStart <= hi; candidateStart += searchStride {
+		candidate := s.in[candidateStart-s.base:]
 		var dot, energy float64
 		for k := 0; k < stretchHop; k += correlationStride {
 			overlap, sample := float64(s.tail[k]), float64(candidate[k])
@@ -218,12 +273,12 @@ func (s *stretcher) bestMatch(lo, hi int) int {
 			energy += sample * sample
 		}
 
-		if score := dot / math.Sqrt(energy+correlationEpsilon); score > bestScore {
-			best, bestScore = start, score
+		if candidateScore := dot / math.Sqrt(energy+correlationEpsilon); candidateScore > bestScore {
+			best, bestScore = candidateStart, candidateScore
 		}
 	}
 
-	return best
+	return best, bestScore
 }
 
 // trim drops input that neither the next search nor the end-of-input flush

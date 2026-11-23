@@ -48,9 +48,15 @@ An unknown path gets a 404 and a wrong method gets a 405.
 A request for `aac` or `flac` gets a 400.
 
 A time-stretch changes the speed, so the voice keeps its pitch and the reply
-still streams. At speed 1 the service does not touch the samples. At a slow
-speed, a reply can end up to 50 ms short of its exact length. The service
-returns a reply shorter than 20 ms without a speed change.
+still streams. At speed 1 the service does not touch the samples. At any
+other speed, upstream audio of n samples is stretched to n / speed samples,
+rounded down. The reply is never longer than that and can end up to 10 ms
+short of it. Upstream audio shorter than 20 ms, or whose n / speed is shorter
+than 10 ms, is not stretched: the reply is its first n / speed samples, or all
+n samples if that is fewer. So a slow speed returns all of it and a fast speed
+its start. Upstream audio of fewer samples than the speed gives no samples,
+and the request gets a 502. These lengths are of the samples before encoding;
+`mp3` adds the encoder's delay and padding.
 
 ## Transcriptions
 

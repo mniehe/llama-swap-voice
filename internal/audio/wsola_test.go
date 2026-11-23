@@ -18,24 +18,24 @@ import (
 )
 
 const (
-	stretchToneSeconds     = 2
-	stretchLengthTolerance = 0.02
-	maxShortfallSamples    = outputRate / 20
-	pitchSliceSamples      = outputRate
-	tailWindowSamples      = outputRate / 100
-	tailCheckSamples       = outputRate / 10
-	maxZeroRunSamples      = outputRate / 200
-	minTailRMSRatio        = 0.25
-	streamChunkBytes       = outputRate / 50 * outputSampleBytes
-	streamPauseBytes       = outputRate / 2 * outputSampleBytes
-	minStreamedBytes       = outputRate / 5 * outputSampleBytes
-	streamTimeout          = 2 * time.Second
-	shortContractSamples   = outputRate / 10
-	maxRandomChunkBytes    = 9000
-	oneByteMaxSamples      = 5000
-	randomLengthCount      = 8
-	maxRandomLength        = 60000
-	chunkSeed              = 7
+	stretchToneSeconds   = 2
+	maxShortfallSamples  = outputRate / 100
+	pitchSliceSamples    = outputRate
+	tailWindowSamples    = outputRate / 100
+	tailCheckSamples     = outputRate / 10
+	maxZeroRunSamples    = outputRate / 200
+	minTailRMSRatio      = 0.25
+	streamChunkBytes     = outputRate / 50 * outputSampleBytes
+	streamPauseBytes     = outputRate / 2 * outputSampleBytes
+	minStreamedBytes     = outputRate / 5 * outputSampleBytes
+	streamTimeout        = 2 * time.Second
+	shortContractSamples = outputRate / 10
+	lengthBlockSamples   = 96
+	maxRandomChunkBytes  = 9000
+	oneByteMaxSamples    = 5000
+	randomLengthCount    = 8
+	maxRandomLength      = 60000
+	chunkSeed            = 7
 )
 
 var (
@@ -92,13 +92,6 @@ func speechPCM(t *testing.T) []byte {
 	return fixture(t, "speech.wav")[wavHeaderBytes:]
 }
 
-// lengthContract is the stretcher's length contract: at slow speeds the
-// output can stop up to 50 ms short of input/speed, where the prototype
-// padded with silence.
-func lengthContract(want float64) float64 {
-	return max(want*stretchLengthTolerance, maxShortfallSamples)
-}
-
 func TestNewStretcher_RejectsSpeedsOutsideRange(t *testing.T) {
 	for _, speed := range []float64{0, -1, math.NaN(), math.Inf(1), 5e-324, 0.2499, 4.0001} {
 		t.Run(speedName(speed), func(t *testing.T) {
@@ -125,13 +118,14 @@ func TestNewStretcher_Tone_KeepsPitchAndScalesLength(t *testing.T) {
 		t.Run(speedName(speed), func(t *testing.T) {
 			out := samplesOf(t, stretch(t, input, speed))
 
-			want := float64(inputSamples) / speed
+			want := int(float64(inputSamples) / speed)
 			slice := min(pitchSliceSamples, len(out)/2)
 			start := (len(out) - slice) / 2
 			peak := peakFrequency(out[start:start+slice], outputRate)
-			t.Logf("speed %g: %d samples, want %.0f (%+.2f%%), peak %.2f Hz over %d samples", speed, len(out), want, 100*(float64(len(out))-want)/want, peak, slice)
+			t.Logf("speed %g: %d samples, want %d (%d short), peak %.2f Hz over %d samples", speed, len(out), want, want-len(out), peak, slice)
 
-			assert.InDelta(t, want, float64(len(out)), lengthContract(want))
+			assert.LessOrEqual(t, len(out), want)
+			assert.InDelta(t, want, len(out), maxShortfallSamples)
 			assert.InDelta(t, toneHz, peak, frequencyTolerance)
 		})
 	}
@@ -145,7 +139,7 @@ func TestNewStretcher_ShortInputs_StopShortOrPassThrough(t *testing.T) {
 		speed   float64
 		want    int
 	}{
-		{samples: stretchWindow, speed: 0.25, want: 2 * stretchWindow},
+		{samples: stretchWindow, speed: 0.25, want: 4 * stretchWindow},
 		{samples: 100, speed: 0.25, want: 100},
 		{samples: 100, speed: 0.5, want: 100},
 		{samples: 100, speed: 2, want: 50},
@@ -170,20 +164,58 @@ func TestNewStretcher_SlowSpeeds_StayWithinTheLengthContract(t *testing.T) {
 
 	for _, speed := range slowSpeeds {
 		t.Run(speedName(speed), func(t *testing.T) {
-			worst, worstAt := 0, 0
-			for samples := stretchWindow; samples <= shortContractSamples; samples++ {
-				out := len(stretch(t, input[:samples*outputSampleBytes], speed)) / outputSampleBytes
-				want := int(float64(samples) / speed)
+			t.Parallel()
 
-				require.LessOrEqual(t, out, want, "%d samples", samples)
-				require.InDelta(t, want, out, lengthContract(float64(want)), "%d samples", samples)
-				if want-out > worst {
-					worst, worstAt = want-out, samples
+			// Blocks of lengths run in parallel, because under the race
+			// detector one length after another takes minutes.
+			var worst []shortfall
+			t.Run("lengths", func(t *testing.T) {
+				for first := stretchWindow; first <= shortContractSamples; first += lengthBlockSamples {
+					block := len(worst)
+					worst = append(worst, shortfall{})
+					end := min(first+lengthBlockSamples, shortContractSamples+1)
+					t.Run(strconv.Itoa(first), func(t *testing.T) {
+						t.Parallel()
+						worst[block] = checkLengths(t, input, speed, first, end)
+					})
+				}
+			})
+
+			longest := shortfall{}
+			for _, block := range worst {
+				if block.samples > longest.samples {
+					longest = block
 				}
 			}
-			t.Logf("speed %g: worst shortfall %d samples (%s) at %d input samples", speed, worst, samplesLength(worst, outputRate), worstAt)
+			t.Logf("speed %g: worst shortfall %d samples (%s) at %d input samples", speed, longest.samples, samplesLength(longest.samples, outputRate), longest.at)
 		})
 	}
+}
+
+// shortfall is how many samples short of input/speed the output of an input
+// of at samples ended.
+type shortfall struct {
+	samples, at int
+}
+
+// checkLengths holds every input length in [first, end) to the length
+// contract and returns the largest shortfall.
+func checkLengths(t *testing.T, input []byte, speed float64, first, end int) shortfall {
+	t.Helper()
+
+	var worst shortfall
+	for samples := first; samples < end; samples++ {
+		out := len(stretch(t, input[:samples*outputSampleBytes], speed)) / outputSampleBytes
+		want := int(float64(samples) / speed)
+
+		require.LessOrEqual(t, out, want, "%d samples", samples)
+		require.InDelta(t, want, out, maxShortfallSamples, "%d samples", samples)
+		if want-out > worst.samples {
+			worst = shortfall{samples: want - out, at: samples}
+		}
+	}
+
+	return worst
 }
 
 func TestNewStretcher_NormalSpeed_IsIdentity(t *testing.T) {
@@ -192,15 +224,19 @@ func TestNewStretcher_NormalSpeed_IsIdentity(t *testing.T) {
 	assert.Equal(t, input, stretch(t, input, 1))
 }
 
-// prototypeStretch is the WSOLA prototype that passed the blind listening
-// test, kept verbatim.
+// prototypeStretch is an offline reference copy of the stretcher's WSOLA:
+// the whole input in memory, a 15 ms search at every sample, the correlation
+// over every sample, and the same weak-match guard. The bit-exact oracle and
+// FuzzStretcher compare the streaming stretcher against it; the splice and
+// gap tests check the algorithm itself.
 func prototypeStretch(x []float32, rate int, speed float64) []float32 {
 	hop := rate / 100
 	window := 2 * hop
-	search := rate / 200
+	search := rate * 15 / 1000
 	n := int(float64(len(x)) / speed)
 	y := make([]float32, n+window)
 	copy(y, x[:min(window, len(x))])
+	prevStart, prevEnd := 0, window
 	for out := hop; out+window <= n; out += hop {
 		expected := int(float64(out) * speed)
 		lo := max(0, expected-search)
@@ -208,27 +244,13 @@ func prototypeStretch(x []float32, rate int, speed float64) []float32 {
 		if lo > hi {
 			break
 		}
-		best := lo
-		bestScore := -math.MaxFloat64
-		for j := lo; j <= hi; j += 2 {
-			var dot, energy float64
-			for k := 0; k < hop; k += 4 {
-				a := float64(y[out+k])
-				b := float64(x[j+k])
-				dot += a * b
-				energy += b * b
-			}
-			score := dot / math.Sqrt(energy+1e-15)
-			if score > bestScore {
-				bestScore = score
-				best = j
-			}
-		}
+		best := prototypeMatch(x, y[out:out+hop], lo, hi, prevStart, prevEnd)
 		for k := 0; k < hop; k++ {
 			w := float32(k) / float32(hop)
 			y[out+k] = y[out+k]*(1-w) + x[best+k]*w
 		}
 		copy(y[out+hop:out+window], x[best+hop:best+window])
+		prevStart, prevEnd = best, best+window
 	}
 	return y[:n]
 }
@@ -239,11 +261,12 @@ func trackedPrototype(x []float32, speed float64) (y []float32, lastEnd, segEnd 
 	rate := outputRate
 	hop := rate / 100
 	window := 2 * hop
-	search := rate / 200
+	search := rate * 15 / 1000
 	n := int(float64(len(x)) / speed)
 	y = make([]float32, n+window)
 	copy(y, x[:min(window, len(x))])
 	lastEnd, segEnd = window, window
+	prevStart, prevEnd := 0, window
 	for out := hop; out+window <= n; out += hop {
 		expected := int(float64(out) * speed)
 		lo := max(0, expected-search)
@@ -251,30 +274,55 @@ func trackedPrototype(x []float32, speed float64) (y []float32, lastEnd, segEnd 
 		if lo > hi {
 			break
 		}
-		best := lo
-		bestScore := -math.MaxFloat64
-		for j := lo; j <= hi; j += 2 {
-			var dot, energy float64
-			for k := 0; k < hop; k += 4 {
-				a := float64(y[out+k])
-				b := float64(x[j+k])
-				dot += a * b
-				energy += b * b
-			}
-			score := dot / math.Sqrt(energy+1e-15)
-			if score > bestScore {
-				bestScore = score
-				best = j
-			}
-		}
+		best := prototypeMatch(x, y[out:out+hop], lo, hi, prevStart, prevEnd)
 		for k := 0; k < hop; k++ {
 			w := float32(k) / float32(hop)
 			y[out+k] = y[out+k]*(1-w) + x[best+k]*w
 		}
 		copy(y[out+hop:out+window], x[best+hop:best+window])
 		lastEnd, segEnd = out+window, best+window
+		prevStart, prevEnd = best, best+window
 	}
 	return y[:n], lastEnd, segEnd
+}
+
+// prototypeMatch is the prototype's choice of window start in x for the
+// overlap tail: the best normalised match in [lo, hi], unless that match is
+// weak and leaves input after prevEnd out, in which case the best match whose
+// start lies in [prevStart, prevEnd] as well, if any.
+func prototypeMatch(x, tail []float32, lo, hi, prevStart, prevEnd int) int {
+	best, bestScore := prototypeSearch(x, tail, lo, hi)
+	var tailEnergy float64
+	for _, a := range tail {
+		tailEnergy += float64(a) * float64(a)
+	}
+	if bestScore/math.Sqrt(tailEnergy+1e-15) >= 0.8 || (best >= prevStart && best <= prevEnd) {
+		return best
+	}
+	guardedLo, guardedHi := max(lo, prevStart), min(hi, prevEnd)
+	if guardedLo > guardedHi {
+		return best
+	}
+	guarded, _ := prototypeSearch(x, tail, guardedLo, guardedHi)
+	return guarded
+}
+
+func prototypeSearch(x, tail []float32, lo, hi int) (best int, bestScore float64) {
+	best, bestScore = lo, -math.MaxFloat64
+	for j := lo; j <= hi; j++ {
+		var dot, energy float64
+		for k, a := range tail {
+			b := float64(x[j+k])
+			dot += float64(a) * b
+			energy += b * b
+		}
+		score := dot / math.Sqrt(energy+1e-15)
+		if score > bestScore {
+			bestScore = score
+			best = j
+		}
+	}
+	return best, bestScore
 }
 
 func toUnit(samples []int16) []float32 {
@@ -404,9 +452,12 @@ func TestTrackedPrototype_MatchesPrototype(t *testing.T) {
 	x := toUnit(samplesOf(t, speechPCM(t)))
 
 	for _, speed := range oracleSpeeds {
-		tracked, _, _ := trackedPrototype(x, speed)
+		t.Run(speedName(speed), func(t *testing.T) {
+			t.Parallel()
+			tracked, _, _ := trackedPrototype(x, speed)
 
-		assert.Equal(t, prototypeStretch(x, outputRate, speed), tracked, "speed %g", speed)
+			assert.Equal(t, prototypeStretch(x, outputRate, speed), tracked)
+		})
 	}
 }
 
@@ -417,22 +468,33 @@ func TestNewStretcher_MatchesExactOracle(t *testing.T) {
 		lengths = append(lengths, rng.IntN(maxRandomLength))
 	}
 
+	// Parallel, because under the race detector the cases one after another
+	// outlast go test's default ten-minute timeout.
 	for _, length := range lengths {
 		for name, in := range oracleSignals(t, length) {
-			pcm := pcmOf(t, in)
-			for _, speed := range oracleSpeeds {
-				want := exactOracle(in, speed)
-				for mode := range readModeCount {
-					if mode == oneByteReads && length > oneByteMaxSamples {
-						continue
-					}
+			t.Run(name+"/"+strconv.Itoa(length), func(t *testing.T) {
+				t.Parallel()
+				matchesExactOracle(t, in)
+			})
+		}
+	}
+}
 
-					got, err := stretchWith(t, pcm, speed, mode)
-					require.NoError(t, err)
-					index := firstDifference(want, got)
-					require.Equal(t, -1, index, "%s, %d samples, speed %g, read mode %d: first difference at %d (want %d samples, got %d)", name, length, speed, mode, index, len(want), len(got))
-				}
+func matchesExactOracle(t *testing.T, in []int16) {
+	t.Helper()
+
+	pcm := pcmOf(t, in)
+	for _, speed := range oracleSpeeds {
+		want := exactOracle(in, speed)
+		for mode := range readModeCount {
+			if mode == oneByteReads && len(in) > oneByteMaxSamples {
+				continue
 			}
+
+			got, err := stretchWith(t, pcm, speed, mode)
+			require.NoError(t, err)
+			index := firstDifference(want, got)
+			require.Equal(t, -1, index, "%d samples, speed %g, read mode %d: first difference at %d (want %d samples, got %d)", len(in), speed, mode, index, len(want), len(got))
 		}
 	}
 }
