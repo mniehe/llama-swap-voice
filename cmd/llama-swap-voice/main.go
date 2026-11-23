@@ -108,16 +108,66 @@ type entrypoints struct {
 	wyoming *wyoming.Server
 }
 
-// serve binds the Wyoming port before the HTTP server starts, so the
-// readiness probe never answers while that bind can still fail.
+// listeners are the bound sockets serveOn serves. wyoming is nil when the
+// Wyoming listener is disabled.
+type listeners struct {
+	http    net.Listener
+	wyoming net.Listener
+}
+
+type listenFunc func(ctx context.Context, network, addr string) (net.Listener, error)
+
 func serve(ctx context.Context, cfg *ServiceConfig, service *services, logger *slog.Logger) error {
+	return serveWith(ctx, cfg, service, logger, (&net.ListenConfig{}).Listen)
+}
+
+func serveWith(ctx context.Context, cfg *ServiceConfig, service *services, logger *slog.Logger, listen listenFunc) error {
+	ls, err := bind(ctx, cfg, logger, listen)
+	if err != nil {
+		return err
+	}
+
+	return serveOn(ctx, cfg, service, ls, logger)
+}
+
+// bind opens the Wyoming listener before the HTTP one, so the readiness
+// probe never answers while a bind can still fail. When the HTTP bind fails
+// it closes the Wyoming listener before it returns.
+func bind(ctx context.Context, cfg *ServiceConfig, logger *slog.Logger, listen listenFunc) (*listeners, error) {
+	ls := &listeners{}
+	if cfg.Wyoming.Enabled {
+		listener, err := listen(ctx, "tcp", net.JoinHostPort(cfg.Wyoming.Host, strconv.Itoa(cfg.Wyoming.Port)))
+		if err != nil {
+			return nil, fmt.Errorf("wyoming listener: %w", err)
+		}
+		logger.Info("wyoming listening", slog.String("address", listener.Addr().String()))
+		ls.wyoming = listener
+	}
+
+	// A stop signal while the HTTP address resolves must end in the grace
+	// period, not in a failed start.
+	listener, err := listen(context.WithoutCancel(ctx), "tcp", net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)))
+	if err != nil {
+		err = fmt.Errorf("http listener: %w", err)
+		if ls.wyoming == nil {
+			return nil, err
+		}
+		return nil, errors.Join(err, ls.wyoming.Close())
+	}
+	ls.http = listener
+
+	return ls, nil
+}
+
+// serveOn owns the listeners in ls and closes them before it returns.
+func serveOn(ctx context.Context, cfg *ServiceConfig, service *services, ls *listeners, logger *slog.Logger) error {
+	defer closeListeners(ls, logger)
 	ongoingCtx, stopOngoing := context.WithCancel(context.Background())
 	defer stopOngoing()
 
 	wyomingCfg := cfg.wyomingConfig(Version)
 	servers := &entrypoints{
 		http: &http.Server{
-			Addr:              net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port)),
 			Handler:           service.api.Handler(),
 			ReadHeaderTimeout: readHeaderTimeout,
 			IdleTimeout:       idleTimeout,
@@ -129,17 +179,13 @@ func serve(ctx context.Context, cfg *ServiceConfig, service *services, logger *s
 	}
 
 	listenErr := make(chan error, 2)
-	if cfg.Wyoming.Enabled {
-		listener, err := listenWyoming(ctx, &cfg.Wyoming, logger)
-		if err != nil {
-			return err
-		}
+	if ls.wyoming != nil {
 		go func() {
-			listenErr <- serveWyoming(servers.wyoming, listener)
+			listenErr <- serveWyoming(servers.wyoming, ls.wyoming)
 		}()
 	}
 	go func() {
-		listenErr <- listen(servers.http)
+		listenErr <- serveHTTP(servers.http, ls.http)
 	}()
 
 	select {
@@ -155,25 +201,27 @@ func serve(ctx context.Context, cfg *ServiceConfig, service *services, logger *s
 	return shutdown(servers, service, stopOngoing, &cfg.ShutdownTiming, logger)
 }
 
-func listen(httpServer *http.Server) error {
-	err := httpServer.ListenAndServe()
+// closeListeners is needed because shutdown closes only the listeners a
+// server has registered, and a server registers one only once its goroutine
+// has entered Serve, which a signal or the other server's failure can beat.
+func closeListeners(ls *listeners, logger *slog.Logger) {
+	for _, listener := range []net.Listener{ls.http, ls.wyoming} {
+		if listener == nil {
+			continue
+		}
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			logger.Warn("closing listener", slog.String("address", listener.Addr().String()), slog.Any("error", err))
+		}
+	}
+}
+
+func serveHTTP(httpServer *http.Server, listener net.Listener) error {
+	err := httpServer.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 
 	return fmt.Errorf("http server: %w", err)
-}
-
-func listenWyoming(ctx context.Context, cfg *WyomingConfig, logger *slog.Logger) (net.Listener, error) {
-	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("wyoming listener: %w", err)
-	}
-
-	logger.Info("wyoming listening", slog.String("address", addr))
-
-	return listener, nil
 }
 
 func serveWyoming(server *wyoming.Server, listener net.Listener) error {
