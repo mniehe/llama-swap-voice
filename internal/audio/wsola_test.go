@@ -31,6 +31,7 @@ const (
 	minStreamedBytes       = outputRate / 5 * outputSampleBytes
 	streamTimeout          = 2 * time.Second
 	shortContractSamples   = outputRate / 10
+	lengthBlockSamples     = 96
 	maxRandomChunkBytes    = 9000
 	oneByteMaxSamples      = 5000
 	randomLengthCount      = 8
@@ -170,20 +171,58 @@ func TestNewStretcher_SlowSpeeds_StayWithinTheLengthContract(t *testing.T) {
 
 	for _, speed := range slowSpeeds {
 		t.Run(speedName(speed), func(t *testing.T) {
-			worst, worstAt := 0, 0
-			for samples := stretchWindow; samples <= shortContractSamples; samples++ {
-				out := len(stretch(t, input[:samples*outputSampleBytes], speed)) / outputSampleBytes
-				want := int(float64(samples) / speed)
+			t.Parallel()
 
-				require.LessOrEqual(t, out, want, "%d samples", samples)
-				require.InDelta(t, want, out, lengthContract(float64(want), speed), "%d samples", samples)
-				if want-out > worst {
-					worst, worstAt = want-out, samples
+			// Blocks of lengths run in parallel, because under the race
+			// detector one length after another takes minutes.
+			var worst []shortfall
+			t.Run("lengths", func(t *testing.T) {
+				for first := stretchWindow; first <= shortContractSamples; first += lengthBlockSamples {
+					block := len(worst)
+					worst = append(worst, shortfall{})
+					end := min(first+lengthBlockSamples, shortContractSamples+1)
+					t.Run(strconv.Itoa(first), func(t *testing.T) {
+						t.Parallel()
+						worst[block] = checkLengths(t, input, speed, first, end)
+					})
+				}
+			})
+
+			longest := shortfall{}
+			for _, block := range worst {
+				if block.samples > longest.samples {
+					longest = block
 				}
 			}
-			t.Logf("speed %g: worst shortfall %d samples (%s) at %d input samples", speed, worst, samplesLength(worst, outputRate), worstAt)
+			t.Logf("speed %g: worst shortfall %d samples (%s) at %d input samples", speed, longest.samples, samplesLength(longest.samples, outputRate), longest.at)
 		})
 	}
+}
+
+// shortfall is how many samples short of input/speed the output of an input
+// of at samples ended.
+type shortfall struct {
+	samples, at int
+}
+
+// checkLengths holds every input length in [first, end) to the length
+// contract and returns the largest shortfall.
+func checkLengths(t *testing.T, input []byte, speed float64, first, end int) shortfall {
+	t.Helper()
+
+	var worst shortfall
+	for samples := first; samples < end; samples++ {
+		out := len(stretch(t, input[:samples*outputSampleBytes], speed)) / outputSampleBytes
+		want := int(float64(samples) / speed)
+
+		require.LessOrEqual(t, out, want, "%d samples", samples)
+		require.InDelta(t, want, out, lengthContract(float64(want), speed), "%d samples", samples)
+		if want-out > worst.samples {
+			worst = shortfall{samples: want - out, at: samples}
+		}
+	}
+
+	return worst
 }
 
 func TestNewStretcher_NormalSpeed_IsIdentity(t *testing.T) {
@@ -420,9 +459,12 @@ func TestTrackedPrototype_MatchesPrototype(t *testing.T) {
 	x := toUnit(samplesOf(t, speechPCM(t)))
 
 	for _, speed := range oracleSpeeds {
-		tracked, _, _ := trackedPrototype(x, speed)
+		t.Run(speedName(speed), func(t *testing.T) {
+			t.Parallel()
+			tracked, _, _ := trackedPrototype(x, speed)
 
-		assert.Equal(t, prototypeStretch(x, outputRate, speed), tracked, "speed %g", speed)
+			assert.Equal(t, prototypeStretch(x, outputRate, speed), tracked)
+		})
 	}
 }
 
