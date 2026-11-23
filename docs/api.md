@@ -49,8 +49,13 @@ A request for `aac` or `flac` gets a 400.
 
 A time-stretch changes the speed, so the voice keeps its pitch and the reply
 still streams. At speed 1 the service does not touch the samples. At any
-other speed, a reply can end up to 10 ms short of its exact length. The service
-returns a reply shorter than 20 ms without a speed change.
+other speed, the exact length is the upstream audio's length divided by the
+speed. From upstream audio of at least 20 ms, a reply can end up to 10 ms
+short of it, and below speed 0.5 up to 10 ms / speed - 10 ms short (30 ms at
+speed 0.25). Upstream audio shorter than 20 ms is not stretched but cut to the
+exact length, so a slow speed returns all of it and a fast speed its start.
+These lengths are of the samples before encoding; `mp3` adds the encoder's
+delay and padding.
 
 ## Transcriptions
 
