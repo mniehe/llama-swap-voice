@@ -18,25 +18,24 @@ import (
 )
 
 const (
-	stretchToneSeconds     = 2
-	stretchLengthTolerance = 0.02
-	maxShortfallSamples    = outputRate / 100
-	pitchSliceSamples      = outputRate
-	tailWindowSamples      = outputRate / 100
-	tailCheckSamples       = outputRate / 10
-	maxZeroRunSamples      = outputRate / 200
-	minTailRMSRatio        = 0.25
-	streamChunkBytes       = outputRate / 50 * outputSampleBytes
-	streamPauseBytes       = outputRate / 2 * outputSampleBytes
-	minStreamedBytes       = outputRate / 5 * outputSampleBytes
-	streamTimeout          = 2 * time.Second
-	shortContractSamples   = outputRate / 10
-	lengthBlockSamples     = 96
-	maxRandomChunkBytes    = 9000
-	oneByteMaxSamples      = 5000
-	randomLengthCount      = 8
-	maxRandomLength        = 60000
-	chunkSeed              = 7
+	stretchToneSeconds   = 2
+	maxShortfallSamples  = outputRate / 100
+	pitchSliceSamples    = outputRate
+	tailWindowSamples    = outputRate / 100
+	tailCheckSamples     = outputRate / 10
+	maxZeroRunSamples    = outputRate / 200
+	minTailRMSRatio      = 0.25
+	streamChunkBytes     = outputRate / 50 * outputSampleBytes
+	streamPauseBytes     = outputRate / 2 * outputSampleBytes
+	minStreamedBytes     = outputRate / 5 * outputSampleBytes
+	streamTimeout        = 2 * time.Second
+	shortContractSamples = outputRate / 10
+	lengthBlockSamples   = 96
+	maxRandomChunkBytes  = 9000
+	oneByteMaxSamples    = 5000
+	randomLengthCount    = 8
+	maxRandomLength      = 60000
+	chunkSeed            = 7
 )
 
 var (
@@ -93,12 +92,6 @@ func speechPCM(t *testing.T) []byte {
 	return fixture(t, "speech.wav")[wavHeaderBytes:]
 }
 
-// lengthContract is the stretcher's length contract: the output can stop up
-// to 10 ms short of input/speed, where the prototype padded with silence.
-func lengthContract(want float64) float64 {
-	return max(want*stretchLengthTolerance, maxShortfallSamples)
-}
-
 func TestNewStretcher_RejectsSpeedsOutsideRange(t *testing.T) {
 	for _, speed := range []float64{0, -1, math.NaN(), math.Inf(1), 5e-324, 0.2499, 4.0001} {
 		t.Run(speedName(speed), func(t *testing.T) {
@@ -125,13 +118,14 @@ func TestNewStretcher_Tone_KeepsPitchAndScalesLength(t *testing.T) {
 		t.Run(speedName(speed), func(t *testing.T) {
 			out := samplesOf(t, stretch(t, input, speed))
 
-			want := float64(inputSamples) / speed
+			want := int(float64(inputSamples) / speed)
 			slice := min(pitchSliceSamples, len(out)/2)
 			start := (len(out) - slice) / 2
 			peak := peakFrequency(out[start:start+slice], outputRate)
-			t.Logf("speed %g: %d samples, want %.0f (%+.2f%%), peak %.2f Hz over %d samples", speed, len(out), want, 100*(float64(len(out))-want)/want, peak, slice)
+			t.Logf("speed %g: %d samples, want %d (%d short), peak %.2f Hz over %d samples", speed, len(out), want, want-len(out), peak, slice)
 
-			assert.InDelta(t, want, float64(len(out)), lengthContract(want))
+			assert.LessOrEqual(t, len(out), want)
+			assert.InDelta(t, want, len(out), maxShortfallSamples)
 			assert.InDelta(t, toneHz, peak, frequencyTolerance)
 		})
 	}
@@ -215,7 +209,7 @@ func checkLengths(t *testing.T, input []byte, speed float64, first, end int) sho
 		want := int(float64(samples) / speed)
 
 		require.LessOrEqual(t, out, want, "%d samples", samples)
-		require.InDelta(t, want, out, lengthContract(float64(want)), "%d samples", samples)
+		require.InDelta(t, want, out, maxShortfallSamples, "%d samples", samples)
 		if want-out > worst.samples {
 			worst = shortfall{samples: want - out, at: samples}
 		}
