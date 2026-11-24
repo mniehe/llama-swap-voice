@@ -12,9 +12,12 @@ a bug it prevents or a test it enables.
   `internal/audio` (for the encoders); `internal/wyoming` imports
   `internal/pipeline` and `internal/audio` (for `WAVHeader`) and never
   `internal/openai`; `internal/pipeline` imports
-  `internal/audio` and `internal/upstream` and never `net/http`; `audio`,
-  `upstream` and `voices` import no other internal package.
-  A reverse or sideways import is a finding.
+  `internal/audio` and `internal/upstream` and never `net/http`;
+  `internal/audio` imports only `internal/fft`, a leaf that imports the
+  standard library alone; `fft`, `upstream` and `voices` import no other
+  internal package. Any other reverse or sideways import is a finding.
+- `internal/fft` exports `Size`, `ErrLength` and `Correlate`, a stateless
+  exact cross-correlator whose error bound `internal/fft/PROOF.md` proves.
 - `internal/config` is generic koanf loading (`LoadConfig[T]`); the
   service's own settings, defaults and `Validate` live in
   `cmd/llama-swap-voice/config.go`, and `serverConfig` maps them onto

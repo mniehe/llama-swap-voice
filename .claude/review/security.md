@@ -5,10 +5,18 @@ Every finding states the actor or the access they need, the trust boundary
 crossed, the asset, and what they gain. The service has no authentication:
 any client that reaches the port can call every route, so the questions are
 memory safety, resource exhaustion and disclosure. AGENTS.md names
-`internal/audio`, `internal/voices`, `internal/upstream`, `internal/openai`,
-`internal/wyoming`, `internal/pipeline`, `cmd/llama-swap-voice` and the build
-files critical paths, where a small
+`internal/audio`, `internal/fft`, `internal/voices`, `internal/upstream`,
+`internal/openai`, `internal/wyoming`, `internal/pipeline`,
+`cmd/llama-swap-voice` and the build files critical paths, where a small
 mistake is a memory-safety or denial-of-service hole.
+
+`internal/fft` parses nothing, but `internal/audio` runs every wide WSOLA
+search through it. Check three things there: every length is bounded by
+`Size` and rejected with `ErrLength` before any index; callers pass only
+samples on the PCM scale `Correlate` documents, integer multiples of
+2^-15 in [-1, 1]; and nothing voids the numeric bound in
+`internal/fft/PROOF.md`, whose last section lists the changes that do. A
+wrong dot product there does not crash; it silently corrupts audio.
 
 ## Trust boundaries
 
