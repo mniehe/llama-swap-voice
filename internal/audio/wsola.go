@@ -278,12 +278,13 @@ func (s *stretcher) chooseStart(lo, hi int) int {
 // would.
 //
 // A wide search takes its dot products from the FFT correlator, which
-// returns the same exact sums. A narrow one, near the start or end of the
-// input, uses the direct scan, which is written out here, not in a
-// function of its own, because the race detector instruments every read
-// through a pointer but not reads of a local array, and this loop's reads
-// made the race tests much slower when it did. Go does not unroll loops,
-// so the lanes are written out too.
+// returns the same exact sums. Every streaming search is wide; a narrow one
+// happens only while finish flushes the end of the input, which for a
+// short input can include its first placement. It uses the direct scan,
+// which is written out here, not in a function of its own, because the
+// race detector instruments every read through a pointer but not reads of
+// a local array, and this loop's reads made the race tests much slower
+// when it did. Go does not unroll loops, so the lanes are written out too.
 func (s *stretcher) scoreStarts(lo, hi int, scores *[searchStarts]float64) (tailNorm float64) {
 	var reference [stretchHop]float64
 	var block [searchBlock]float64
