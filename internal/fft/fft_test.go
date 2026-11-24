@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -198,6 +200,28 @@ func TestCorrelate_RandomPCM_IsExact(t *testing.T) {
 	}
 	for range 50 {
 		checkExact(t, randomPCM(rng, Size), randomPCM(rng, Size/2))
+	}
+}
+
+// An empty reference makes every dot product the empty sum, +0, at each of
+// len(block)+1 lags.
+func TestCorrelate_EmptyReference_ZeroesEveryLag(t *testing.T) {
+	for _, blockLen := range []int{0, Size - 1, Size} {
+		t.Run(strconv.Itoa(blockLen), func(t *testing.T) {
+			dots := make([]float64, blockLen+2)
+			for k := range dots {
+				dots[k] = 42
+			}
+			block := toUnit(filled(blockLen, maxSample))
+
+			require.NoError(t, Correlate(dots, block, nil))
+
+			for k := range blockLen + 1 {
+				require.Zerof(t, dots[k], "lag %d", k)
+				require.Falsef(t, math.Signbit(dots[k]), "lag %d is -0", k)
+			}
+			require.InDelta(t, 42, dots[blockLen+1], 0, "the element past the last lag changed")
+		})
 	}
 }
 

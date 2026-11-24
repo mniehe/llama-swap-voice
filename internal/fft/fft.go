@@ -79,6 +79,12 @@ func Correlate(dots, block, ref []float64) error {
 	if len(block) > Size || len(ref) > len(block) || len(dots) < len(block)-len(ref)+1 {
 		return fmt.Errorf("%w: block %d, reference %d, dots %d, size %d", ErrLength, len(block), len(ref), len(dots), Size)
 	}
+	// A full block with an empty reference has Size+1 lags, one more than
+	// the transform's output.
+	if len(ref) == 0 {
+		clear(dots[:len(block)+1])
+		return nil
+	}
 
 	var scaled [Size]float64
 	correlate(&scaled, block, ref)
