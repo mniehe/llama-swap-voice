@@ -477,6 +477,8 @@ func TestNormaliseUpload_DurationLimit_CountsDecodedFrames(t *testing.T) {
 }
 
 func TestNormaliseUpload_LongNarrowbandWAV_TooLong(t *testing.T) {
+	t.Parallel()
+
 	long := wavSpec{tag: formatPCM, rate: narrowbandRate, bits: pcm16Bits, channels: [][]float32{silence(narrowbandRate * longWAVSeconds)}}
 
 	_, err := NormaliseUpload(t.Context(), bytes.NewReader(long.bytes()), limits)

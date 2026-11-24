@@ -462,6 +462,8 @@ func TestTrackedPrototype_MatchesPrototype(t *testing.T) {
 }
 
 func TestNewStretcher_MatchesExactOracle(t *testing.T) {
+	t.Parallel()
+
 	rng := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // G404: reproducible test lengths.
 	lengths := append([]int{}, oracleLengths...)
 	for range randomLengthCount {
