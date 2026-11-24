@@ -120,6 +120,16 @@ func assertSplicesCleanly(t *testing.T, tone func(period int) []float32, periods
 	}
 }
 
+// benchCorrelators are the correlators the benchmarks compare on the same
+// workload.
+var benchCorrelators = []struct {
+	name       string
+	correlator newCorrelator
+}{
+	{"internal", internalCorrelator},
+	{"gofft", goFFTCorrelate},
+}
+
 func BenchmarkStretcher_Speech60s(b *testing.B) {
 	benchmarkSpeech60s(b, benchSpeed)
 }
@@ -133,15 +143,25 @@ func BenchmarkStretcher_Speech60sSlowest(b *testing.B) {
 func benchmarkSpeech60s(b *testing.B, speed float64) {
 	b.Helper()
 
-	speech := fixture(b, "speech.wav")[wavHeaderBytes:]
-	clipSeconds := len(speech) / outputSampleBytes / outputRate
-	input := bytes.Repeat(speech, benchSpeechSeconds/clipSeconds)
-	b.SetBytes(int64(len(input)))
-
-	for b.Loop() {
-		stretcher, err := NewStretcher(bytes.NewReader(input), speed)
-		require.NoError(b, err)
-		_, err = io.Copy(io.Discard, stretcher)
-		require.NoError(b, err)
+	input := speech60s(b)
+	for _, bench := range benchCorrelators {
+		b.Run("correlator="+bench.name, func(b *testing.B) {
+			b.SetBytes(int64(len(input)))
+			for b.Loop() {
+				stretcher, err := newStretcherWith(bytes.NewReader(input), speed, bench.correlator())
+				require.NoError(b, err)
+				_, err = io.Copy(io.Discard, stretcher)
+				require.NoError(b, err)
+			}
+		})
 	}
+}
+
+// speech60s is the speech fixture repeated to 60 seconds.
+func speech60s(t testing.TB) []byte {
+	t.Helper()
+
+	speech := fixture(t, "speech.wav")[wavHeaderBytes:]
+	clipSeconds := len(speech) / outputSampleBytes / outputRate
+	return bytes.Repeat(speech, benchSpeechSeconds/clipSeconds)
 }

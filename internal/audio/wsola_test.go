@@ -15,6 +15,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mniehe/llama-swap-voice/internal/fft"
 )
 
 const (
@@ -405,7 +407,24 @@ func readerFor(pcm []byte, mode readMode) io.Reader {
 func stretchWith(t *testing.T, pcm []byte, speed float64, mode readMode) ([]int16, error) {
 	t.Helper()
 
-	out, err := io.ReadAll(newStretcher(t, readerFor(pcm, mode), speed))
+	return stretchCorrelated(t, pcm, speed, mode, internalCorrelator)
+}
+
+// newCorrelator returns a correlator for one stretcher, which may keep
+// state between its calls.
+type newCorrelator func() correlateFunc
+
+func internalCorrelator() correlateFunc {
+	return fft.Correlate
+}
+
+func stretchCorrelated(t *testing.T, pcm []byte, speed float64, mode readMode, correlator newCorrelator) ([]int16, error) {
+	t.Helper()
+
+	stretcher, err := newStretcherWith(readerFor(pcm, mode), speed, correlator())
+	require.NoError(t, err)
+
+	out, err := io.ReadAll(stretcher)
 	if err != nil {
 		return nil, err
 	}
@@ -466,6 +485,11 @@ func TestTrackedPrototype_MatchesPrototype(t *testing.T) {
 
 func TestNewStretcher_MatchesExactOracle(t *testing.T) {
 	t.Parallel()
+	runExactOracle(t, internalCorrelator)
+}
+
+func runExactOracle(t *testing.T, correlator newCorrelator) {
+	t.Helper()
 
 	rng := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // G404: reproducible test lengths.
 	lengths := append([]int{}, oracleLengths...)
@@ -479,13 +503,13 @@ func TestNewStretcher_MatchesExactOracle(t *testing.T) {
 		for name, in := range oracleSignals(t, length) {
 			t.Run(name+"/"+strconv.Itoa(length), func(t *testing.T) {
 				t.Parallel()
-				matchesExactOracle(t, in)
+				matchesExactOracle(t, in, correlator)
 			})
 		}
 	}
 }
 
-func matchesExactOracle(t *testing.T, in []int16) {
+func matchesExactOracle(t *testing.T, in []int16, correlator newCorrelator) {
 	t.Helper()
 
 	pcm := pcmOf(t, in)
@@ -496,7 +520,7 @@ func matchesExactOracle(t *testing.T, in []int16) {
 				continue
 			}
 
-			got, err := stretchWith(t, pcm, speed, mode)
+			got, err := stretchCorrelated(t, pcm, speed, mode, correlator)
 			require.NoError(t, err)
 			index := firstDifference(want, got)
 			require.Equal(t, -1, index, "%d samples, speed %g, read mode %d: first difference at %d (want %d samples, got %d)", len(in), speed, mode, index, len(want), len(got))
