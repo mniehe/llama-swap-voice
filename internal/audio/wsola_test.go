@@ -36,6 +36,9 @@ const (
 	randomLengthCount    = 8
 	maxRandomLength      = 60000
 	chunkSeed            = 7
+	// maxStretchAllocs bounds a 2 s stretch at the slowest speed, which
+	// searches 800 times.
+	maxStretchAllocs = 50
 )
 
 var (
@@ -660,4 +663,18 @@ func TestNewStretcher_SourceErrors_AreReturned(t *testing.T) {
 			assert.ErrorIs(t, err, tt.want)
 		})
 	}
+}
+
+// A wide search's arrays must stay off the heap: allocating them on every
+// hop made the stretcher 8% slower.
+func TestNewStretcher_AllocationsDoNotGrowWithHops(t *testing.T) {
+	pcm := speechPCM(t)
+	allocs := testing.AllocsPerRun(1, func() {
+		stretcher, err := NewStretcher(bytes.NewReader(pcm), MinSpeed)
+		require.NoError(t, err)
+		_, err = io.Copy(io.Discard, stretcher)
+		require.NoError(t, err)
+	})
+
+	assert.LessOrEqual(t, allocs, float64(maxStretchAllocs))
 }
