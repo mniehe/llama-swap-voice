@@ -20,9 +20,16 @@ For each lag k in [0, len(block) − len(ref)], the true dot product is
     d(k) = Σ_{i < len(ref)} block[k+i] · ref[i] = K(k) · 2^-30
 
 where K(k) is an integer, because each product is a multiple of 2^-30.
+Since |d(k)| ≤ len(ref) ≤ 2^10, |K(k)| ≤ 2^40.
 
-**Theorem.** Let r(k) be the computed value `scaled[k] · 2^20` that
-`Correlate` rounds. Then
+**The empty reference.** If `len(ref) = 0`, every d(k) is the empty sum,
+0, and there are len(block) + 1 lags, up to N + 1, one more than the
+transform has outputs. `Correlate` then writes +0 to each lag and runs no
+transform, so no FFT output is used and the theorem below is not needed.
+The theorem covers `len(ref) >= 1`, where there are at most N lags.
+
+**Theorem.** Let `len(ref) >= 1`, and let r(k) be the computed value
+`scaled[k] · 2^20` that `Correlate` rounds. Then
 
     |r(k) − K(k)| ≤ 2^30 · ‖x‖·‖y‖ · [(1+u)^30 (1+3u)^31 (1+u/√2)^30 − 1] + 2^-1000
 
@@ -36,8 +43,11 @@ Here u = 2^-53, and ‖x‖ and ‖y‖ are the Euclidean norms of `block` and
   units, 60× below 0.5.
 
 **Corollary.** Since |r(k) − K(k)| < 1/2, `math.Round(r(k))` returns K(k),
-with no tie possible. `float64(K) * 0x1p-30` is then exactly d(k), and a
-zero K gives +0, as the direct sum does.
+with no tie possible, except that a zero K may come back as −0 when r(k)
+is slightly negative. The conversion to `int64` is exact, because K is an
+integer with |K| ≤ 2^40 < 2^63, and it maps −0 to 0. `float64` of that
+integer is exact too, since 2^40 < 2^53, so `float64(K) * 0x1p-30` is
+exactly d(k), and a zero K gives +0, as the direct sum does.
 
 ## Sources
 
@@ -70,7 +80,7 @@ flowchart LR
   F1 --> P["Z[k] = X[k] · conj(Y[k])"]
   F2 --> P
   P --> rz[bit-reverse] --> I[same transform, roots conj ω^k]
-  I --> S["r(k) = Re · 2^20"] --> R["K = round(r); d = K · 2^-30"]
+  I --> S["r(k) = Re · 2^20"] --> R["K = int64(round(r))"] --> D["d = float64(K) · 2^-30"]
 ```
 
 1. **Load.** `block` and `ref` go into separate length-1024 complex
@@ -100,7 +110,13 @@ flowchart LR
    (each stored root with its imaginary part negated, which is exact) and
    without a 1/N factor.
 6. **Scale and round.** r(k) = Re(ĥ[k]) · 2^20. A power-of-two scale is
-   exact. Then K = round(r), and d = K · 2^-30, which is also exact.
+   exact. Then `math.Round` rounds r to an integral float64, and
+   `int64(...)` converts it to an integer K, which turns a rounded −0 into
+   0. Finally d = `float64(K)` · 2^-30, which is also exact. The tests
+   meet the −0 case: in `TestCorrelate_Cancellation_IsExactZero`, a
+   constant block of −32768 against a reference of 120 × 32767 then
+   120 × −32767 gives r = −1.304989997088438e-06 at lag 1, which
+   `math.Round` takes to −0, and `Correlate` returns +0.
 
 **The exact counterpart.** With exact roots ω^k and exact arithmetic,
 step 2 maps x to its DFT, X[m] = Σ_n x[n] ω^{nm}. The unnormalised
@@ -124,9 +140,27 @@ smallest subnormal).
   If the exact sum is subnormal it is representable, so no η term arises.
 * **Complex add, component-wise:** |fl(z) − z| ≤ u|z| in modulus, because
   each component errs by at most u times itself.
-* **No overflow:** spectrum values are at most ‖x‖₁ ≤ 1024 (plus a
-  relative error far below 1), products at most 2^21, and inverse outputs
-  at most N · 2^21 = 2^31. All of these are far below binary64's 2^1024.
+* **Finite execution.** The rounding model above, and so Lemmas 2 to 6,
+  hold only while every intermediate is finite, with no overflow. The
+  following coarse bound shows that every execution inside the contract
+  is finite, without using the lemmas themselves. Rounding is monotone,
+  so a value of modulus at most B rounds to at most fl(B) ≤ B(1+u).
+  Every stored root has components of magnitude at most 1.
+  * *Butterfly.* If every input component has magnitude at most M ≥ 1,
+    each product fl(c·x) is at most M(1+u), each component of t̂ is at
+    most 2M(1+u)², and each output component is at most
+    (M + 2M(1+u)²)(1+u), which is below 4M.
+  * *Pointwise multiply.* If every component of X̂ and Ŷ is below M ≥ 1,
+    each product is at most M²(1+u), and each output component is at
+    most 2M²(1+u)², below 4M².
+
+  The inputs have components at most 1. Ten forward stages give
+  components below 4^10 = 2^20; the multiply gives below 4 · 2^40 = 2^42;
+  ten inverse stages give below 2^42 · 4^10 = 2^62; the exact 2^20
+  upshift gives below 2^82. All of these are far below binary64's
+  largest finite value, about 2^1024, so no step overflows, and no NaN
+  arises. The `int64` conversion needs the sharper range that the
+  theorem then gives: |r| < |K| + 1/2 ≤ 2^40 + 1/2.
 
 Write q = (1+u)(1+3u)(1+β), with β = u/√2 the root error (see
 "Twiddles"), and p = 1+3u. Norms ‖·‖ are Euclidean, ‖·‖₁ is the sum of
@@ -213,7 +247,7 @@ lattice, so v̂_0 = v_0.
 For a float input vector v, each output m of the computed inverse Ĝ(v)
 satisfies
 
-    |Ĝ(v)[m] − G(v)[m]| ≤ (q^10 − 1)‖v‖₁ + 3069η.
+    |Ĝ(v)[m] − G(v)[m]| ≤ (q^10 − 1)‖v‖₁ + 3070η.
 
 *Proof.* After s stages, each exact element v_s[i] is a sum, with
 unit-modulus coefficients, of v over a set S_i of 2^s indices. A
@@ -233,7 +267,8 @@ This uses 1+u ≤ q, (1+u)(1+μ) = q, (1+u)μ + u = q − 1 and u ≤ q − 1.
 Substituting the claim for e_a and e_b gives
 q(q^{s−1} − 1)(A_a + A_b) + (q−1)(A_a + A_b) = (q^s − 1)A_s. The bottom
 output is bounded the same way. At s = 10, A_10[m] = ‖v‖₁ and
-H_10 = 3069.00…η. ∎
+H_10 = 3(1+u)η · Σ_{j<10}(2q)^j = 3069.0000000000131…η, because q > 1
+makes each term slightly above 3·2^j. So H_10 < 3070η. ∎
 
 ## Lemma 6 (pointwise product, ℓ1 norm)
 
@@ -257,9 +292,12 @@ Apply Lemma 5 to the computed spectrum Ẑ, and use |G(w)[m]| ≤ ‖w‖₁,
 because every coefficient of G has unit modulus:
 
     |Ĝ(Ẑ)[m] − G(Z)[m]| ≤ |Ĝ(Ẑ)[m] − G(Ẑ)[m]| + ‖Ẑ − Z‖₁
-                        ≤ (q^10 − 1)(‖Z‖₁ + ‖Ẑ − Z‖₁) + ‖Ẑ − Z‖₁ + 3069η
+                        ≤ (q^10 − 1)(‖Z‖₁ + ‖Ẑ − Z‖₁) + ‖Ẑ − Z‖₁ + 3070η
                         ≤ (q^10 − 1)‖X‖‖Y‖ + q^10(p·q^20 − 1)‖X‖‖Y‖ + 2^28η
                         = (p·q^30 − 1)‖X‖‖Y‖ + 2^28η.
+
+The η terms are q^10 · 2^27η from Lemma 6 and 3070η from Lemma 5, which
+sum to 134,220,798.0000000007…η < 2^28η.
 
 This uses ‖Z‖₁ = Σ|X_k||Y_k| ≤ ‖X‖‖Y‖. By Parseval, ‖X‖‖Y‖ = N·‖x‖‖y‖,
 and G(Z)[m] = N·d(m). The real part errs no more than the complex value.
@@ -348,15 +386,16 @@ product in `correlate`'s butterfly loop and in `multiplyConjugate` is therefore 
 `float64(...)`, and so is each component before it enters a butterfly's
 add or subtract.
 
-Disassembly checks, which must print 0:
+The tests run on amd64 v1, which has no FMA instruction, so they cannot
+see a lost conversion. The `fft-no-fma` check in `nix/checks.nix`, which
+`nix flake check` runs, compiles this package for amd64 v3 and for arm64
+and fails if either build fails, if the assembly lacks `correlate` or
+`multiplyConjugate`, or if it holds any fused multiply-add. To run it
+alone:
 
 ```bash
-GOAMD64=v3 go build -a -gcflags=-S ./internal/fft 2>&1 | grep -ci 'VFMADD\|VFMSUB\|VFNMADD\|VFNMSUB'
-CGO_ENABLED=0 GOARCH=arm64 go build -a -gcflags=-S ./internal/fft 2>&1 | grep -ci 'FMADDD\|FMSUBD\|FNMADDD\|FNMSUBD'
+nix build -L .#checks.x86_64-linux.fft-no-fma
 ```
-
-With the conversions removed, Go 1.27.3 emits 3 fused instructions on
-amd64 (v3) and 6 on arm64.
 
 The code also avoids Go's `complex128` multiplication, because the
 specification leaves its lowering open.
