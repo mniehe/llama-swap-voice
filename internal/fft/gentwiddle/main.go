@@ -197,7 +197,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("format: %v", err)
 	}
-	if err := os.WriteFile(outputFile, formatted, 0o600); err != nil {
+	if err := os.WriteFile(outputFile, formatted, 0o644); err != nil {
 		log.Fatalf("write %s: %v", outputFile, err)
 	}
 }
