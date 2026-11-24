@@ -411,8 +411,8 @@ refuses.
 
 ## Running without Nix
 
-The service is one Go binary. To build it you need cgo, a C compiler,
-pkg-config and libopus.
+The service is one Go binary. To build it you need Go 1.27.1 or later, cgo,
+a C compiler, pkg-config and libopus.
 
 1. Install the service.
 
