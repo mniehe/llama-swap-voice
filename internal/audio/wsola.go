@@ -21,11 +21,18 @@ const (
 	stretchHop          = outputRate * stretchHopMillis / millisPerSecond
 	stretchWindow       = 2 * stretchHop
 	stretchSearch       = outputRate * stretchSearchMillis / millisPerSecond
-	searchStride        = 1
-	correlationStride   = 1
 	correlationEpsilon  = 1e-15
 	stretchReadBytes    = 4096
 	unstretchedSpeed    = 1
+	// searchStarts is the most starts one search scores, one per sample of
+	// ±stretchSearch; searchBlock is the input their overlaps span.
+	searchStarts = 2*stretchSearch + 1
+	searchBlock  = searchStarts - 1 + stretchHop
+	// dotLanes is how many sums of the dot product run side by side. They
+	// must tile the overlap exactly: a remainder makes the blank constant
+	// negative, which fails to compile.
+	dotLanes = 8
+	_        = uint(-(stretchHop % dotLanes))
 	// minMatchCorrelation is the normalised correlation below which a match
 	// may not skip input. Voiced speech and steady tones match near 1;
 	// consonants and noise match below it.
@@ -231,8 +238,10 @@ func (s *stretcher) place() bool {
 // skips nothing. Above speed 2 [lo, hi] can lie wholly past the previous
 // window, and the weak match stands.
 func (s *stretcher) chooseStart(lo, hi int) int {
-	best, score := s.bestMatch(lo, hi)
-	if score/s.tailNorm() >= minMatchCorrelation {
+	var scores [searchStarts]float64
+	tailNorm := s.scoreStarts(lo, hi, &scores)
+	best, score := bestStart(&scores, lo, lo, hi)
+	if score/tailNorm >= minMatchCorrelation {
 		return best
 	}
 
@@ -246,39 +255,91 @@ func (s *stretcher) chooseStart(lo, hi int) int {
 		return best
 	}
 
-	guarded, _ := s.bestMatch(guardedLo, guardedHi)
+	guarded, _ := bestStart(&scores, lo, guardedLo, guardedHi)
 	return guarded
 }
 
-// tailNorm turns a bestMatch score into the normalised correlation between
-// the overlap and the candidate. It reads the same samples as bestMatch.
-func (s *stretcher) tailNorm() float64 {
-	var energy float64
-	for k := 0; k < stretchHop; k += correlationStride {
-		overlap := float64(s.tail[k])
-		energy += overlap * overlap
-	}
+// scoreStarts sets scores[start-lo], for each start in [lo, hi], to how well
+// the window from start continues the overlap, and returns the overlap's
+// norm, which turns a score into a normalised correlation.
+//
+// Every sample is a multiple of 2^-15 in [-1, 1), so each product is a
+// multiple of 2^-30 and a sum of stretchHop of them needs under 38 of
+// float64's 53 bits. The sums are therefore exact in any order: the lanes
+// of the dot product and the sliding energy give the scores a plain loop
+// would.
+//
+// The dot product is written out here, not in a function of its own,
+// because the race detector instruments every read through a pointer but
+// not reads of a local array, and this loop's reads made the race tests
+// much slower when it did. Go does not unroll loops, so the lanes are
+// written out too.
+func (s *stretcher) scoreStarts(lo, hi int, scores *[searchStarts]float64) (tailNorm float64) {
+	var reference [stretchHop]float64
+	var block [searchBlock]float64
+	stage(reference[:], s.tail)
+	stage(block[:], s.in[lo-s.base:hi-s.base+stretchHop])
 
-	return math.Sqrt(energy + correlationEpsilon)
-}
-
-func (s *stretcher) bestMatch(lo, hi int) (start int, score float64) {
-	best, bestScore := lo, -math.MaxFloat64
-	for candidateStart := lo; candidateStart <= hi; candidateStart += searchStride {
-		candidate := s.in[candidateStart-s.base:]
-		var dot, energy float64
-		for k := 0; k < stretchHop; k += correlationStride {
-			overlap, sample := float64(s.tail[k]), float64(candidate[k])
-			dot += overlap * sample
-			energy += sample * sample
+	var energies [searchStarts]float64
+	slideEnergies(&block, hi-lo, &energies)
+	for offset := 0; offset <= hi-lo; offset++ {
+		var l0, l1, l2, l3, l4, l5, l6, l7 float64
+		for k := 0; k <= stretchHop-dotLanes; k += dotLanes {
+			l0 += reference[k] * block[offset+k]
+			l1 += reference[k+1] * block[offset+k+1]
+			l2 += reference[k+2] * block[offset+k+2]
+			l3 += reference[k+3] * block[offset+k+3]
+			l4 += reference[k+4] * block[offset+k+4]
+			l5 += reference[k+5] * block[offset+k+5]
+			l6 += reference[k+6] * block[offset+k+6]
+			l7 += reference[k+7] * block[offset+k+7]
 		}
 
-		if candidateScore := dot / math.Sqrt(energy+correlationEpsilon); candidateScore > bestScore {
-			best, bestScore = candidateStart, candidateScore
+		dot := (l0 + l1) + (l2 + l3) + (l4 + l5) + (l6 + l7)
+		scores[offset] = dot / math.Sqrt(energies[offset]+correlationEpsilon)
+	}
+
+	return math.Sqrt(sumSquares(reference[:]) + correlationEpsilon)
+}
+
+// slideEnergies sets energies[offset], for each offset in [0, last], to the
+// energy of block[offset:offset+stretchHop]. Only the first is summed; each
+// later one drops the sample that left the window and adds the one that
+// entered it.
+func slideEnergies(block *[searchBlock]float64, last int, energies *[searchStarts]float64) {
+	energies[0] = sumSquares(block[:stretchHop])
+	for offset := 1; offset <= last; offset++ {
+		outgoing, incoming := block[offset-1], block[offset-1+stretchHop]
+		energies[offset] = energies[offset-1] + incoming*incoming - outgoing*outgoing
+	}
+}
+
+// bestStart returns the first start in [from, to] with the highest score,
+// where scores[start-lo] is the score of start.
+func bestStart(scores *[searchStarts]float64, lo, from, to int) (start int, score float64) {
+	best, bestScore := from, -math.MaxFloat64
+	for candidate := from; candidate <= to; candidate++ {
+		if candidateScore := scores[candidate-lo]; candidateScore > bestScore {
+			best, bestScore = candidate, candidateScore
 		}
 	}
 
 	return best, bestScore
+}
+
+func stage(dst []float64, src []float32) {
+	for k, sample := range src {
+		dst[k] = float64(sample)
+	}
+}
+
+func sumSquares(samples []float64) float64 {
+	var sum float64
+	for _, sample := range samples {
+		sum += sample * sample
+	}
+
+	return sum
 }
 
 // trim drops input that neither the next search nor the end-of-input flush

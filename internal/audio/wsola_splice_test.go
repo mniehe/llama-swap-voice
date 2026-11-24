@@ -21,6 +21,7 @@ const (
 	decibelsPerDecade   = 10
 	benchSpeechSeconds  = 60
 	benchSpeed          = 1.15
+	benchSlowestSpeed   = MinSpeed
 )
 
 var (
@@ -120,13 +121,25 @@ func assertSplicesCleanly(t *testing.T, tone func(period int) []float32, periods
 }
 
 func BenchmarkStretcher_Speech60s(b *testing.B) {
+	benchmarkSpeech60s(b, benchSpeed)
+}
+
+// The slowest speed places four times as many windows per input second as
+// speed 1, so the search dominates it most.
+func BenchmarkStretcher_Speech60sSlowest(b *testing.B) {
+	benchmarkSpeech60s(b, benchSlowestSpeed)
+}
+
+func benchmarkSpeech60s(b *testing.B, speed float64) {
+	b.Helper()
+
 	speech := fixture(b, "speech.wav")[wavHeaderBytes:]
 	clipSeconds := len(speech) / outputSampleBytes / outputRate
 	input := bytes.Repeat(speech, benchSpeechSeconds/clipSeconds)
 	b.SetBytes(int64(len(input)))
 
 	for b.Loop() {
-		stretcher, err := NewStretcher(bytes.NewReader(input), benchSpeed)
+		stretcher, err := NewStretcher(bytes.NewReader(input), speed)
 		require.NoError(b, err)
 		_, err = io.Copy(io.Discard, stretcher)
 		require.NoError(b, err)
