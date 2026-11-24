@@ -21,8 +21,14 @@ const (
 	wsolaBlock = 960
 	wsolaRef   = 240
 	// provenBound is PROOF.md's bound on |real(h)·2^20 - K| for the
-	// general contract, in integer units.
-	provenBound = 0.01761
+	// general contract, in integer units, rounded up.
+	provenBound = 0.017604150813
+	// dotUnits and upshift restate the contract, 2^30 integer units per
+	// unit dot product and a 2^20 upshift after an unnormalised 1024-point
+	// inverse, without the package's constants, so the oracle shares no
+	// scaling with the code under test.
+	dotUnits = 0x1p30
+	upshift  = 0x1p20
 )
 
 // deviation tracks the largest |real(h)·2^20 - K| any test observed.
@@ -66,7 +72,8 @@ func oracle(block, ref []int16) []int64 {
 }
 
 // checkExact correlates block with ref and requires every lag to equal the
-// integer oracle, and a zero dot to be +0 as the direct sum gives.
+// integer oracle, a zero dot to be +0 as the direct sum gives, and the
+// unrounded transform output to lie within PROOF.md's bound.
 func checkExact(t *testing.T, block, ref []int16) {
 	t.Helper()
 
@@ -74,19 +81,24 @@ func checkExact(t *testing.T, block, ref []int16) {
 	dots := make([]float64, len(want))
 	require.NoErrorf(t, Correlate(dots, toUnit(block), toUnit(ref)), "block %d, reference %d", len(block), len(ref))
 
-	var scaled [Size]float64
-	correlate(&scaled, toUnit(block), toUnit(ref))
-	worst := 0.0
-	for k := range len(want) {
-		worst = max(worst, math.Abs(scaled[k]*spectrumScale-float64(want[k])))
+	// An empty reference uses no transform output.
+	if len(ref) > 0 {
+		var scaled [Size]float64
+		correlate(&scaled, toUnit(block), toUnit(ref))
+		worst := 0.0
+		for k := range len(want) {
+			worst = max(worst, math.Abs(scaled[k]*upshift-float64(want[k])))
+		}
+		observe(worst)
+		require.LessOrEqualf(t, worst, provenBound, "block %d, reference %d: unrounded error over the proven bound", len(block), len(ref))
 	}
-	observe(worst)
 
-	// One assertion per call, not per lag: the exhaustive tests check
-	// millions of lags.
+	// Lags are compared in plain Go, not one assertion each, because the
+	// exhaustive tests check millions of them.
 	for k, w := range want {
-		if dots[k] != float64(w)*dotStep || (dots[k] == 0 && math.Signbit(dots[k])) {
-			require.Failf(t, "inexact lag", "block %d, reference %d, lag %d: got %v (K %v), want K %d", len(block), len(ref), k, dots[k], dots[k]/dotStep, w)
+		wantDot := float64(w) / dotUnits
+		if dots[k] != wantDot || (dots[k] == 0 && math.Signbit(dots[k])) {
+			require.Failf(t, "inexact lag", "block %d, reference %d, lag %d: got %v (K %v), want K %d", len(block), len(ref), k, dots[k], dots[k]*dotUnits, w)
 		}
 	}
 }
@@ -239,12 +251,15 @@ func TestCorrelate_LengthsOutsideContract_ReturnErrLength(t *testing.T) {
 
 func FuzzCorrelate(f *testing.F) {
 	f.Add(uint16(wsolaBlock), uint16(wsolaRef), []byte{0xff, 0x7f, 0x00, 0x80})
+	f.Add(uint16(Size), uint16(0), []byte{0xff, 0x7f})
 	f.Add(uint16(Size), uint16(Size), []byte{0x00, 0x80})
-	f.Add(uint16(1), uint16(1), []byte{})
+	f.Add(uint16(0), uint16(0), []byte{})
+	f.Add(uint16(1), uint16(1), []byte{0x00, 0x80})
 
+	// Lengths in range map to themselves, so each seed runs as written.
 	f.Fuzz(func(t *testing.T, blockLen, refLen uint16, data []byte) {
-		lb := int(blockLen)%Size + 1
-		lr := int(refLen)%lb + 1
+		lb := int(blockLen) % (Size + 1)
+		lr := int(refLen) % (lb + 1)
 		samples := make([]int16, lb+lr)
 		for i := range samples {
 			if 2*i+1 < len(data) {
