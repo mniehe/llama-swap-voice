@@ -36,6 +36,9 @@ const (
 	randomLengthCount    = 8
 	maxRandomLength      = 60000
 	chunkSeed            = 7
+	// maxStretchAllocs bounds a 2 s stretch at the slowest speed, which
+	// searches 800 times.
+	maxStretchAllocs = 50
 )
 
 var (
@@ -399,10 +402,17 @@ func readerFor(pcm []byte, mode readMode) io.Reader {
 	return r
 }
 
-func stretchWith(t *testing.T, pcm []byte, speed float64, mode readMode) ([]int16, error) {
+// stretcherFactory builds a stretcher: NewStretcher, or one with an injected
+// correlator for comparison.
+type stretcherFactory func(r io.Reader, speed float64) (io.Reader, error)
+
+func stretchWith(t *testing.T, pcm []byte, speed float64, mode readMode, factory stretcherFactory) ([]int16, error) {
 	t.Helper()
 
-	out, err := io.ReadAll(newStretcher(t, readerFor(pcm, mode), speed))
+	stretcher, err := factory(readerFor(pcm, mode), speed)
+	require.NoError(t, err)
+
+	out, err := io.ReadAll(stretcher)
 	if err != nil {
 		return nil, err
 	}
@@ -462,6 +472,13 @@ func TestTrackedPrototype_MatchesPrototype(t *testing.T) {
 }
 
 func TestNewStretcher_MatchesExactOracle(t *testing.T) {
+	t.Parallel()
+	runExactOracle(t, NewStretcher)
+}
+
+func runExactOracle(t *testing.T, factory stretcherFactory) {
+	t.Helper()
+
 	rng := rand.New(rand.NewPCG(1, 2)) //nolint:gosec // G404: reproducible test lengths.
 	lengths := append([]int{}, oracleLengths...)
 	for range randomLengthCount {
@@ -474,13 +491,13 @@ func TestNewStretcher_MatchesExactOracle(t *testing.T) {
 		for name, in := range oracleSignals(t, length) {
 			t.Run(name+"/"+strconv.Itoa(length), func(t *testing.T) {
 				t.Parallel()
-				matchesExactOracle(t, in)
+				matchesExactOracle(t, in, factory)
 			})
 		}
 	}
 }
 
-func matchesExactOracle(t *testing.T, in []int16) {
+func matchesExactOracle(t *testing.T, in []int16, factory stretcherFactory) {
 	t.Helper()
 
 	pcm := pcmOf(t, in)
@@ -491,7 +508,7 @@ func matchesExactOracle(t *testing.T, in []int16) {
 				continue
 			}
 
-			got, err := stretchWith(t, pcm, speed, mode)
+			got, err := stretchWith(t, pcm, speed, mode, factory)
 			require.NoError(t, err)
 			index := firstDifference(want, got)
 			require.Equal(t, -1, index, "%d samples, speed %g, read mode %d: first difference at %d (want %d samples, got %d)", len(in), speed, mode, index, len(want), len(got))
@@ -512,7 +529,7 @@ func FuzzStretcher(f *testing.F) {
 		speed := MinSpeed + (MaxSpeed-MinSpeed)*float64(speedStep)/math.MaxUint16
 		mode := readMode(modeByte) % readModeCount
 
-		got, err := stretchWith(t, data, speed, mode)
+		got, err := stretchWith(t, data, speed, mode, NewStretcher)
 		if len(data)%outputSampleBytes != 0 {
 			require.ErrorIs(t, err, io.ErrUnexpectedEOF, "odd length %d accepted", len(data))
 			return
@@ -658,4 +675,19 @@ func TestNewStretcher_SourceErrors_AreReturned(t *testing.T) {
 			assert.ErrorIs(t, err, tt.want)
 		})
 	}
+}
+
+// The stretcher stays within a fixed allocation budget on 2 s of speech. A
+// wide search's arrays must stay off the heap: allocating them on every hop
+// made the stretcher 8% slower and breaks the budget.
+func TestNewStretcher_AllocationBudget(t *testing.T) {
+	pcm := speechPCM(t)
+	allocs := testing.AllocsPerRun(1, func() {
+		stretcher, err := NewStretcher(bytes.NewReader(pcm), MinSpeed)
+		require.NoError(t, err)
+		_, err = io.Copy(io.Discard, stretcher)
+		require.NoError(t, err)
+	})
+
+	assert.LessOrEqual(t, allocs, float64(maxStretchAllocs))
 }

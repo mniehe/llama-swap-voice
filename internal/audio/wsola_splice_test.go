@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mniehe/llama-swap-voice/internal/fft"
 )
 
 const (
@@ -21,6 +23,7 @@ const (
 	decibelsPerDecade   = 10
 	benchSpeechSeconds  = 60
 	benchSpeed          = 1.15
+	benchSlowestSpeed   = MinSpeed
 )
 
 var (
@@ -119,16 +122,50 @@ func assertSplicesCleanly(t *testing.T, tone func(period int) []float32, periods
 	}
 }
 
-func BenchmarkStretcher_Speech60s(b *testing.B) {
-	speech := fixture(b, "speech.wav")[wavHeaderBytes:]
-	clipSeconds := len(speech) / outputSampleBytes / outputRate
-	input := bytes.Repeat(speech, benchSpeechSeconds/clipSeconds)
-	b.SetBytes(int64(len(input)))
+// benchCorrelators are the correlators the benchmarks compare on the same
+// workload: production's internal/fft and the go-fft adapter. correlator
+// builds one for a single call; stretcher builds a stretcher that uses it.
+var benchCorrelators = []struct {
+	name       string
+	correlator func() correlateFunc
+	stretcher  stretcherFactory
+}{
+	{"internal", func() correlateFunc { return fft.Correlate }, NewStretcher},
+	{"gofft", goFFTCorrelate, goFFTStretcher},
+}
 
-	for b.Loop() {
-		stretcher, err := NewStretcher(bytes.NewReader(input), benchSpeed)
-		require.NoError(b, err)
-		_, err = io.Copy(io.Discard, stretcher)
-		require.NoError(b, err)
+func BenchmarkStretcher_Speech60s(b *testing.B) {
+	benchmarkSpeech60s(b, benchSpeed)
+}
+
+// The slowest speed places four times as many windows per input second as
+// speed 1, so the search dominates it most.
+func BenchmarkStretcher_Speech60sSlowest(b *testing.B) {
+	benchmarkSpeech60s(b, benchSlowestSpeed)
+}
+
+func benchmarkSpeech60s(b *testing.B, speed float64) {
+	b.Helper()
+
+	input := speech60s(b)
+	for _, bench := range benchCorrelators {
+		b.Run("correlator="+bench.name, func(b *testing.B) {
+			b.SetBytes(int64(len(input)))
+			for b.Loop() {
+				stretcher, err := bench.stretcher(bytes.NewReader(input), speed)
+				require.NoError(b, err)
+				_, err = io.Copy(io.Discard, stretcher)
+				require.NoError(b, err)
+			}
+		})
 	}
+}
+
+// speech60s is the speech fixture repeated to 60 seconds.
+func speech60s(t testing.TB) []byte {
+	t.Helper()
+
+	speech := fixture(t, "speech.wav")[wavHeaderBytes:]
+	clipSeconds := len(speech) / outputSampleBytes / outputRate
+	return bytes.Repeat(speech, benchSpeechSeconds/clipSeconds)
 }

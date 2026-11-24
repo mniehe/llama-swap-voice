@@ -1,0 +1,203 @@
+//go:build ignore
+
+// Command gentwiddle writes twiddles.go: the roots exp(-2πik/1024) for
+// k = 0..511, each component correctly rounded to binary64.
+//
+// Every quantity is held as an interval [lo, hi] computed with directed
+// rounding, so the exact value always lies inside it. A component is
+// written only when both ends round to the same binary64 value: rounding
+// is monotone, so the exact value then rounds to it too. A high-precision
+// estimate alone would certify nothing; the interval does.
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"go/format"
+	"log"
+	"math/big"
+	"os"
+	"strconv"
+)
+
+const (
+	size        = 1024
+	roots       = size / 2
+	octant      = size / 8
+	quarter     = size / 4
+	precision   = 320
+	tailBits    = 300
+	outputFile  = "twiddles.go"
+	machinFirst = 5
+	machinLast  = 239
+)
+
+// interval holds lo <= x <= hi for an exact real x.
+type interval struct {
+	lo, hi *big.Float
+}
+
+func newFloat(mode big.RoundingMode) *big.Float {
+	return new(big.Float).SetPrec(precision).SetMode(mode)
+}
+
+func exact(v int64) interval {
+	return interval{newFloat(big.ToNegativeInf).SetInt64(v), newFloat(big.ToPositiveInf).SetInt64(v)}
+}
+
+func (a interval) add(b interval) interval {
+	return interval{newFloat(big.ToNegativeInf).Add(a.lo, b.lo), newFloat(big.ToPositiveInf).Add(a.hi, b.hi)}
+}
+
+func (a interval) sub(b interval) interval {
+	return interval{newFloat(big.ToNegativeInf).Sub(a.lo, b.hi), newFloat(big.ToPositiveInf).Sub(a.hi, b.lo)}
+}
+
+func (a interval) neg() interval {
+	return interval{new(big.Float).Neg(a.hi), new(big.Float).Neg(a.lo)}
+}
+
+// mulPos multiplies two intervals that lie in [0, ∞).
+func (a interval) mulPos(b interval) interval {
+	return interval{newFloat(big.ToNegativeInf).Mul(a.lo, b.lo), newFloat(big.ToPositiveInf).Mul(a.hi, b.hi)}
+}
+
+// divInt divides an interval that lies in [0, ∞) by a positive integer.
+func (a interval) divInt(d int64) interval {
+	den := new(big.Float).SetInt64(d)
+	return interval{newFloat(big.ToNegativeInf).Quo(a.lo, den), newFloat(big.ToPositiveInf).Quo(a.hi, den)}
+}
+
+// widen adds [-e, e] for an error bound e >= 0.
+func (a interval) widen(e *big.Float) interval {
+	return interval{newFloat(big.ToNegativeInf).Sub(a.lo, e), newFloat(big.ToPositiveInf).Add(a.hi, e)}
+}
+
+func negligible(x *big.Float) bool {
+	return x.Sign() == 0 || x.MantExp(nil) < -tailBits
+}
+
+// arctanInverse encloses arctan(1/m) = Σ (-1)^j / ((2j+1) m^(2j+1)). The
+// terms alternate and shrink, so the error after any term is at most the
+// next term.
+func arctanInverse(m int64) interval {
+	power := exact(1).divInt(m)
+	sum := exact(0)
+	for j := int64(0); ; j++ {
+		term := power.divInt(2*j + 1)
+		if negligible(term.hi) {
+			return sum.widen(term.hi)
+		}
+		if j%2 == 0 {
+			sum = sum.add(term)
+		} else {
+			sum = sum.sub(term)
+		}
+		power = power.divInt(m * m)
+	}
+}
+
+// pi encloses π by Machin's formula, π = 16 arctan(1/5) - 4 arctan(1/239).
+func pi() interval {
+	first := arctanInverse(machinFirst)
+	last := arctanInverse(machinLast)
+	sixteen, four := exact(16), exact(4)
+	return first.mulPos(sixteen).sub(last.mulPos(four))
+}
+
+// sinCos encloses sin x and cos x for x in [0, π/4] from their Taylor
+// series. After the terms up to x^(n-1)/(n-1)!, the Lagrange remainder is
+// at most x^n/n!, the magnitude of the next term.
+func sinCos(x interval) (sin, cos interval) {
+	sin, cos = exact(0), exact(0)
+	term := exact(1)
+	for n := int64(0); ; n++ {
+		if negligible(term.hi) {
+			return sin.widen(term.hi), cos.widen(term.hi)
+		}
+		target := &cos
+		if n%2 == 1 {
+			target = &sin
+		}
+		if (n/2)%2 == 0 {
+			*target = target.add(term)
+		} else {
+			*target = target.sub(term)
+		}
+		term = term.mulPos(x).divInt(n + 1)
+	}
+}
+
+// root encloses cos and -sin of πk/512 for k in [0, 512). The angle is
+// reduced to [0, π/4] by exact identities, so cos(π/2) and sin(0) are
+// exactly zero.
+func root(k int, octantRoots []struct{ sin, cos interval }) (re, im interval) {
+	cosine, sine := func() (interval, interval) {
+		switch {
+		case k <= octant:
+			r := octantRoots[k]
+			return r.cos, r.sin
+		case k <= quarter:
+			r := octantRoots[quarter-k]
+			return r.sin, r.cos
+		case k <= quarter+octant:
+			r := octantRoots[k-quarter]
+			return r.sin.neg(), r.cos
+		default:
+			r := octantRoots[roots-k]
+			return r.cos.neg(), r.sin
+		}
+	}()
+	return cosine, sine.neg()
+}
+
+func rounded(v interval) (float64, error) {
+	lo, _ := v.lo.Float64()
+	hi, _ := v.hi.Float64()
+	if lo != hi {
+		return 0, fmt.Errorf("interval [%s, %s] straddles a rounding boundary", v.lo.Text('g', 40), v.hi.Text('g', 40))
+	}
+	return lo, nil
+}
+
+func literal(v float64) string {
+	if v == 0 {
+		return "0"
+	}
+	return strconv.FormatFloat(v, 'x', -1, 64)
+}
+
+func main() {
+	piBounds := pi()
+	octantRoots := make([]struct{ sin, cos interval }, octant+1)
+	for r := range octantRoots {
+		angle := piBounds.mulPos(exact(int64(r))).divInt(roots)
+		octantRoots[r].sin, octantRoots[r].cos = sinCos(angle)
+	}
+
+	var src bytes.Buffer
+	src.WriteString("// Code generated by gentwiddle/main.go; DO NOT EDIT.\n\npackage fft\n\n")
+	src.WriteString("// roots[k] holds the real and imaginary parts of exp(-2πik/1024), each\n// correctly rounded to binary64.\n")
+	src.WriteString("var roots = [Size / 2][2]float64{\n")
+	for k := range roots {
+		re, im := root(k, octantRoots)
+		reValue, err := rounded(re)
+		if err != nil {
+			log.Fatalf("root %d real part: %v", k, err)
+		}
+		imValue, err := rounded(im)
+		if err != nil {
+			log.Fatalf("root %d imaginary part: %v", k, err)
+		}
+		fmt.Fprintf(&src, "\t{%s, %s},\n", literal(reValue), literal(imValue))
+	}
+	src.WriteString("}\n")
+
+	formatted, err := format.Source(src.Bytes())
+	if err != nil {
+		log.Fatalf("format: %v", err)
+	}
+	if err := os.WriteFile(outputFile, formatted, 0o644); err != nil {
+		log.Fatalf("write %s: %v", outputFile, err)
+	}
+}

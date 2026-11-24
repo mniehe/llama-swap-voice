@@ -2,6 +2,10 @@ github.com/braheezy/shine-mp3 v0.2.0 h1:0OwmbVLfQFe4c5+UjV5FF4NKedxYw0qHnP5rDOs/
 github.com/braheezy/shine-mp3 v0.2.0/go.mod h1:0H/pmcpFAd+Fnrj6Pc7du7wL36U/HqtfcgPJuCgc1L4=
 github.com/fatih/structs v1.1.0 h1:Q7juDM0QtcnhCpeyLGQKyg4TOIghuNXrkL32pHAUMxo=
 github.com/fatih/structs v1.1.0/go.mod h1:9NiDSp5zOcgEDl+j00MP/WkGVPOlPRLejGD8Ga6PJ7M=
+github.com/go-fft/fft v0.49.0 h1:kjFNu+wvhC7EguNM2kYHr/CfS52fZmlJ9+W/kfvQSJ0=
+github.com/go-fft/fft v0.49.0/go.mod h1:XzZFr/AUmUeN3t9n3Z5ROg94oXNUTv4HvQC6sq7DBUE=
+github.com/go-simd/floats v0.40.0 h1:rCRm6IqeS/PxIYivC+ClrdRo1k4EE//hBfXmOQcaHXo=
+github.com/go-simd/floats v0.40.0/go.mod h1:Aq5a6oY5pUqm9Hpi+iV2nrNmaaUb0rwHvUHIerXWSvA=
 github.com/go-viper/mapstructure/v2 v2.5.0 h1:vM5IJoUAy3d7zRSVtIwQgBj7BiWtMPfmPEgAXnvj1Ro=
 github.com/go-viper/mapstructure/v2 v2.5.0/go.mod h1:oJDH3BJKyqBA2TXFhDsKDGDTlndYOZ6rGS0BRZIxGhM=
 github.com/hajimehoshi/go-mp3 v0.3.4 h1:NUP7pBYH8OguP4diaTZ9wJbUbk3tC0KlfzsEpWmYj68=
@@ -28,3 +32,5 @@ github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUm
 go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=
 go.yaml.in/yaml/v3 v3.0.5/go.mod h1:HVTZu1O7/Vkt2N+BFy8Zza+lnLsABggaTM2ZpNIGuKg=
 golang.org/x/sys v0.0.0-20220712014510-0a85c31ab51e/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+golang.org/x/sys v0.49.0 h1:XbzkgYJHdqh/8m2Uu0W/dQv8nktxx4BFHp1M0gROTXA=
+golang.org/x/sys v0.49.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=

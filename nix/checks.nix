@@ -214,6 +214,57 @@ in {
       touch $out
     '';
 
+  # internal/fft/PROOF.md's bound assumes every product rounds before its
+  # add, which the float64() conversions guarantee; without them Go fuses
+  # the two on amd64 v3 and arm64. The tests run at amd64 v1, which has no
+  # FMA, so only the assembly shows a lost conversion.
+  fft-no-fma =
+    pkgs.runCommand "llama-swap-voice-fft-no-fma" {
+      nativeBuildInputs = [go];
+      src = lib.fileset.toSource {
+        root = ../.;
+        fileset = lib.fileset.unions [../go.mod ../go.sum ../internal/fft];
+      };
+    } ''
+      export HOME=$TMPDIR GOTOOLCHAIN=local GOFLAGS= GOPROXY=off CGO_ENABLED=0 GOOS=linux
+      cd $src
+
+      failed=0
+
+      # check NAME FUSED-OPCODES GOENV...: compiles internal/fft with a fresh
+      # cache, so the compiler runs and prints the assembly.
+      check() {
+        name=$1 fused=$2
+        shift 2
+        listing=$TMPDIR/$name.s
+        if ! env GOCACHE=$TMPDIR/cache-$name "$@" go build -gcflags=-S ./internal/fft > $listing 2>&1; then
+          cat $listing >&2
+          echo "$name: internal/fft does not build" >&2
+          failed=1
+          return
+        fi
+        for function in correlate multiplyConjugate; do
+          if ! grep -q "^github.com/mniehe/llama-swap-voice/internal/fft\.$function STEXT" $listing; then
+            echo "$name: no assembly for $function" >&2
+            failed=1
+          fi
+        done
+        if grep -E "$fused" $listing >&2; then
+          echo "$name: internal/fft contains fused multiply-adds" >&2
+          failed=1
+          return
+        fi
+        echo "$name: no fused multiply-adds"
+      }
+
+      check amd64-v3 'VFMADD|VFMSUB|VFNMADD|VFNMSUB' GOARCH=amd64 GOAMD64=v3
+      check arm64 'FMADDD|FMSUBD|FNMADDD|FNMSUBD' GOARCH=arm64
+      if [ $failed != 0 ]; then
+        exit 1
+      fi
+      touch $out
+    '';
+
   # Runs pion/opus's own RFC 6716 / RFC 8251 decoder conformance test against
   # the revision gomod2nix.toml pins, taken from the vendor set. The source is
   # only go.mod and go.sum, so the check reruns when a dependency moves and
