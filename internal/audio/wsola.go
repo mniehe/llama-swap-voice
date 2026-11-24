@@ -69,7 +69,7 @@ const (
 // returns all of it, a fast one its start, and fewer than speed samples
 // none. Speed 1 returns r unchanged.
 func NewStretcher(r io.Reader, speed float64) (io.Reader, error) {
-	return newStretcherWith(r, speed, fft.Correlate)
+	return newStretcherWith(r, speed, nil)
 }
 
 // correlateFunc has fft.Correlate's contract: it sets dots to the exact
@@ -77,7 +77,7 @@ func NewStretcher(r io.Reader, speed float64) (io.Reader, error) {
 type correlateFunc func(dots, block, ref []float64) error
 
 // newStretcherWith is NewStretcher with the correlator that wide searches
-// use, so tests can compare correlators.
+// use, so tests can compare correlators. A nil correlate uses fft.Correlate.
 func newStretcherWith(r io.Reader, speed float64, correlate correlateFunc) (io.Reader, error) {
 	if math.IsNaN(speed) || speed < MinSpeed || speed > MaxSpeed {
 		return nil, fmt.Errorf("speed must be between %g and %g, got %g", MinSpeed, MaxSpeed, speed)
@@ -87,38 +87,42 @@ func newStretcherWith(r io.Reader, speed float64, correlate correlateFunc) (io.R
 		return r, nil
 	}
 
-	return &stretcher{
-		src:       r,
-		speed:     speed,
-		correlate: correlate,
-		wide:      new(wideSearch),
-		read:      make([]byte, stretchReadBytes),
-		raw:       make([]byte, 0, stretchReadBytes+outputSampleBytes),
-		tail:      make([]float32, 0, stretchHop),
-	}, nil
+	s := &stretcher{
+		src:   r,
+		speed: speed,
+		read:  make([]byte, stretchReadBytes),
+		raw:   make([]byte, 0, stretchReadBytes+outputSampleBytes),
+		tail:  make([]float32, 0, stretchHop),
+	}
+	if correlate != nil {
+		s.injected = &injectedCorrelator{correlate: correlate}
+	}
+
+	return s, nil
 }
 
-// wideSearch holds a wide search's input and dot products for the
-// correlator. Arrays passed to a function value escape to the heap, so
-// scoreStarts copies its local arrays here rather than passing them, which
-// would allocate them on every search.
-type wideSearch struct {
-	dots  [searchStarts]float64
-	block [searchBlock]float64
-	ref   [stretchHop]float64
+// injectedCorrelator is a correlator other than fft.Correlate, with copies
+// of a wide search's input and dot products. Arrays passed to a function
+// value escape to the heap, so correlateWide copies scoreStarts' local
+// arrays here rather than passing them, which would allocate them on every
+// search.
+type injectedCorrelator struct {
+	correlate correlateFunc
+	dots      [searchStarts]float64
+	block     [searchBlock]float64
+	ref       [stretchHop]float64
 }
 
 // stretcher holds the input from the earliest sample a later window can
 // still use, and the second half of the last window, which the next one
 // crossfades with. Output index out is always the number of samples emitted.
 type stretcher struct {
-	src       io.Reader
-	speed     float64
-	correlate correlateFunc
-	wide      *wideSearch
-	read      []byte
-	raw       []byte
-	decoded   []int16
+	src      io.Reader
+	speed    float64
+	injected *injectedCorrelator
+	read     []byte
+	raw      []byte
+	decoded  []int16
 
 	in     []float32
 	base   int
@@ -318,11 +322,14 @@ func (s *stretcher) scoreStarts(lo, hi int, scores *[searchStarts]float64) (tail
 
 	var energies [searchStarts]float64
 	slideEnergies(&block, hi-lo, &energies)
-	if hi-lo+1 >= fftMinStarts && s.correlateWide(hi-lo, &block, &reference) {
-		for offset := 0; offset <= hi-lo; offset++ {
-			scores[offset] = s.wide.dots[offset] / math.Sqrt(energies[offset]+correlationEpsilon)
+	if hi-lo+1 >= fftMinStarts {
+		var dots [searchStarts]float64
+		if s.correlateWide(hi-lo, &dots, &block, &reference) {
+			for offset := 0; offset <= hi-lo; offset++ {
+				scores[offset] = dots[offset] / math.Sqrt(energies[offset]+correlationEpsilon)
+			}
+			return tailNorm
 		}
-		return tailNorm
 	}
 
 	for offset := 0; offset <= hi-lo; offset++ {
@@ -345,14 +352,25 @@ func (s *stretcher) scoreStarts(lo, hi int, scores *[searchStarts]float64) (tail
 	return tailNorm
 }
 
-// correlateWide sets s.wide.dots[offset], for each offset in [0, last], to
-// the dot product of reference with block[offset:offset+stretchHop], and
-// reports whether the correlator accepted the lengths.
-func (s *stretcher) correlateWide(last int, block *[searchBlock]float64, reference *[stretchHop]float64) bool {
-	wide := s.wide
-	n := copy(wide.block[:], block[:last+stretchHop])
-	wide.ref = *reference
-	return s.correlate(wide.dots[:last+1], wide.block[:n], wide.ref[:]) == nil
+// correlateWide sets dots[offset], for each offset in [0, last], to the dot
+// product of reference with block[offset:offset+stretchHop], and reports
+// whether the correlator accepted the lengths. Production calls
+// fft.Correlate statically, which keeps the caller's arrays on its stack;
+// only an injected correlator pays for the copies.
+func (s *stretcher) correlateWide(last int, dots *[searchStarts]float64, block *[searchBlock]float64, reference *[stretchHop]float64) bool {
+	injected := s.injected
+	if injected == nil {
+		return fft.Correlate(dots[:last+1], block[:last+stretchHop], reference[:]) == nil
+	}
+
+	n := copy(injected.block[:], block[:last+stretchHop])
+	injected.ref = *reference
+	if injected.correlate(injected.dots[:last+1], injected.block[:n], injected.ref[:]) != nil {
+		return false
+	}
+
+	copy(dots[:last+1], injected.dots[:last+1])
+	return true
 }
 
 // slideEnergies sets energies[offset], for each offset in [0, last], to the
