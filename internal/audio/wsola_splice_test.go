@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mniehe/llama-swap-voice/internal/fft"
 )
 
 const (
@@ -121,13 +123,15 @@ func assertSplicesCleanly(t *testing.T, tone func(period int) []float32, periods
 }
 
 // benchCorrelators are the correlators the benchmarks compare on the same
-// workload.
+// workload: production's internal/fft and the go-fft adapter. correlator
+// builds one for a single call; stretcher builds a stretcher that uses it.
 var benchCorrelators = []struct {
 	name       string
-	correlator newCorrelator
+	correlator func() correlateFunc
+	stretcher  stretcherFactory
 }{
-	{"internal", internalCorrelator},
-	{"gofft", goFFTCorrelate},
+	{"internal", func() correlateFunc { return fft.Correlate }, NewStretcher},
+	{"gofft", goFFTCorrelate, goFFTStretcher},
 }
 
 func BenchmarkStretcher_Speech60s(b *testing.B) {
@@ -148,7 +152,7 @@ func benchmarkSpeech60s(b *testing.B, speed float64) {
 		b.Run("correlator="+bench.name, func(b *testing.B) {
 			b.SetBytes(int64(len(input)))
 			for b.Loop() {
-				stretcher, err := newStretcherWith(bytes.NewReader(input), speed, bench.correlator())
+				stretcher, err := bench.stretcher(bytes.NewReader(input), speed)
 				require.NoError(b, err)
 				_, err = io.Copy(io.Discard, stretcher)
 				require.NoError(b, err)

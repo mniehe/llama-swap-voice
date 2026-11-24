@@ -1,17 +1,16 @@
 package audio
 
 import (
-	"bytes"
-	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
 	"math/cmplx"
+	"math/rand/v2"
+	"strconv"
 	"testing"
 
 	gofft "github.com/go-fft/fft"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/mniehe/llama-swap-voice/internal/fft"
@@ -24,10 +23,6 @@ const (
 	goFFTDotStep  = 0x1p-30
 	goFFTBins     = fft.Size/2 + 1
 )
-
-// hashSpeeds are the speeds whose output on the 60 s speech input must be
-// the same with either correlator.
-var hashSpeeds = []float64{0.25, 1.10, 1.15, 1.20}
 
 // goFFTCorrelator is fft.Correlate's contract built on go-fft's real plan,
 // for comparison only. It holds its buffers, so one value serves one
@@ -76,35 +71,107 @@ func (c *goFFTCorrelator) correlate(dots, block, ref []float64) error {
 	return nil
 }
 
-func TestGoFFTCorrelator_MatchesExactOracle(t *testing.T) {
-	t.Parallel()
-	runExactOracle(t, goFFTCorrelate)
+// goFFTStretcher is NewStretcher with the go-fft adapter as its correlator.
+func goFFTStretcher(r io.Reader, speed float64) (io.Reader, error) {
+	return newStretcherWith(r, speed, goFFTCorrelate())
 }
 
-func TestGoFFTCorrelator_Speech60s_MatchesInternal(t *testing.T) {
-	input := speech60s(t)
+// goFFTPatterns are s16 inputs for the per-lag test: random samples, a
+// single impulse, full-scale samples of alternating sign, whose products
+// cancel from one lag to the next, and constant full scale, the largest
+// sums.
+var goFFTPatterns = map[string]func(rng *rand.ChaCha8, length int) []int16{
+	"random": func(rng *rand.ChaCha8, length int) []int16 {
+		samples := make([]int16, length)
+		for i := range samples {
+			samples[i] = int16(rng.Uint64() >> randomSampleShift) //nolint:gosec // G115: the shift leaves 16 bits.
+		}
+		return samples
+	},
+	"impulse": func(_ *rand.ChaCha8, length int) []int16 {
+		samples := make([]int16, length)
+		samples[length/2] = math.MaxInt16
+		return samples
+	},
+	"alternating": func(_ *rand.ChaCha8, length int) []int16 {
+		samples := make([]int16, length)
+		for i := range samples {
+			samples[i] = math.MaxInt16
+			if i%2 == 1 {
+				samples[i] = math.MinInt16
+			}
+		}
+		return samples
+	},
+	"full scale": func(_ *rand.ChaCha8, length int) []int16 {
+		samples := make([]int16, length)
+		for i := range samples {
+			samples[i] = math.MinInt16
+		}
+		return samples
+	},
+}
 
-	for _, speed := range hashSpeeds {
-		t.Run(speedName(speed), func(t *testing.T) {
-			t.Parallel()
-			want := stretchAll(t, input, speed, internalCorrelator)
-			got := stretchAll(t, input, speed, goFFTCorrelate)
-			t.Logf("speed %g: internal %x, go-fft %x", speed, sha256.Sum256(want), sha256.Sum256(got))
+// randomSampleShift keeps the top 16 bits of a random uint64.
+const randomSampleShift = 48
 
-			assert.Equal(t, sha256.Sum256(want), sha256.Sum256(got))
-		})
+// The stretcher falls back to the exact direct scan when a correlator
+// fails, so its output cannot show a broken adapter. This compares every
+// dot product the adapter returns with an exact integer sum.
+func TestGoFFTCorrelator_EveryLagIsExact(t *testing.T) {
+	t.Parallel()
+
+	blockLengths := []int{fftMinStarts - 1 + stretchHop, searchBlock}
+	for name, pattern := range goFFTPatterns {
+		for _, blockLength := range blockLengths {
+			t.Run(name+"/"+strconv.Itoa(blockLength), func(t *testing.T) {
+				t.Parallel()
+				rng := rand.NewChaCha8(noiseSeed)
+				block, ref := pattern(rng, blockLength), pattern(rng, stretchHop)
+				dots := make([]float64, blockLength-stretchHop+1)
+
+				require.NoError(t, goFFTCorrelate()(dots, unitSamples(block), unitSamples(ref)))
+
+				for lag, want := range exactDots(block, ref) {
+					require.Equal(t, math.Float64bits(want), math.Float64bits(dots[lag]), "lag %d: want %g, got %g", lag, want, dots[lag])
+				}
+			})
+		}
 	}
 }
 
-func stretchAll(t *testing.T, input []byte, speed float64, correlator newCorrelator) []byte {
-	t.Helper()
+func TestGoFFTCorrelator_ShortDots_ReturnErrLength(t *testing.T) {
+	var block [searchBlock]float64
+	var ref [stretchHop]float64
+	dots := make([]float64, searchBlock-stretchHop)
 
-	stretcher, err := newStretcherWith(bytes.NewReader(input), speed, correlator())
-	require.NoError(t, err)
-	out, err := io.ReadAll(stretcher)
-	require.NoError(t, err)
+	err := goFFTCorrelate()(dots, block[:], ref[:])
 
-	return out
+	require.ErrorIs(t, err, fft.ErrLength)
+}
+
+// exactDots are the dot products of ref with each window of block, summed
+// as integers and scaled to the samples' units of 2^-15 squared.
+func exactDots(block, ref []int16) []float64 {
+	dots := make([]float64, len(block)-len(ref)+1)
+	for lag := range dots {
+		var sum int64
+		for i, sample := range ref {
+			sum += int64(block[lag+i]) * int64(sample)
+		}
+		dots[lag] = float64(sum) * goFFTDotStep
+	}
+
+	return dots
+}
+
+func unitSamples(samples []int16) []float64 {
+	unit := make([]float64, len(samples))
+	for i, sample := range samples {
+		unit[i] = float64(sample) / s16Scale
+	}
+
+	return unit
 }
 
 // BenchmarkCorrelator_Call times one correlation of the size a streaming
