@@ -2,7 +2,6 @@ package fft
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -73,9 +72,7 @@ func checkExact(t *testing.T, block, ref []int16) {
 
 	want := oracle(block, ref)
 	dots := make([]float64, len(want))
-	if err := Correlate(dots, toUnit(block), toUnit(ref)); err != nil {
-		t.Fatalf("block %d, reference %d: %v", len(block), len(ref), err)
-	}
+	require.NoErrorf(t, Correlate(dots, toUnit(block), toUnit(ref)), "block %d, reference %d", len(block), len(ref))
 
 	var scaled [Size]float64
 	correlate(&scaled, toUnit(block), toUnit(ref))
@@ -85,9 +82,11 @@ func checkExact(t *testing.T, block, ref []int16) {
 	}
 	observe(worst)
 
+	// One assertion per call, not per lag: the exhaustive tests check
+	// millions of lags.
 	for k, w := range want {
 		if dots[k] != float64(w)*dotStep || (dots[k] == 0 && math.Signbit(dots[k])) {
-			t.Fatalf("block %d, reference %d, lag %d: got %v (K %v), want K %d", len(block), len(ref), k, dots[k], dots[k]/dotStep, w)
+			require.Failf(t, "inexact lag", "block %d, reference %d, lag %d: got %v (K %v), want K %d", len(block), len(ref), k, dots[k], dots[k]/dotStep, w)
 		}
 	}
 }
@@ -165,13 +164,9 @@ func TestCorrelate_ImpulsePairs_PinTheLag(t *testing.T) {
 			checkExact(t, block, ref)
 
 			dots := make([]float64, lags+1)
-			if err := Correlate(dots, toUnit(block), toUnit(ref)); err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, Correlate(dots, toUnit(block), toUnit(ref)))
 			for k, d := range dots {
-				if (d != 0) != (k == lag) {
-					t.Fatalf("lengths %v, impulse at lag %d: dot %v at lag %d", lengths, lag, d, k)
-				}
+				require.Equalf(t, k == lag, d != 0, "lengths %v, impulse at lag %d: dot %v at lag %d", lengths, lag, d, k)
 			}
 		}
 	}
@@ -236,12 +231,8 @@ func TestCorrelate_LengthsOutsideContract_ReturnErrLength(t *testing.T) {
 			dots := make([]float64, lengths[0])
 			dots[0] = -1
 			err := Correlate(dots, make([]float64, lengths[1]), make([]float64, lengths[2]))
-			if !errors.Is(err, ErrLength) {
-				t.Fatalf("got %v, want ErrLength", err)
-			}
-			if dots[0] != -1 {
-				t.Fatalf("dots changed on error")
-			}
+			require.ErrorIs(t, err, ErrLength)
+			require.InDelta(t, -1, dots[0], 0, "dots changed on error")
 		})
 	}
 }
@@ -272,7 +263,7 @@ func BenchmarkCorrelate(b *testing.B) {
 	dots := make([]float64, wsolaBlock-wsolaRef+1)
 	for b.Loop() {
 		if err := Correlate(dots, block, ref); err != nil {
-			b.Fatal(err)
+			require.NoError(b, err)
 		}
 	}
 }
@@ -315,7 +306,7 @@ func BenchmarkScan(b *testing.B) {
 			var dots [Size]float64
 			for b.Loop() {
 				if err := Correlate(dots[:lags], block[:lags-1+wsolaRef], ref[:]); err != nil {
-					b.Fatal(err)
+					require.NoError(b, err)
 				}
 			}
 		})

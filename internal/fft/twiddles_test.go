@@ -5,6 +5,8 @@ import (
 	"math/big"
 	"strconv"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 // The certificate recomputes every root by a route independent of
@@ -118,9 +120,7 @@ func certify(t *testing.T, name string, stored float64, want bounds) *big.Float 
 
 	lo, _ := want.lo.Float64()
 	hi, _ := want.hi.Float64()
-	if lo != stored || hi != stored {
-		t.Errorf("%s: stored %x, exact value lies in [%s, %s], which rounds to [%x, %x]", name, stored, want.lo.Text('g', 30), want.hi.Text('g', 30), lo, hi)
-	}
+	assert.Truef(t, lo == stored && hi == stored, "%s: stored %x, exact value lies in [%s, %s], which rounds to [%x, %x]", name, stored, want.lo.Text('g', 30), want.hi.Text('g', 30), lo, hi)
 
 	s := new(big.Float).SetFloat64(stored)
 	below := certFloat(big.ToPositiveInf).Sub(s, want.lo)
@@ -129,8 +129,8 @@ func certify(t *testing.T, name string, stored float64, want bounds) *big.Float 
 	if above.Cmp(below) > 0 {
 		worst = above
 	}
-	if stored != 0 && worst.Cmp(halfUlp(stored)) > 0 {
-		t.Errorf("%s: |stored - exact| may reach %s, over half an ulp %s", name, worst.Text('g', 10), halfUlp(stored).Text('g', 10))
+	if stored != 0 {
+		assert.LessOrEqualf(t, worst.Cmp(halfUlp(stored)), 0, "%s: |stored - exact| may reach %s, over half an ulp %s", name, worst.Text('g', 10), halfUlp(stored).Text('g', 10))
 	}
 
 	return worst
@@ -156,9 +156,7 @@ func TestRoots_AreCorrectlyRounded(t *testing.T) {
 		squared := certFloat(big.ToPositiveInf).Add(
 			certFloat(big.ToPositiveInf).Mul(reErr, reErr),
 			certFloat(big.ToPositiveInf).Mul(imErr, imErr))
-		if squared.Cmp(betaSquared) > 0 {
-			t.Errorf("ω^%d: |stored - exact| may reach %s, over u/√2", k, squared.Sqrt(squared).Text('g', 10))
-		}
+		assert.LessOrEqualf(t, squared.Cmp(betaSquared), 0, "ω^%d: |stored - exact| may reach %s, over u/√2", k, new(big.Float).Sqrt(squared).Text('g', 10))
 		ratio, _ := certFloat(big.ToPositiveInf).Quo(squared, certFloat(big.ToNearestEven).Mul(u, u)).Float64()
 		worstRatio = max(worstRatio, math.Sqrt(ratio))
 	}
