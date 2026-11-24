@@ -32,6 +32,12 @@ var hashSpeeds = []float64{0.25, 1.10, 1.15, 1.20}
 // goFFTCorrelator is fft.Correlate's contract built on go-fft's real plan,
 // for comparison only. It holds its buffers, so one value serves one
 // stretcher.
+//
+// Production uses internal/fft on purpose. go-fft measured about three
+// times faster in BenchmarkStretcher_Speech60s, but internal/fft is fast
+// enough for now, needs no dependency, and its exactness is proven
+// (internal/fft/PROOF.md). go-fft's exactness is only tested, and its
+// kernels, routes and fused multiply-adds vary by CPU.
 type goFFTCorrelator struct {
 	plan          *gofft.RealPlan
 	block, ref    [fft.Size]float64
