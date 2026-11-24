@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+
+	"github.com/mniehe/llama-swap-voice/internal/fft"
 )
 
 // MinSpeed and MaxSpeed bound the speeds NewStretcher accepts.
@@ -33,6 +35,12 @@ const (
 	// negative, which fails to compile.
 	dotLanes = 8
 	_        = uint(-(stretchHop % dotLanes))
+	// fftMinStarts is the fewest starts the FFT correlator scores; below it
+	// the direct scan is faster. The correlator needs the whole search block
+	// to fit its transform, or the constant below is negative and fails to
+	// compile.
+	fftMinStarts = 400
+	_            = uint(fft.Size - searchBlock)
 	// minMatchCorrelation is the normalised correlation below which a match
 	// may not skip input. Voiced speech and steady tones match near 1;
 	// consonants and noise match below it.
@@ -269,19 +277,32 @@ func (s *stretcher) chooseStart(lo, hi int) int {
 // of the dot product and the sliding energy give the scores a plain loop
 // would.
 //
-// The dot product is written out here, not in a function of its own,
-// because the race detector instruments every read through a pointer but
-// not reads of a local array, and this loop's reads made the race tests
-// much slower when it did. Go does not unroll loops, so the lanes are
-// written out too.
+// A wide search takes its dot products from the FFT correlator, which
+// returns the same exact sums. A narrow one, near the start or end of the
+// input, uses the direct scan, which is written out here, not in a
+// function of its own, because the race detector instruments every read
+// through a pointer but not reads of a local array, and this loop's reads
+// made the race tests much slower when it did. Go does not unroll loops,
+// so the lanes are written out too.
 func (s *stretcher) scoreStarts(lo, hi int, scores *[searchStarts]float64) (tailNorm float64) {
 	var reference [stretchHop]float64
 	var block [searchBlock]float64
 	stage(reference[:], s.tail)
 	stage(block[:], s.in[lo-s.base:hi-s.base+stretchHop])
+	tailNorm = math.Sqrt(sumSquares(reference[:]) + correlationEpsilon)
 
 	var energies [searchStarts]float64
 	slideEnergies(&block, hi-lo, &energies)
+	if hi-lo+1 >= fftMinStarts {
+		var dots [searchStarts]float64
+		if fft.Correlate(dots[:hi-lo+1], block[:hi-lo+stretchHop], reference[:]) == nil {
+			for offset := 0; offset <= hi-lo; offset++ {
+				scores[offset] = dots[offset] / math.Sqrt(energies[offset]+correlationEpsilon)
+			}
+			return tailNorm
+		}
+	}
+
 	for offset := 0; offset <= hi-lo; offset++ {
 		var l0, l1, l2, l3, l4, l5, l6, l7 float64
 		for k := 0; k <= stretchHop-dotLanes; k += dotLanes {
@@ -299,7 +320,7 @@ func (s *stretcher) scoreStarts(lo, hi int, scores *[searchStarts]float64) (tail
 		scores[offset] = dot / math.Sqrt(energies[offset]+correlationEpsilon)
 	}
 
-	return math.Sqrt(sumSquares(reference[:]) + correlationEpsilon)
+	return tailNorm
 }
 
 // slideEnergies sets energies[offset], for each offset in [0, last], to the
