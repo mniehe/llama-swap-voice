@@ -116,14 +116,18 @@ no other site can frame it.
 
 `GET /recordings/{id}/audio` returns the recording as `audio/ogg`: Ogg Opus,
 16 kHz mono, 32 kbps. It serves byte ranges (206, or 416 for a range past
-the end or a malformed `Range`), `HEAD` and conditional requests (304, or 412
-for an `If-Match` or `If-Unmodified-Since` that fails). Every reply to a
-`GET` or `HEAD` of this path carries `Cache-Control: no-store`, errors
+the end or a `Range` it cannot parse), `HEAD` and conditional requests (304,
+or 412 for an `If-Match` or `If-Unmodified-Since` that fails). It ignores a
+`Range` that names no range (`bytes=`), more than 200 ranges, or ranges that
+together exceed the file, and answers 200 with the whole file. Every reply to
+a `GET` or `HEAD` of this path carries `Cache-Control: no-store`, errors
 included: the 403 for a `Host` that is not allowed, the 404, and every other
-status. A 412, 416 or 500 is a JSON error. A 416 for a range past the end also carries
-`Content-Range: bytes */{size}`; a 416 for a malformed `Range` carries no
-`Content-Range`. The transfer may take as long as sending the file at
-16 KiB/s takes, and at least 10 seconds.
+status, except a 503 for shutdown, which the service answers before it
+routes the request. A reply to another method, the 405, does not carry it.
+A 412, 416 or 500 is a JSON error. A 416 for a range past the end also
+carries `Content-Range: bytes */{size}`; a 416 for a `Range` it cannot parse
+carries no `Content-Range`. The transfer may take as long as sending the
+file at 16 KiB/s takes, and at least 10 seconds.
 
 `POST /recordings/{id}/keep` takes a form with one field, `keep`, set to
 `true` or `false` and given once. On success it answers 303 with
