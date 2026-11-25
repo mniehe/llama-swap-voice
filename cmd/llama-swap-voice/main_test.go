@@ -117,7 +117,15 @@ func serviceFor(t *testing.T, cfg *ServiceConfig, respond http.HandlerFunc, http
 	fake := httptest.NewServer(respond)
 	t.Cleanup(fake.Close)
 
-	client, err := upstream.New(fake.URL, "tts", "asr", httpClient)
+	return serviceAt(t, cfg, fake.URL, httpClient)
+}
+
+// serviceAt builds the services against an upstream at upstreamURL that
+// httpClient reaches.
+func serviceAt(t *testing.T, cfg *ServiceConfig, upstreamURL string, httpClient *http.Client) *services {
+	t.Helper()
+
+	client, err := upstream.New(upstreamURL, "tts", "asr", httpClient)
 	require.NoError(t, err)
 
 	service, err := newServices(cfg, map[string]string{"alice": filepath.Join(cfg.Voices.Dir, "alice.mp3")}, client, slog.New(slog.DiscardHandler))
@@ -441,12 +449,16 @@ func postSpeech(ctx context.Context, base string) (string, error) {
 }
 
 func postSpeechBody(ctx context.Context, base, body string) (string, error) {
+	return postSpeechVia(ctx, unpooledClient(), base, body)
+}
+
+func postSpeechVia(ctx context.Context, client *http.Client, base, body string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/audio/speech", strings.NewReader(body))
 	if err != nil {
 		return "", err
 	}
 
-	resp, err := unpooledClient().Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -1460,42 +1472,150 @@ func TestStartRecordings_StopGivesUpAtTheDeadline(t *testing.T) {
 }
 
 const (
-	// drainTotal and drainHard are the shutdown budget of the drain test:
-	// Total is long enough that a deadline counted from the end of
-	// shutdown, Total later, misses the slack.
+	// drainGrace, drainTotal and drainHard are the shutdown timing of the
+	// drain test. Each differs from the others, so a budget counted from
+	// the signal or from the end of shutdown ends at another instant.
+	drainGrace = 200 * time.Millisecond
 	drainTotal = time.Second
 	drainHard  = 300 * time.Millisecond
+	// bubbleUpstream and bubbleService name the two servers a drain test
+	// reaches through pipeListeners; nothing resolves them.
+	bubbleUpstream = "http://upstream.invalid"
+	bubbleService  = "http://service.invalid"
 )
 
-func TestServe_RecordingsDrainDeadlineRunsFromShutdownStart(t *testing.T) {
-	cfg := validConfig(t)
-	cfg.ShutdownTiming = ShutdownTimingConfig{Total: drainTotal, Hard: drainHard}
-	paused := make(chan struct{})
-	service := serviceFor(t, &cfg, func(w http.ResponseWriter, r *http.Request) {
-		_, err := io.WriteString(w, slowAudio)
-		assert.NoError(t, err)
-		assert.NoError(t, http.NewResponseController(w).Flush())
-		close(paused)
-		<-r.Context().Done()
-	}, &http.Client{})
-	drainEnded := make(chan time.Time, 1)
-	service.runRecordings = func(ctx, drain context.Context) {
-		<-ctx.Done()
-		<-drain.Done()
-		drainEnded <- time.Now()
+// pipeListener is a net.Listener whose connections are in-memory pipes. A
+// synctest bubble's clock stops while a goroutine waits on a real socket,
+// and keeps moving while one waits on a pipe.
+type pipeListener struct {
+	conns  chan net.Conn
+	closed chan struct{}
+	close  func()
+}
+
+func newPipeListener() *pipeListener {
+	closed := make(chan struct{})
+	return &pipeListener{conns: make(chan net.Conn), closed: closed, close: sync.OnceFunc(func() { close(closed) })}
+}
+
+func (l *pipeListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.conns:
+		return conn, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
 	}
-	// The stuck request holds shutdown for all of Total, so shutdown ends
-	// Total after it starts.
-	s := stuckSpeech(t, &cfg, service, paused)
-	signalled := time.Now()
-	s.cancel()
+}
 
-	budget := drainTotal + drainHard
-	require.NoError(t, requireServeReturns(t, s.done, budget+probeTimeout))
-	ended := <-drainEnded
+func (l *pipeListener) Close() error {
+	l.close()
+	return nil
+}
 
-	assert.GreaterOrEqual(t, ended.Sub(signalled), budget, "the drain lasts the whole budget")
-	assert.Less(t, ended.Sub(signalled), budget+shutdownSlack, "the budget counts from the start of shutdown, not its end")
+func (*pipeListener) Addr() net.Addr {
+	return pipeAddr{}
+}
+
+// DialContext hands one end of a new pipe to Accept and returns the other.
+func (l *pipeListener) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	server, client := net.Pipe()
+	select {
+	case l.conns <- server:
+		return client, nil
+	case <-l.closed:
+		return nil, errors.Join(net.ErrClosed, server.Close(), client.Close())
+	case <-ctx.Done():
+		return nil, errors.Join(ctx.Err(), server.Close(), client.Close())
+	}
+}
+
+// client reaches the listener with a connection per request, so no idle
+// connection outlives the bubble.
+func (l *pipeListener) client() *http.Client {
+	return &http.Client{Transport: &http.Transport{DialContext: l.DialContext, DisableKeepAlives: true}}
+}
+
+type pipeAddr struct{}
+
+func (pipeAddr) Network() string { return "pipe" }
+func (pipeAddr) String() string  { return "pipe" }
+
+// receiveWithin returns the value ch delivers, and fails the test when none
+// arrives within d of bubble time.
+func receiveWithin[T any](t *testing.T, ch <-chan T, d time.Duration, what string) T {
+	t.Helper()
+
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(d):
+		require.FailNow(t, what, "nothing within %s", d)
+		var zero T
+		return zero
+	}
+}
+
+func TestServe_RecordingsDrainDeadlineRunsFromShutdownStart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := validConfig(t)
+		cfg.ShutdownTiming = ShutdownTimingConfig{Grace: drainGrace, Total: drainTotal, Hard: drainHard}
+
+		paused := make(chan struct{})
+		upstreamListener := newPipeListener()
+		fake := &http.Server{
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// net/http cancels r's context on a closed connection only
+				// once the request body has been read.
+				_, err := io.Copy(io.Discard, r.Body)
+				assert.NoError(t, err)
+				_, err = io.WriteString(w, slowAudio)
+				assert.NoError(t, err)
+				assert.NoError(t, http.NewResponseController(w).Flush())
+				close(paused)
+				<-r.Context().Done()
+			}),
+			ReadHeaderTimeout: probeTimeout,
+		}
+		upstreamDone := make(chan error, 1)
+		go func() { upstreamDone <- fake.Serve(upstreamListener) }()
+
+		service := serviceAt(t, &cfg, bubbleUpstream, upstreamListener.client())
+		drainEnded := make(chan time.Time, 1)
+		service.runRecordings = func(ctx, drain context.Context) {
+			<-ctx.Done()
+			<-drain.Done()
+			drainEnded <- time.Now()
+		}
+
+		listener := newPipeListener()
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- serveOn(ctx, &cfg, service, &listeners{http: listener}, slog.New(slog.DiscardHandler)) }()
+
+		requestEnded := make(chan time.Time, 1)
+		go func() {
+			_, err := postSpeechVia(t.Context(), listener.client(), bubbleService, `{"input":"hi","response_format":"mp3"}`)
+			assert.Error(t, err, "a cancelled stream must not end cleanly")
+			requestEnded <- time.Now()
+		}()
+		receiveWithin(t, paused, probeTimeout, "the upstream reply never started")
+
+		signalled := time.Now()
+		cancel()
+
+		budget := drainGrace + drainTotal + drainHard
+		require.NoError(t, receiveWithin(t, done, budget+probeTimeout, "serve did not return"))
+		// Without a request that holds shutdown for all of Total, a budget
+		// counted from the end of shutdown would end at the same instant.
+		requestEnd := receiveWithin(t, requestEnded, probeTimeout, "the speech request never ended")
+		assert.Equal(t, drainGrace+drainTotal, requestEnd.Sub(signalled), "the stuck request holds shutdown until Total has passed")
+		drainEnd := receiveWithin(t, drainEnded, probeTimeout, "the recordings drain never ended")
+		assert.Equal(t, budget, drainEnd.Sub(signalled), "the drain ends Total and Hard after shutdown starts, which is Grace after the signal")
+
+		require.NoError(t, fake.Close())
+		assert.ErrorIs(t, receiveWithin(t, upstreamDone, probeTimeout, "the fake upstream never stopped"), http.ErrServerClosed)
+	})
 }
 
 func TestStartRecordings_RecordingsOffIsNoOp(t *testing.T) {
