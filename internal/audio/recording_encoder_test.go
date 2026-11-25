@@ -20,6 +20,10 @@ const (
 	// taken from the package constants, so a changed constant fails here.
 	replyBitrate           = 24000
 	recordingTargetBitrate = 32000
+	// wantComplexity and wantVBR are the encoder settings both streams
+	// share: the slowest, best complexity and variable bitrate.
+	wantComplexity = 10
+	wantVBR        = 1
 	// recordingToneSeconds is long enough for VBR to settle near its target.
 	recordingToneSeconds = 10
 	// vbrBandDivisor bounds the measured rate to the target plus or minus an
@@ -28,17 +32,17 @@ const (
 	vbrBandDivisor = 8
 )
 
-// configuredBitrate returns the target bitrate the libopus encoder behind
-// encoder was configured with.
-func configuredBitrate(t *testing.T, encoder io.WriteCloser) int {
+// configured returns the value the libopus encoder behind encoder was
+// configured with for setting.
+func configured(t *testing.T, encoder io.WriteCloser, setting opusSetting) int {
 	t.Helper()
 
 	opus, ok := encoder.(*opusEncoder)
 	require.True(t, ok, "encoder is %T", encoder)
-	bitrate, err := opus.codec.configuredBitrate()
+	value, err := opus.codec.configured(setting)
 	require.NoError(t, err)
 
-	return bitrate
+	return value
 }
 
 func opusHeadOf(t *testing.T, stream []byte) (head opusHead, inputRate uint32) {
@@ -63,12 +67,14 @@ func TestNewEncoder_Opus_HeadDeclaresReplyRateAndPreSkip(t *testing.T) {
 	assert.Equal(t, libopusPreSkip, head.preSkip, "pre-skip at 48 kHz")
 }
 
-func TestNewEncoder_Opus_ConfiguredAtReplyBitrate(t *testing.T) {
+func TestNewEncoder_Opus_ConfiguredForReplies(t *testing.T) {
 	encoder, err := NewEncoder(Opus, io.Discard)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, encoder.Close()) }()
 
-	assert.Equal(t, replyBitrate, configuredBitrate(t, encoder))
+	assert.Equal(t, replyBitrate, configured(t, encoder, settingBitrate))
+	assert.Equal(t, wantComplexity, configured(t, encoder, settingComplexity))
+	assert.Equal(t, wantVBR, configured(t, encoder, settingVBR))
 }
 
 func encodeRecording(t *testing.T, pcm []byte) []byte {
@@ -114,12 +120,14 @@ func TestNewRecordingEncoder_HeadReportsSixteenKilohertz(t *testing.T) {
 	assert.Equal(t, preSkip+uint64(len(samples))*opusRate/RecordingRate, final, "final granule is pre-skip plus the input length at 48 kHz")
 }
 
-func TestNewRecordingEncoder_ConfiguredAtRecordingBitrate(t *testing.T) {
+func TestNewRecordingEncoder_ConfiguredForRecordings(t *testing.T) {
 	encoder, err := NewRecordingEncoder(io.Discard)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, encoder.Close()) }()
 
-	assert.Equal(t, recordingTargetBitrate, configuredBitrate(t, encoder))
+	assert.Equal(t, recordingTargetBitrate, configured(t, encoder, settingBitrate))
+	assert.Equal(t, wantComplexity, configured(t, encoder, settingComplexity))
+	assert.Equal(t, wantVBR, configured(t, encoder, settingVBR))
 }
 
 // A smoke test of the whole stream's size; the configured bitrate above is

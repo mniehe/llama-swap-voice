@@ -39,6 +39,14 @@ const (
 	// jsonEscapedByte is a character JSON escapes to six bytes, the worst
 	// case for the metadata bound.
 	jsonEscapedByte = "<"
+
+	// Ogg page and OpusHead layout (RFC 3533, RFC 7845).
+	oggHeaderBytes    = 27
+	oggGranuleOffset  = 6
+	oggSegmentsOffset = 26
+	opusHeadPreSkip   = 10
+	// granulesPerSample is how many 48 kHz granules one 16 kHz sample spans.
+	granulesPerSample = 48000 / audio.RecordingRate
 )
 
 // logBuffer collects JSON log lines from a store.
@@ -176,9 +184,41 @@ func TestSave_StoredAudioMatchesTheInput(t *testing.T) {
 	got := samplesOf(t, decoded)
 
 	assert.InDelta(t, len(input), len(got), opusFrame, "decoded length within one Opus frame")
+	preSkip, final := oggTimeline(t, opus)
+	assert.Equal(t, uint64(preSkip)+granulesPerSample*uint64(len(input)), final,
+		"final granule is pre-skip plus the input at 48 kHz, so the WAV header was not encoded as audio")
 	correlation := bestCorrelation(input, got, opusFrame)
 	t.Logf("best normalised cross-correlation %.4f", correlation)
 	assert.GreaterOrEqual(t, correlation, minCorrelation)
+}
+
+// oggTimeline walks the Ogg pages of stream and returns the pre-skip its
+// OpusHead declares and the granule position of its last page.
+func oggTimeline(t *testing.T, stream []byte) (preSkip uint16, final uint64) {
+	t.Helper()
+
+	for offset, page := 0, 0; offset < len(stream); page++ {
+		require.GreaterOrEqual(t, len(stream)-offset, oggHeaderBytes, "page %d header", page)
+		require.Equal(t, "OggS", string(stream[offset:offset+4]), "page %d capture", page)
+		final = binary.LittleEndian.Uint64(stream[offset+oggGranuleOffset:])
+		segments := int(stream[offset+oggSegmentsOffset])
+		bodyStart := offset + oggHeaderBytes + segments
+		require.LessOrEqual(t, bodyStart, len(stream), "page %d segment table", page)
+		bodyBytes := 0
+		for _, lacing := range stream[offset+oggHeaderBytes : bodyStart] {
+			bodyBytes += int(lacing)
+		}
+		require.LessOrEqual(t, bodyStart+bodyBytes, len(stream), "page %d body", page)
+		if page == 0 {
+			head := stream[bodyStart : bodyStart+bodyBytes]
+			require.GreaterOrEqual(t, len(head), opusHeadPreSkip+2)
+			require.Equal(t, "OpusHead", string(head[:8]))
+			preSkip = binary.LittleEndian.Uint16(head[opusHeadPreSkip:])
+		}
+		offset = bodyStart + bodyBytes
+	}
+
+	return preSkip, final
 }
 
 func TestSave_JSONWriteFailureRemovesTheOpus(t *testing.T) {

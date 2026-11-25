@@ -98,14 +98,36 @@ func (c *libopus) configure() error {
 	return nil
 }
 
-// configuredBitrate reads back the target bitrate libopus is encoding at.
-func (c *libopus) configuredBitrate() (int, error) {
-	var bitrate C.opus_int32
-	if status := C.lsv_opus_get(c.encoder, C.OPUS_GET_BITRATE_REQUEST, &bitrate); status != C.OPUS_OK {
-		return 0, opusError("read bitrate", status)
+// opusSetting names an encoder setting that can be read back.
+type opusSetting int
+
+const (
+	settingBitrate opusSetting = iota
+	settingComplexity
+	settingVBR
+)
+
+// configured reads back the value libopus is encoding with for setting.
+func (c *libopus) configured(setting opusSetting) (int, error) {
+	var request C.int
+	var name string
+	switch setting {
+	case settingBitrate:
+		request, name = C.OPUS_GET_BITRATE_REQUEST, "bitrate"
+	case settingComplexity:
+		request, name = C.OPUS_GET_COMPLEXITY_REQUEST, "complexity"
+	case settingVBR:
+		request, name = C.OPUS_GET_VBR_REQUEST, "vbr"
+	default:
+		return 0, fmt.Errorf("libopus: unknown setting %d", setting)
 	}
 
-	return int(bitrate), nil
+	var value C.opus_int32
+	if status := C.lsv_opus_get(c.encoder, request, &value); status != C.OPUS_OK {
+		return 0, opusError("read "+name, status)
+	}
+
+	return int(value), nil
 }
 
 // encode returns a packet that stays valid until the next call.
