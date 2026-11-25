@@ -238,6 +238,7 @@ them and review the transcripts. It is off by default.
 | Option | Type | Default | Effect |
 |---|---|---|---|
 | `recordings.enable` | boolean | `false` | Keeps the audio and transcript of every successful transcription, from the HTTP API and from the Wyoming listener, in `<stateDir>/recordings`. Serves the [recordings page](api.md#recordings) at `/recordings` on the HTTP port. |
+| `recordings.allowedHosts` | list of strings | `[]` | Hosts that the recordings page answers besides `127.0.0.1`, `[::1]`, `localhost` and `host`. An entry without a port, such as `voice.example.org`, matches that host on every port; `voice.example.org:8443` matches that port only. An entry may not hold a comma, a slash or a space. |
 
 **Turning this on stores household speech.** Each recording stays on disk
 for 7 days. A recording that you mark kept on the page stays until you
@@ -246,22 +247,34 @@ port can listen to every recording and change its keep mark. Keep `host` on
 loopback, or put a reverse proxy that checks who is asking in front of the
 port.
 
-The service saves a recording after the transcription succeeds and before it
-answers. A failed transcription saves nothing. A save that fails, for example
-because the disk is full, is logged as a warning, and the client still gets
-its transcript.
+The page answers only requests whose `Host` header names loopback, `host`
+or an entry of `recordings.allowedHosts`, and refuses others with a 403.
+This stops a web page in a browser on your network from reaching the
+recordings by rebinding its own name to the service's address. Behind a
+reverse proxy, make the proxy pass the public `Host` through unchanged and
+list that host in `recordings.allowedHosts`; the service never reads
+`X-Forwarded-Host`.
+
+The service saves a recording in the background after the transcription
+succeeds and it has answered. A failed transcription saves nothing. A save
+that fails, for example because the disk is full, is logged as a warning;
+the client already has its transcript. Up to 64 MiB of audio may wait to be
+saved; a recording that would pass that is dropped with a warning. On
+shutdown the service saves what is waiting until the shutdown budget,
+`shutdown.total` plus `shutdown.hard`, has passed, and drops the rest with
+a warning.
 
 Each recording is two files with the same name: `<id>.opus`, the audio that
 was sent to the ASR model as Ogg Opus (16 kHz mono, 32 kbps, about 14 MB an
 hour), and `<id>.json`:
 
 ```json
-{"at":"2026-11-25T15:30:00Z","durationMs":2140,"source":"wyoming","transcript":"Turn on the kitchen lights.","keep":false}
+{"at":"2026-11-25T15:30:00.123456789Z","durationMs":2140,"source":"wyoming","transcript":"Turn on the kitchen lights.","keep":false}
 ```
 
 `source` is `openai` for the HTTP API and `wyoming` for the Wyoming
-listener. The id is the UTC time of the recording and a random suffix, such
-as `20261125T153000Z-1a2b3c4d`.
+listener. `at` is the UTC time of the save to the nanosecond. The id is that
+time to the second and a random suffix, such as `20261125T153000Z-1a2b3c4d`.
 
 The service deletes recordings that are not kept and are older than 7 days,
 once when it starts and then every hour. The two files of all recordings
@@ -270,6 +283,14 @@ service deletes the oldest recordings that are not kept until the new one
 fits. Kept recordings count toward the cap. When kept recordings alone leave
 no room, the service saves nothing and logs a warning. The retention, the
 cap and the interval are fixed.
+
+The recordings directory must belong to the service alone. At start and
+every hour the service deletes, besides expired recordings, the files that
+an interrupted save or delete leaves: a `.opus` or `.json` file without its
+partner, and its own temporary files, `probe-<digits>.tmp` and
+`<id>.opus.<digits>.tmp` or `<id>.json.<digits>.tmp`. It leaves other files
+alone. At start it also deletes a recording whose `.json` does not decode,
+with a warning.
 
 With `recordings.enable` on, the module creates `<stateDir>/recordings`
 with mode `0700`, owned by `user` and `group`, and makes that directory,
@@ -284,7 +305,7 @@ again leaves the directory and its recordings on disk; delete them by hand.
 | `user` | string | `"llama-swap-voice"` | The user the service runs as. The module creates it only under the default name. |
 | `group` | string | `"llama-swap-voice"` | The group the service runs as. The module creates it only under the default name. Under `qwentts`, llama-swap's user joins it, so do not share it with other services. |
 | `stateDir` | string | `"/var/lib/llama-swap-voice"` | A directory for this module alone. The voices directory is `<stateDir>/voices`, and the [recordings](#recordings) directory is `<stateDir>/recordings`. Use an absolute path with no `%` and no slash at the end. |
-| `extraEnvironment` | attribute set of strings | `{}` | Extra [environment variables](#environment-variables) for the service, by full name. They override the variables the module writes. Evaluation checks only the [variables the module reads back](#variables-the-module-reads-back). The service checks every other override, the Wyoming variables included, when it starts, and refuses to start on a bad value. |
+| `extraEnvironment` | attribute set of strings | `{}` | Extra [environment variables](#environment-variables) for the service, by full name. They override the variables the module writes. Evaluation checks only the [variables the module reads back](#variables-the-module-reads-back), and refuses `RECORDINGS_ENABLE`, `RECORDINGS_DIR` and `RECORDINGS_ALLOWEDHOSTS`, because the recordings directory and the sandbox follow the [recordings](#recordings) options. The service checks every other override, the Wyoming variables included, when it starts, and refuses to start on a bad value. |
 | `voiceNames` | list of strings, read-only | the declared names | The names of the declared voices, sorted. Other modules can read it. |
 | `llamaSwap.group.name` | string | `"voice"` | The name of the group. |
 | `llamaSwap.group.location` | `"legacy"` or `"routing"` | `"legacy"` | Where the module writes the group: the top-level `groups` key, or `routing.router.settings.groups`. llama-swap refuses a configuration that uses both, so match the rest of your settings. |
@@ -499,8 +520,8 @@ module writes them for you, so you need this table only when you run the
 service by hand or use `extraEnvironment`. Each name starts with
 `LLAMA_SWAP_VOICE_`; the table and the rest of this page leave the prefix
 out. Only `VOICES_DEFAULT` is required. The service checks the `WYOMING_`
-variables only when `WYOMING_ENABLED` is `true`, and `RECORDINGS_DIR` only
-when `RECORDINGS_ENABLE` is `true`.
+variables only when `WYOMING_ENABLED` is `true`, and `RECORDINGS_DIR` and
+`RECORDINGS_ALLOWEDHOSTS` only when `RECORDINGS_ENABLE` is `true`.
 
 | Variable (`LLAMA_SWAP_VOICE_…`) | Module option | Default | Effect |
 |---|---|---|---|
@@ -532,7 +553,8 @@ when `RECORDINGS_ENABLE` is `true`.
 | `WYOMING_STREAMING` | `wyoming.streaming` | `sentences` | How the service speaks a [streamed synthesis](api.md#streamed-synthesis): `sentences` speaks each sentence as it completes and advertises streaming in `info`; `whole` speaks the whole text after `synthesize-stop` and advertises no streaming. |
 | `WYOMING_STREAMINGMAXCHARS` | `wyoming.streamingMaxChars` | `300` | 1 to `TTS_MAXINPUTCHARS`. In `sentences` mode, the most characters of the sentences that one `synthesize-chunk` completes to join into one request. A longer sentence is spoken whole. The text of a stream not yet spoken plus an arriving chunk may not exceed `TTS_MAXINPUTCHARS`. |
 | `RECORDINGS_ENABLE` | `recordings.enable` | `false` | `true` keeps the audio and transcript of every successful transcription in `RECORDINGS_DIR` and serves the [recordings page](api.md#recordings). This stores household speech for 7 days, and kept recordings until they are released. |
-| `RECORDINGS_DIR` | `stateDir` | none | The directory of recordings, an absolute path. Required when `RECORDINGS_ENABLE` is `true`. The service creates it with mode `0700` if it is missing, and refuses to start if it cannot create it or write to it. The module sets it to `<stateDir>/recordings`. |
+| `RECORDINGS_DIR` | `stateDir` | none | The directory of recordings, an absolute path, for the service alone: it deletes the [leftover files](#recordings) it finds there. Required when `RECORDINGS_ENABLE` is `true`. The service creates it with mode `0700` if it is missing, and refuses to start if it cannot create it or write to it. The module sets it to `<stateDir>/recordings`. |
+| `RECORDINGS_ALLOWEDHOSTS` | `recordings.allowedHosts` | empty | The hosts, separated by commas, that the recordings page answers besides `127.0.0.1`, `[::1]`, `localhost` and `HOST`. Each is a host, an IPv6 address in brackets, or either with a port; a host without a port matches every port. The service refuses to start on an entry with a scheme, a path or a space. |
 
 Set a variable that has no option through `extraEnvironment`:
 

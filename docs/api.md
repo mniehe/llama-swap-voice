@@ -24,9 +24,9 @@ with `recordings.enable` on, and have no `/v1` form.
 | `GET /health` | Health check | 200 |
 | `GET /internal/liveness` | Liveness probe | 200 |
 | `GET /internal/readiness` | Readiness probe | 200; 503 in plain text during shutdown |
-| `GET /recordings` | The [recordings](#recordings) page, in HTML | 200, 500 |
-| `GET /recordings/{id}/audio` | One recording, as Ogg Opus | 200, 404, 500 |
-| `POST /recordings/{id}/keep` | Mark a recording kept, or release it | 303, 400, 404, 500 |
+| `GET /recordings` | The [recordings](#recordings) page, in HTML | 200, 400, 403, 500 |
+| `GET /recordings/{id}/audio` | One recording, as Ogg Opus | 200, 206, 304, 403, 404, 416, 500 |
+| `POST /recordings/{id}/keep` | Mark a recording kept, or release it | 303, 400, 403, 404, 500 |
 
 An unknown path gets a 404 and a wrong method gets a 405.
 
@@ -92,17 +92,34 @@ the option, these paths answer 404 like any unknown path. They have no
 authentication; the recordings hold household speech, so limit who can reach
 the port.
 
+The three paths answer only a request whose `Host` header names an allowed
+host: `127.0.0.1`, `[::1]` or `localhost` on any port, the listen address
+`host`, or an entry of `recordings.allowedHosts`. Any other `Host` gets a
+403, which stops a DNS-rebinding page in a browser on your network from
+reading the recordings. The service never reads `X-Forwarded-Host`, so a
+reverse proxy must pass the public `Host` through unchanged, and that host
+must be in `recordings.allowedHosts`.
+
 `GET /recordings` returns an HTML page that needs no JavaScript. It lists the
-recordings newest first, each with its UTC time, its length, its source
-(`openai` or `wyoming`) and its transcript. Each row has an audio player and
-a button that marks the recording kept or releases it.
+newest 100 recordings, newest first, each with its UTC time, its length, its
+source (`openai` or `wyoming`) and its transcript, and says how many of all
+the recordings it shows. Each row has an audio player and a button that
+marks the recording kept or releases it. When older recordings exist, an
+"Older" link leads to `GET /recordings?before={id}`, the next 100 recordings
+older than `{id}`. A `before` that is not one recording id gets a 400.
 
 `GET /recordings/{id}/audio` returns the recording as `audio/ogg`: Ogg Opus,
-16 kHz mono, 32 kbps. The service does not serve byte ranges.
+16 kHz mono, 32 kbps, with `Cache-Control: no-store`. It serves byte ranges
+(206, or 416 for a range past the end), `HEAD` and conditional requests
+(304). The transfer may take as long as sending the file at 16 KiB/s takes,
+and at least 10 seconds.
 
 `POST /recordings/{id}/keep` takes a form with one field, `keep`, set to
-`true` or `false`. On success it answers 303 with `Location: /recordings`.
-Any other value, a missing field or a form over 1 KiB gets a 400.
+`true` or `false` and given once. On success it answers 303 with
+`Location: /recordings`. Any other value, a missing or repeated field, or a
+form over 1 KiB gets a 400. A post that a browser marks as coming from
+another site (`Sec-Fetch-Site`, or an `Origin` that does not match the host)
+gets a 403.
 
 An id that does not have the form of a recording id, such as
 `20261125T153000Z-1a2b3c4d`, gets a 404 without touching the disk, as does
@@ -114,6 +131,12 @@ at most 1 GiB. A new recording first displaces the oldest ones that are not
 kept. When kept recordings alone fill the 1 GiB, the service saves nothing
 new, logs a warning, and still returns the transcript.
 
+The service saves a recording in the background after it has returned the
+transcript, one at a time in the order they arrived. Up to 64 MiB of audio
+may wait to be saved. A recording that would pass that is dropped with a
+warning. See [shutdown](#shutdown) for what happens to waiting recordings
+when the service stops.
+
 ## Errors
 
 An error is JSON of the form `{"error":{"message":"…"}}`. This includes
@@ -123,6 +146,7 @@ change, so a later failure cuts the transfer.
 | Status | Cause |
 |---|---|
 | 400 | A malformed body; an empty or too long `input`; an unknown voice or format; a `speed` out of range; a missing `file`; an upload that the service cannot decode or that is longer than 20 minutes |
+| 403 | A recordings request whose `Host` is not allowed; a keep post from another site |
 | 404, 405 | An unknown path; a wrong method; an unknown or malformed recording id |
 | 429 and other upstream errors | Passed on from llama-swap or the model server, with its message and `Retry-After` |
 | 500 | A fault inside the service. The cause is in its log. |
@@ -151,6 +175,9 @@ no redirect from llama-swap.
 | Time for a speech request or a transcription | 2 minutes | `request.timeout` |
 | Time for any other request | 10 seconds | fixed |
 | Recordings keep form | 1 KiB | fixed |
+| Recordings on one page | 100 | fixed |
+| Slowest fetch of a recording's audio | 16 KiB/s | fixed |
+| Recordings audio waiting to be saved | 64 MiB | fixed |
 | Recordings kept when not marked | 7 days | fixed |
 | All recordings together | 1 GiB | fixed |
 
@@ -169,6 +196,11 @@ in three steps:
 
 [Limits and timeouts](options.md#limits-and-timeouts) lists the option for
 each step.
+
+With `recordings.enable` on, the service then saves the recordings still
+waiting, until `SHUTDOWN_TOTAL` plus `SHUTDOWN_HARD` after step 2 began. It
+drops any left at that time with one warning that gives their count, and
+does not wait for a save that is still writing.
 
 ## Wyoming
 
