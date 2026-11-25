@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/mniehe/llama-swap-voice/internal/recordings"
 )
@@ -41,10 +40,6 @@ const (
 	maxPlaybackSeconds = int64(math.MaxInt64 / time.Second)
 	shownTime          = "2006-01-02 15:04:05"
 	hoursPerDay        = 24
-	// maxPreviewBytes bounds the transcript a page row shows, so a page of
-	// transcripts at the upstream's 1 MiB bound stays small.
-	maxPreviewBytes = 2 << 10
-	previewEllipsis = "…"
 	// framePolicy keeps another site from framing the page and its keep
 	// buttons.
 	framePolicy = "frame-ancestors 'none'"
@@ -108,7 +103,7 @@ func (s *Server) recordingRoutes() []route {
 
 	return []route{
 		{http.MethodGet, recordingsRoute, s.allowedHost(s.handleRecordings)},
-		{http.MethodGet, recordingsRoute + "/{" + recordingIDKey + "}/audio", s.allowedHost(s.handleRecordingAudio)},
+		{http.MethodGet, recordingsRoute + "/{" + recordingIDKey + "}/audio", notStored(s.allowedHost(s.handleRecordingAudio))},
 		{http.MethodPost, recordingsRoute + "/{" + recordingIDKey + "}/keep", s.allowedHost(keep.ServeHTTP)},
 	}
 }
@@ -122,6 +117,15 @@ func (s *Server) allowedHost(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
+		next(w, r)
+	}
+}
+
+// notStored marks every reply of next, an error included, as one no cache
+// may keep.
+func notStored(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		next(w, r)
 	}
 }
@@ -197,24 +201,9 @@ func newRecordingRow(rec *recordings.Recording) recordingRow {
 		Shown:      rec.At.UTC().Format(shownTime),
 		Length:     fmt.Sprintf("%.1f s", rec.Duration.Seconds()),
 		Source:     rec.Source,
-		Transcript: preview(rec.Transcript),
+		Transcript: rec.Transcript,
 		Keep:       rec.Keep,
 	}
-}
-
-// preview cuts transcript to maxPreviewBytes on a character boundary and
-// marks the cut with an ellipsis.
-func preview(transcript string) string {
-	if len(transcript) <= maxPreviewBytes {
-		return transcript
-	}
-
-	cut := maxPreviewBytes
-	for cut > 0 && !utf8.RuneStart(transcript[cut]) {
-		cut--
-	}
-
-	return transcript[:cut] + previewEllipsis
 }
 
 // handleRecordingAudio serves the file with its own deadline, long enough to

@@ -252,6 +252,7 @@ func TestRecordingRoutes_InvalidOrUnknownIDIsNotFound(t *testing.T) {
 		audio := h.get(recordingsPath + "/" + id + "/audio")
 		assert.Equal(t, http.StatusNotFound, audio.StatusCode, "audio %q", id)
 		assert.Equal(t, contentTypeJSON, audio.Header.Get("Content-Type"))
+		assert.Equal(t, "no-store", audio.Header.Get("Cache-Control"), "audio %q", id)
 		assert.NotEmpty(t, errorMessage(t, audio))
 
 		keep := h.postForm(recordingsPath+"/"+id+"/keep", url.Values{"keep": {"true"}})
@@ -414,12 +415,12 @@ func TestRecordingsPage_ShowsABoundedTranscriptPreview(t *testing.T) {
 	assert.Less(t, len(page), 4*previewBytes, "the page stays small")
 }
 
-func TestNewRecordingRow_ShortTranscriptIsWhole(t *testing.T) {
-	rec := recordings.Recording{Transcript: strings.Repeat("x", previewBytes)}
+func TestNewRecordingRow_ShowsThePreviewTheStoreReturns(t *testing.T) {
+	rec := recordings.Recording{Transcript: strings.Repeat("x", 2*previewBytes)}
 
 	row := newRecordingRow(&rec)
 
-	assert.Equal(t, rec.Transcript, row.Transcript, "a transcript at the bound is shown whole")
+	assert.Equal(t, rec.Transcript, row.Transcript, "the store bounds the preview; the page cuts nothing more")
 }
 
 // keepFormOf returns a keep form padded with a second field to exactly size
@@ -506,7 +507,18 @@ func TestRecordingAudio_UnreadableFileIsServerError(t *testing.T) {
 
 	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 	assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"))
+	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
 	assert.Equal(t, "could not read the recording", errorMessage(t, resp))
+}
+
+func TestRecordingAudio_ForeignHostIsNotCached(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, _ := newRecordingHarnessIn(t, dir, recordedText)
+
+	resp := h.requestAs(http.MethodGet, recordingsPath+"/"+ids[0]+"/audio", "evil.example", "", nil)
+
+	requireJSONError(t, resp, http.StatusForbidden)
 }
 
 // requestAs sends method to path with the Host header set to host and the
@@ -726,6 +738,17 @@ func TestRecordingAudio_UnsatisfiableRangeIsAJSONError(t *testing.T) {
 
 	requireJSONError(t, resp, http.StatusRequestedRangeNotSatisfiable)
 	assert.Equal(t, fmt.Sprintf("bytes */%d", len(audio)), resp.Header.Get("Content-Range"))
+}
+
+func TestRecordingAudio_MalformedRangeIsAJSONErrorWithoutContentRange(t *testing.T) {
+	dir := t.TempDir()
+	id, _ := plantLongRecording(t, dir, slowReadChunk)
+	h, _ := newRecordingHarnessIn(t, dir, recordedText)
+
+	resp := h.requestAs(http.MethodGet, recordingsPath+"/"+id+"/audio", "127.0.0.1", "", map[string]string{"Range": "bytes=x-y"})
+
+	requireJSONError(t, resp, http.StatusRequestedRangeNotSatisfiable)
+	assert.Empty(t, resp.Header.Get("Content-Range"))
 }
 
 func TestRecordingAudio_FailedPreconditionIsAJSONError(t *testing.T) {
