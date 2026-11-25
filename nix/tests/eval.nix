@@ -427,9 +427,34 @@
     (failsWith "RECORDINGS_ENABLE in extraEnvironment fails naming recordings.enable"
       (base // {extraEnvironment."${prefix}RECORDINGS_ENABLE" = "true";})
       ["${opt}.extraEnvironment.${prefix}RECORDINGS_ENABLE" "${opt}.recordings.enable"])
-    (failsWith "RECORDINGS_DIR in extraEnvironment fails naming stateDir"
-      (base // {extraEnvironment."${prefix}RECORDINGS_DIR" = "/srv/elsewhere";})
+    (failsWith "RECORDINGS_ENABLE = \"1\" in extraEnvironment turns recordings on and fails"
+      (base // {extraEnvironment."${prefix}RECORDINGS_ENABLE" = "1";})
+      ["${opt}.extraEnvironment.${prefix}RECORDINGS_ENABLE" "${opt}.recordings.enable"])
+    (failsWith "RECORDINGS_ENABLE = \"false\" in extraEnvironment fails while recordings are on"
+      (base
+        // {
+          recordings.enable = true;
+          extraEnvironment."${prefix}RECORDINGS_ENABLE" = "false";
+        })
+      ["${opt}.extraEnvironment.${prefix}RECORDINGS_ENABLE" "${opt}.recordings.enable"])
+    (failsWith "RECORDINGS_DIR in extraEnvironment fails naming stateDir while recordings are on"
+      (base
+        // {
+          recordings.enable = true;
+          extraEnvironment."${prefix}RECORDINGS_DIR" = "/srv/elsewhere";
+        })
       ["${opt}.extraEnvironment.${prefix}RECORDINGS_DIR" "${opt}.stateDir"])
+    (evaluates "RECORDINGS_ENABLE = \"false\" in extraEnvironment is accepted while recordings are off"
+      (base // {extraEnvironment."${prefix}RECORDINGS_ENABLE" = "false";}))
+    (evaluates "RECORDINGS_ENABLE = \"0\" and inert RECORDINGS_DIR and RECORDINGS_ALLOWEDHOSTS are accepted while recordings are off"
+      (base
+        // {
+          extraEnvironment = {
+            "${prefix}RECORDINGS_ENABLE" = "0";
+            "${prefix}RECORDINGS_DIR" = "/srv/elsewhere";
+            "${prefix}RECORDINGS_ALLOWEDHOSTS" = "voice.example";
+          };
+        }))
     (failsWith "RECORDINGS_ALLOWEDHOSTS in extraEnvironment fails naming recordings.allowedHosts"
       (base
         // {

@@ -338,17 +338,27 @@ flakeSelf: {
 
   # The recordings directory, its tmpfiles rule and its sandbox exception
   # follow the options, so an override of these variables would split the
-  # service from them.
+  # service from them. While recordings are off the service reads none of
+  # them, so an override is inert there unless it turns recordings on.
   recordingsVariables = {
     RECORDINGS_ENABLE = "${opt}.recordings.enable";
     RECORDINGS_DIR = "${opt}.recordings.enable and ${opt}.stateDir";
     RECORDINGS_ALLOWEDHOSTS = "${opt}.recordings.allowedHosts";
   };
 
+  # What the service reads as false for a boolean variable: Go's
+  # strconv.ParseBool false spellings, and the empty string.
+  falseSpellings = ["" "0" "f" "F" "false" "FALSE" "False"];
+
+  recordingsOverrideInert = name: value:
+    !cfg.recordings.enable && (name != "RECORDINGS_ENABLE" || lib.elem value falseSpellings);
+
   recordingsAssertions =
-    lib.mapAttrsToList (name: options: {
-      assertion = !(cfg.extraEnvironment ? "${envPrefix}${name}");
-      message = "${opt}.extraEnvironment.${envPrefix}${name} is set; use ${options} instead, because the recordings directory and the sandbox follow the options, not the variable.";
+    lib.mapAttrsToList (name: options: let
+      value = cfg.extraEnvironment."${envPrefix}${name}" or null;
+    in {
+      assertion = value == null || recordingsOverrideInert name value;
+      message = "${opt}.extraEnvironment.${envPrefix}${name} is \"${toString value}\"; use ${options} instead, because the recordings directory and the sandbox follow the options, not the variable. Only an override that leaves recordings off is accepted while ${opt}.recordings.enable is false.";
     })
     recordingsVariables;
 
@@ -726,9 +736,12 @@ in {
         checks every other override, the Wyoming variables included, when it
         starts, and refuses to start on a bad value. The check that the
         Wyoming host and port differ from the HTTP ones compares the
-        options, not overrides. Evaluation refuses the RECORDINGS_ENABLE,
-        RECORDINGS_DIR and RECORDINGS_ALLOWEDHOSTS variables here; set them
-        through recordings.enable, stateDir and recordings.allowedHosts.
+        options, not overrides. Set RECORDINGS_ENABLE, RECORDINGS_DIR and
+        RECORDINGS_ALLOWEDHOSTS through recordings.enable, stateDir and
+        recordings.allowedHosts. While recordings.enable is true, evaluation
+        refuses them here. While it is false, it accepts them only when
+        RECORDINGS_ENABLE is unset, empty or false (0, f, F, false, FALSE,
+        False), because the service then reads none of them.
       '';
     };
   };
