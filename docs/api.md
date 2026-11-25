@@ -25,7 +25,7 @@ with `recordings.enable` on, and have no `/v1` form.
 | `GET /internal/liveness` | Liveness probe | 200 |
 | `GET /internal/readiness` | Readiness probe | 200; 503 in plain text during shutdown |
 | `GET /recordings` | The [recordings](#recordings) page, in HTML | 200, 400, 403, 500 |
-| `GET /recordings/{id}/audio` | One recording, as Ogg Opus | 200, 206, 304, 403, 404, 416, 500 |
+| `GET /recordings/{id}/audio` | One recording, as Ogg Opus | 200, 206, 304, 403, 404, 412, 416, 500 |
 | `POST /recordings/{id}/keep` | Mark a recording kept, or release it | 303, 400, 403, 404, 500 |
 
 An unknown path gets a 404 and a wrong method gets a 405.
@@ -102,17 +102,25 @@ must be in `recordings.allowedHosts`.
 
 `GET /recordings` returns an HTML page that needs no JavaScript. It lists the
 newest 100 recordings, newest first, each with its UTC time, its length, its
-source (`openai` or `wyoming`) and its transcript, and says how many of all
-the recordings it shows. Each row has an audio player and a button that
+source (`openai` or `wyoming`) and the first 2 KiB of its transcript, cut
+at a character and marked with an ellipsis when longer, and says how many of
+all the recordings it shows. Each row has an audio player and a button that
 marks the recording kept or releases it. When older recordings exist, an
 "Older" link leads to `GET /recordings?before={id}`, the next 100 recordings
-older than `{id}`. A `before` that is not one recording id gets a 400.
+older than `{id}`. When the recording `{id}` has been deleted since, the
+page starts at the end of the second in its id, so a recording made in that
+second may show on both pages. A `before` that is not one recording id with
+a real date and time, or a query with a malformed escape such as `%zz`, gets
+a 400. The page sends `Content-Security-Policy: frame-ancestors 'none'`, so
+no other site can frame it.
 
 `GET /recordings/{id}/audio` returns the recording as `audio/ogg`: Ogg Opus,
 16 kHz mono, 32 kbps, with `Cache-Control: no-store`. It serves byte ranges
 (206, or 416 for a range past the end), `HEAD` and conditional requests
-(304). The transfer may take as long as sending the file at 16 KiB/s takes,
-and at least 10 seconds.
+(304, or 412 for an `If-Match` or `If-Unmodified-Since` that fails). A 412,
+416 or 500 is a JSON error with `Cache-Control: no-store`; a 416 also carries
+`Content-Range: bytes */{size}`. The transfer may take as long as sending the
+file at 16 KiB/s takes, and at least 10 seconds.
 
 `POST /recordings/{id}/keep` takes a form with one field, `keep`, set to
 `true` or `false` and given once. On success it answers 303 with
@@ -132,9 +140,11 @@ kept. When kept recordings alone fill the 1 GiB, the service saves nothing
 new, logs a warning, and still returns the transcript.
 
 The service saves a recording in the background after it has returned the
-transcript, one at a time in the order they arrived. Up to 64 MiB of audio
-may wait to be saved. A recording that would pass that is dropped with a
-warning. See [shutdown](#shutdown) for what happens to waiting recordings
+transcript, one at a time in the order they arrived. A recording is dated
+when its transcription finished, not when it is saved. Up to 64 MiB may wait
+to be saved, counting each recording's audio, its transcript and 512 bytes
+more. A recording that would pass that is dropped with a warning that names
+the request. See [shutdown](#shutdown) for what happens to waiting recordings
 when the service stops.
 
 ## Errors
@@ -145,9 +155,10 @@ change, so a later failure cuts the transfer.
 
 | Status | Cause |
 |---|---|
-| 400 | A malformed body; an empty or too long `input`; an unknown voice or format; a `speed` out of range; a missing `file`; an upload that the service cannot decode or that is longer than 20 minutes |
+| 400 | A malformed body; an empty or too long `input`; an unknown voice or format; a `speed` out of range; a missing `file`; an upload that the service cannot decode or that is longer than 20 minutes; a malformed recordings page query |
 | 403 | A recordings request whose `Host` is not allowed; a keep post from another site |
 | 404, 405 | An unknown path; a wrong method; an unknown or malformed recording id |
+| 412, 416 | A recording's audio fetched with a precondition that fails, or a range past its end |
 | 429 and other upstream errors | Passed on from llama-swap or the model server, with its message and `Retry-After` |
 | 500 | A fault inside the service. The cause is in its log. |
 | 502 | llama-swap failed, sent no audio, or sent a transcript over 1 MiB |
@@ -177,7 +188,8 @@ no redirect from llama-swap.
 | Recordings keep form | 1 KiB | fixed |
 | Recordings on one page | 100 | fixed |
 | Slowest fetch of a recording's audio | 16 KiB/s | fixed |
-| Recordings audio waiting to be saved | 64 MiB | fixed |
+| Recordings waiting to be saved: audio, transcript and 512 bytes each | 64 MiB | fixed |
+| Transcript shown on the recordings page | 2 KiB a recording | fixed |
 | Recordings kept when not marked | 7 days | fixed |
 | All recordings together | 1 GiB | fixed |
 

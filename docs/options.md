@@ -258,8 +258,10 @@ list that host in `recordings.allowedHosts`; the service never reads
 The service saves a recording in the background after the transcription
 succeeds and it has answered. A failed transcription saves nothing. A save
 that fails, for example because the disk is full, is logged as a warning;
-the client already has its transcript. Up to 64 MiB of audio may wait to be
-saved; a recording that would pass that is dropped with a warning. On
+the client already has its transcript. Up to 64 MiB may wait to be saved,
+counting each recording's audio, its transcript and 512 bytes more; a
+recording that would pass that is dropped with a warning. Both warnings
+carry the request's `request_id`. On
 shutdown the service saves what is waiting until the shutdown budget,
 `shutdown.total` plus `shutdown.hard`, has passed, and drops the rest with
 a warning.
@@ -273,24 +275,35 @@ hour), and `<id>.json`:
 ```
 
 `source` is `openai` for the HTTP API and `wyoming` for the Wyoming
-listener. `at` is the UTC time of the save to the nanosecond. The id is that
-time to the second and a random suffix, such as `20261125T153000Z-1a2b3c4d`.
+listener. `at` is the UTC time, to the nanosecond, at which the
+transcription finished and the recording was queued, not when it was saved.
+The id is that time to the second and a random suffix, such as
+`20261125T153000Z-1a2b3c4d`.
 
 The service deletes recordings that are not kept and are older than 7 days,
 once when it starts and then every hour. The two files of all recordings
 together may take at most 1 GiB. Before a save that would pass that cap, the
 service deletes the oldest recordings that are not kept until the new one
-fits. Kept recordings count toward the cap. When kept recordings alone leave
-no room, the service saves nothing and logs a warning. The retention, the
-cap and the interval are fixed.
+fits. Kept recordings count toward the cap, and so do the recordings left
+for you below and any file the service failed to delete. When those alone
+leave no room, the service saves nothing and logs a warning. A deletion that
+fails is logged as a warning and the service goes on with the others. The
+retention, the cap and the interval are fixed.
 
 The recordings directory must belong to the service alone. At start and
 every hour the service deletes, besides expired recordings, the files that
 an interrupted save or delete leaves: a `.opus` or `.json` file without its
 partner, and its own temporary files, `probe-<digits>.tmp` and
 `<id>.opus.<digits>.tmp` or `<id>.json.<digits>.tmp`. It leaves other files
-alone. At start it also deletes a recording whose `.json` does not decode,
-with a warning.
+alone.
+
+At start the service logs one warning for each recording whose `.json` does
+not decode, is over 7 MiB, or cannot be read once open, naming its id and
+the reason. It leaves both files of such a recording on disk for you to
+delete: it does not list, expire or evict it, because it cannot read its
+keep mark, but its files count toward the cap. A `.json` the service cannot
+open at all, for example because of its permissions, stops the service from
+starting.
 
 With `recordings.enable` on, the module creates `<stateDir>/recordings`
 with mode `0700`, owned by `user` and `group`, and makes that directory,
@@ -305,7 +318,7 @@ again leaves the directory and its recordings on disk; delete them by hand.
 | `user` | string | `"llama-swap-voice"` | The user the service runs as. The module creates it only under the default name. |
 | `group` | string | `"llama-swap-voice"` | The group the service runs as. The module creates it only under the default name. Under `qwentts`, llama-swap's user joins it, so do not share it with other services. |
 | `stateDir` | string | `"/var/lib/llama-swap-voice"` | A directory for this module alone. The voices directory is `<stateDir>/voices`, and the [recordings](#recordings) directory is `<stateDir>/recordings`. Use an absolute path with no `%` and no slash at the end. |
-| `extraEnvironment` | attribute set of strings | `{}` | Extra [environment variables](#environment-variables) for the service, by full name. They override the variables the module writes. Evaluation checks only the [variables the module reads back](#variables-the-module-reads-back), and refuses `RECORDINGS_ENABLE`, `RECORDINGS_DIR` and `RECORDINGS_ALLOWEDHOSTS`, because the recordings directory and the sandbox follow the [recordings](#recordings) options. The service checks every other override, the Wyoming variables included, when it starts, and refuses to start on a bad value. |
+| `extraEnvironment` | attribute set of strings | `{}` | Extra [environment variables](#environment-variables) for the service, by full name. They override the variables the module writes. Evaluation checks only the [variables the module reads back](#variables-the-module-reads-back). It refuses `RECORDINGS_ENABLE`, `RECORDINGS_DIR` and `RECORDINGS_ALLOWEDHOSTS` while `recordings.enable` is on, because the recordings directory and the sandbox follow the [recordings](#recordings) options. While `recordings.enable` is off it accepts them, as long as `RECORDINGS_ENABLE` is empty or false (`0`, `f`, `F`, `false`, `FALSE` or `False`), because the service then reads none of them. The service checks every other override, the Wyoming variables included, when it starts, and refuses to start on a bad value. |
 | `voiceNames` | list of strings, read-only | the declared names | The names of the declared voices, sorted. Other modules can read it. |
 | `llamaSwap.group.name` | string | `"voice"` | The name of the group. |
 | `llamaSwap.group.location` | `"legacy"` or `"routing"` | `"legacy"` | Where the module writes the group: the top-level `groups` key, or `routing.router.settings.groups`. llama-swap refuses a configuration that uses both, so match the rest of your settings. |
