@@ -6,6 +6,7 @@
   clip = "/srv/clips/sample.wav";
   stateDir = "/var/lib/llama-swap-voice";
   record = "/var/lib/fake-upstream/requests.jsonl";
+  recordingsDir = "${stateDir}/recordings";
   percentClip = "/srv/clips/speaker%n.wav";
 
   # A second address on the llamacpp node stands in for an upstream on
@@ -113,13 +114,19 @@
       ipv6.configuration.services.llama-swap-voice.upstreamURL = "http://[::1]:8081";
     };
   };
+
+  # Only the qwentts node keeps recordings, so the llamacpp node shows that
+  # the default writes nothing.
+  qwenttsExtras = {
+    services.llama-swap-voice.recordings.enable = true;
+  };
 in
   pkgs.testers.runNixOSTest {
     name = "llama-swap-voice-module";
 
     nodes = {
       llamacpp = {imports = [(node "llamacpp") llamacppExtras];};
-      qwentts = node "qwentts";
+      qwentts = {imports = [(node "qwentts") qwenttsExtras];};
     };
 
     testScript = ''
@@ -134,6 +141,8 @@ in
       REMOTE_URL = "${remoteURL}"
       LONG_UPLOAD = "${longUpload}"
       RECORD = "${record}"
+      RECORDINGS = "${recordingsDir}"
+      FIXTURE = "${fixture}"
       SPEECH = "http://127.0.0.1:8920/v1/audio/speech"
 
 
@@ -217,6 +226,52 @@ in
           qwentts.succeed("head -c 4 /tmp/out.wav | grep -q RIFF")
           print(qwentts.succeed("opusinfo /tmp/out.opus"))
           assert len(requests(qwentts)) == 2
+
+      with subtest("recordings: a transcription is saved as Opus with its metadata and listed"):
+          owner = qwentts.succeed(f"stat -c '%a %U %G' {RECORDINGS}").strip()
+          assert owner == "700 llama-swap-voice llama-swap-voice", owner
+
+          reply = qwentts.succeed(
+              f"curl -sS -w '\\n%{{http_code}}' -F file=@{FIXTURE} http://127.0.0.1:8920/v1/audio/transcriptions"
+          )
+          body, status = reply.rsplit("\n", 1)
+          assert status == "200", reply
+          transcript = json.loads(body)["text"]
+
+          names = sorted(qwentts.succeed(f"ls -1 {RECORDINGS}").split())
+          assert len(names) == 2, names
+          recording_id = names[0].removesuffix(".json")
+          assert names == [f"{recording_id}.json", f"{recording_id}.opus"], names
+          meta = json.loads(qwentts.succeed(f"cat {RECORDINGS}/{recording_id}.json"))
+          assert meta["source"] == "openai", meta
+          assert meta["transcript"] == transcript, meta
+          assert meta["keep"] is False, meta
+          assert meta["durationMs"] > 0, meta
+          print(qwentts.succeed(f"opusinfo {RECORDINGS}/{recording_id}.opus"))
+
+          page = qwentts.succeed("curl -sSf http://127.0.0.1:8920/recordings")
+          assert transcript in page, page
+          assert f"/recordings/{recording_id}/audio" in page, page
+
+          status = qwentts.succeed(
+              f"curl -sS -o /tmp/recording.opus -w '%{{http_code}} %{{content_type}}' "
+              f"http://127.0.0.1:8920/recordings/{recording_id}/audio"
+          ).strip()
+          assert status == "200 audio/ogg", status
+          qwentts.succeed(f"cmp /tmp/recording.opus {RECORDINGS}/{recording_id}.opus")
+
+          status = qwentts.succeed(
+              f"curl -sS -o /dev/null -w '%{{http_code}} %{{redirect_url}}' -d keep=true "
+              f"http://127.0.0.1:8920/recordings/{recording_id}/keep"
+          ).strip()
+          assert status == "303 http://127.0.0.1:8920/recordings", status
+          meta = json.loads(qwentts.succeed(f"cat {RECORDINGS}/{recording_id}.json"))
+          assert meta["keep"] is True, meta
+
+      with subtest("recordings are off by default: no directory and no page"):
+          llamacpp.fail(f"test -e {RECORDINGS}")
+          status = llamacpp.succeed("curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8920/recordings").strip()
+          assert status == "404", status
 
       with subtest("a clip copied in by hand is listed and survives tmpfiles"):
           for machine in (llamacpp, qwentts):
@@ -305,6 +360,11 @@ in
                       f"findmnt --task {pid} --noheadings --output OPTIONS --target {path}"
                   ).strip()
                   assert options.split(",")[0] == "ro", f"{path} is mounted {options} for the service"
+          pid = qwentts.succeed("systemctl show -p MainPID --value llama-swap-voice.service").strip()
+          options = qwentts.succeed(
+              f"findmnt --task {pid} --noheadings --output OPTIONS --target {RECORDINGS}"
+          ).strip()
+          assert options.split(",")[0] == "rw", f"{RECORDINGS} is mounted {options} for the service"
           report = llamacpp.succeed("systemd-analyze security --no-pager llama-swap-voice.service")
           print(report)
           found = re.search(r"Overall exposure level for llama-swap-voice.service: ([0-9.]+)", report)

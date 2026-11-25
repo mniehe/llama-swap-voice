@@ -11,6 +11,7 @@ flakeSelf: {
 
   envPrefix = "LLAMA_SWAP_VOICE_";
   voicesDir = "${cfg.stateDir}/voices";
+  recordingsDir = "${cfg.stateDir}/recordings";
   clipExtensions = ["wav" "mp3"];
 
   defaultName = "llama-swap-voice";
@@ -328,6 +329,10 @@ flakeSelf: {
       WYOMING_SPEED = builtins.toJSON cfg.wyoming.speed;
       WYOMING_STREAMING = cfg.wyoming.streaming;
       WYOMING_STREAMINGMAXCHARS = cfg.wyoming.streamingMaxChars;
+    }
+    // lib.optionalAttrs cfg.recordings.enable {
+      RECORDINGS_ENABLE = "true";
+      RECORDINGS_DIR = recordingsDir;
     };
 
   # Every character Go's unicode.IsSpace accepts. Nix strings have no \u
@@ -622,6 +627,20 @@ in {
       };
     };
 
+    recordings.enable = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Keep the audio of every successful transcription, from the HTTP API
+        and the Wyoming listener, as Ogg Opus with its transcript in
+        <stateDir>/recordings (RECORDINGS_ENABLE, RECORDINGS_DIR), and serve
+        a page at /recordings on the HTTP port to play them and mark them
+        kept. This stores household speech: a recording stays for 7 days,
+        and a kept one until it is released. The page has no
+        authentication, so limit who reaches the HTTP port.
+      '';
+    };
+
     voices = mkOption {
       type = types.attrsOf voiceModule;
       default = {};
@@ -713,6 +732,12 @@ in {
           mode = "0750";
         };
       }
+      // lib.optionalAttrs cfg.recordings.enable {
+        ${tmpfilesEscape recordingsDir}.d = {
+          inherit (cfg) user group;
+          mode = "0700";
+        };
+      }
       // lib.mapAttrs' (name: voice: lib.nameValuePair (tmpfilesEscape (linkName name voice)) {L.argument = tmpfilesEscape voice.clip;}) cfg.voices;
 
     systemd.services.llama-swap-voice = {
@@ -733,9 +758,11 @@ in {
         UMask = "0077";
 
         # ProtectSystem=strict leaves every path, stateDir included,
-        # read-only; the only writable place is the private /tmp, where
-        # multipart uploads larger than the in-memory limit spool.
+        # read-only. The writable places are the private /tmp, where
+        # multipart uploads larger than the in-memory limit spool, and,
+        # with recordings.enable, the recordings directory alone.
         ProtectSystem = "strict";
+        ReadWritePaths = lib.mkIf cfg.recordings.enable [recordingsDir];
         ProtectHome = true;
         PrivateTmp = true;
         PrivateDevices = true;

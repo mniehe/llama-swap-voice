@@ -358,6 +358,46 @@
       holds "network is loopback only unless ipAddressAllow adds addresses"
       (service.IPAddressDeny == "any" && service.IPAddressAllow == ["localhost" "192.0.2.10"])
       "IPAddressDeny ${show service.IPAddressDeny}, IPAddressAllow ${show service.IPAddressAllow}")
+
+    (let
+      evaluated = (evaluate (base // {stateDir = "/srv/lsv";})).config;
+      env = lib.filterAttrs (name: _: lib.hasPrefix "${prefix}RECORDINGS_" name) evaluated.systemd.services.llama-swap-voice.environment;
+      service = evaluated.systemd.services.llama-swap-voice.serviceConfig;
+      rules = evaluated.systemd.tmpfiles.settings.llama-swap-voice;
+    in
+      holds "recordings are off by default: no variables, no directory, nothing writable"
+      (env == {} && !(rules ? "/srv/lsv/recordings") && !(service ? ReadWritePaths))
+      "RECORDINGS variables ${show env}; tmpfiles rules ${show (lib.attrNames rules)}; ReadWritePaths ${show (service.ReadWritePaths or null)}")
+
+    (let
+      evaluated =
+        (evaluate (base
+          // {
+            stateDir = "/srv/lsv";
+            user = "voice";
+            group = "voice";
+            recordings.enable = true;
+          })).config;
+      env = evaluated.systemd.services.llama-swap-voice.environment;
+      service = evaluated.systemd.services.llama-swap-voice.serviceConfig;
+      rule = evaluated.systemd.tmpfiles.settings.llama-swap-voice."/srv/lsv/recordings" or {};
+    in
+      holds "recordings.enable sets both variables, a private d rule and the one writable path"
+      (env."${prefix}RECORDINGS_ENABLE" or null
+        == "true"
+        && env."${prefix}RECORDINGS_DIR" or null == "/srv/lsv/recordings"
+        && lib.attrNames rule == ["d"]
+        && lib.getAttrs ["user" "group" "mode"] rule.d
+        == {
+          user = "voice";
+          group = "voice";
+          mode = "0700";
+        }
+        && service.ReadWritePaths == ["/srv/lsv/recordings"]
+        && service.ProtectSystem == "strict")
+      "RECORDINGS_ENABLE ${show (env."${prefix}RECORDINGS_ENABLE" or null)}; RECORDINGS_DIR ${show (env."${prefix}RECORDINGS_DIR" or null)}; rule ${show rule}; ReadWritePaths ${show (service.ReadWritePaths or null)}")
+
+    (evaluates "recordings.enable evaluates to a system" (base // {recordings.enable = true;}))
   ];
 
   # A consumer's own llama-swap configuration, in the legacy group layout.
