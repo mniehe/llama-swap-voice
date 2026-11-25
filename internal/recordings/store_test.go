@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -116,7 +117,7 @@ func readMetadata(t *testing.T, path string) fileFields {
 func ids(t *testing.T, store *Store) []string {
 	t.Helper()
 
-	list, err := store.List()
+	list, _, err := store.List("", math.MaxInt)
 	require.NoError(t, err)
 
 	found := make([]string, 0, len(list))
@@ -134,7 +135,7 @@ func save(t *testing.T, store *Store, transcript string) *Recording {
 
 	before := ids(t, store)
 	require.NoError(t, store.Save(wav(t, halfSecond), sourceOpenAI, transcript))
-	list, err := store.List()
+	list, _, err := store.List("", math.MaxInt)
 	require.NoError(t, err)
 
 	for i := range list {
@@ -217,7 +218,7 @@ func TestList_NewestFirst(t *testing.T) {
 	c.advance(time.Minute)
 	save(t, store, "second")
 
-	list, err := store.List()
+	list, _, err := store.List("", math.MaxInt)
 
 	require.NoError(t, err)
 	require.Len(t, list, 2)
@@ -236,7 +237,7 @@ func TestSetKeep_PersistsAcrossReopen(t *testing.T) {
 	require.NoError(t, store.SetKeep(rec.ID, true))
 
 	reopened, _ := openStore(t, dir)
-	list, err := reopened.List()
+	list, _, err := reopened.List("", math.MaxInt)
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	assert.True(t, list[0].Keep)
@@ -313,7 +314,7 @@ func TestCollect_KeepsARecordingAtExactlyTheRetention(t *testing.T) {
 	c.advance(Retention)
 	require.NoError(t, store.Collect())
 
-	list, err := store.List()
+	list, _, err := store.List("", math.MaxInt)
 	require.NoError(t, err)
 	assert.Len(t, list, 1)
 }
@@ -327,7 +328,7 @@ func TestOpen_CollectsOnce(t *testing.T) {
 	reopened, err := Open(dir, c.Now, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
-	list, err := reopened.List()
+	list, _, err := reopened.List("", math.MaxInt)
 	require.NoError(t, err)
 	assert.Empty(t, list)
 	assert.Empty(t, names(t, dir))
@@ -448,7 +449,7 @@ func TestRun_CollectsEveryInterval(t *testing.T) {
 	ticks <- c.Now()
 
 	assert.Eventually(t, func() bool {
-		list, err := store.List()
+		list, _, err := store.List("", math.MaxInt)
 		return err == nil && len(list) == 0
 	}, time.Second, 10*time.Millisecond)
 }

@@ -1,6 +1,9 @@
 package openai
 
 import (
+	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,12 +21,13 @@ import (
 )
 
 const (
-	recordingsPath    = "/recordings"
-	contentTypeForm   = "application/x-www-form-urlencoded"
-	unknownID         = "20261125T153000Z-00000000"
-	recordedText      = "turn on the kitchen lights"
-	scriptTranscript  = `<script>alert("x")</script> & more`
-	escapedTranscript = `&lt;script&gt;alert(&#34;x&#34;)&lt;/script&gt; &amp; more`
+	recordingsPath     = "/recordings"
+	contentTypeForm    = "application/x-www-form-urlencoded"
+	recordingsPageSize = 100
+	unknownID          = "20261125T153000Z-00000000"
+	recordedText       = "turn on the kitchen lights"
+	scriptTranscript   = `<script>alert("x")</script> & more`
+	escapedTranscript  = `&lt;script&gt;alert(&#34;x&#34;)&lt;/script&gt; &amp; more`
 )
 
 var clockStart = time.Date(2026, time.November, 25, 15, 30, 0, 0, time.UTC)
@@ -34,6 +38,16 @@ func newRecordingHarness(t *testing.T, transcript string) (*harness, *recordings
 	t.Helper()
 
 	dir := t.TempDir()
+	h, store := newRecordingHarnessIn(t, dir, transcript)
+
+	return h, store, dir
+}
+
+// newRecordingHarnessIn is newRecordingHarness over the recordings already in
+// dir.
+func newRecordingHarnessIn(t *testing.T, dir, transcript string) (*harness, *recordings.Store) {
+	t.Helper()
+
 	store, err := recordings.Open(dir, steppingClock(), discardLogger())
 	require.NoError(t, err)
 
@@ -41,7 +55,7 @@ func newRecordingHarness(t *testing.T, transcript string) (*harness, *recordings
 	h.service = New(h.pipeline, discardLogger(), WithRecordings(store))
 	h.server.Config.Handler = h.service.Handler()
 
-	return h, store, dir
+	return h, store
 }
 
 // steppingClock moves a minute on every reading, so recordings saved one
@@ -71,7 +85,7 @@ func dirNames(t *testing.T, dir string) []string {
 func onlyRecording(t *testing.T, store *recordings.Store) recordings.Recording {
 	t.Helper()
 
-	list, err := store.List()
+	list, _, err := store.List("", math.MaxInt)
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 
@@ -119,7 +133,7 @@ func TestRecordingsPage_NewestFirst(t *testing.T) {
 	require.Equal(t, http.StatusOK, h.transcribe(nil, []byte(streamedWAV)).StatusCode)
 	older := onlyRecording(t, store)
 	require.Equal(t, http.StatusOK, h.transcribe(nil, []byte(streamedWAV)).StatusCode)
-	list, err := store.List()
+	list, _, err := store.List("", math.MaxInt)
 	require.NoError(t, err)
 	require.Len(t, list, 2)
 	newer := list[0]
@@ -230,4 +244,142 @@ func TestRecordingRoutes_DisabledAreNotFound(t *testing.T) {
 		assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"))
 		assert.Contains(t, errorMessage(t, resp), "not found")
 	}
+}
+
+// plantRecordings writes count recordings a minute apart into dir, as the
+// store would have saved them, and returns their ids oldest first.
+func plantRecordings(t *testing.T, dir string, count int) []string {
+	t.Helper()
+
+	ids := make([]string, 0, count)
+	for i := range count {
+		at := clockStart.Add(time.Duration(i) * time.Minute)
+		id := at.Format("20060102T150405Z") + fmt.Sprintf("-%08x", i)
+		meta := fmt.Sprintf(`{"at":%q,"durationMs":500,"source":"openai","transcript":"planted %d","keep":false}`, at.Format(time.RFC3339Nano), i)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, id+".json"), []byte(meta), 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, id+".opus"), []byte("audio"), 0o600))
+		ids = append(ids, id)
+	}
+
+	return ids
+}
+
+func TestRecordingsPage_ShowsTheNewestPageAndLinksToOlder(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, recordingsPageSize+1)
+	h, _ := newRecordingHarnessIn(t, dir, recordedText)
+
+	resp := h.get(recordingsPath)
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	page := string(readBody(t, resp))
+	assert.Contains(t, page, "Showing 100 of 101 recordings.")
+	assert.NotContains(t, page, ids[0], "the oldest is on the next page")
+	assert.Contains(t, page, ids[1])
+	assert.Contains(t, page, ids[len(ids)-1])
+	assert.Contains(t, page, `<a href="/recordings?before=`+ids[1]+`">Older</a>`)
+
+	older := string(readBody(t, h.get(recordingsPath+"?before="+ids[1])))
+	assert.Contains(t, older, "Showing 1 of 101 recordings.")
+	assert.Contains(t, older, ids[0])
+	assert.NotContains(t, older, ids[1])
+	assert.NotContains(t, older, "Older</a>")
+}
+
+func TestRecordingsPage_InvalidBeforeIsBadRequest(t *testing.T) {
+	h, _, _ := newRecordingHarness(t, recordedText)
+
+	for _, query := range []string{"?before=x", "?before=..%2Fx", "?before=", "?before=" + unknownID + "&before=" + unknownID} {
+		resp := h.get(recordingsPath + query)
+
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "query %q", query)
+		assert.Contains(t, errorMessage(t, resp), "before", "query %q", query)
+	}
+}
+
+// keepFormOf returns a keep form padded with a second field to exactly size
+// bytes.
+func keepFormOf(t *testing.T, size int) string {
+	t.Helper()
+
+	form := "keep=true&pad="
+	require.LessOrEqual(t, len(form), size)
+
+	return form + strings.Repeat("p", size-len(form))
+}
+
+func TestRecordingKeep_FormAtTheLimitIsAccepted(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+
+	resp := h.postUnfollowed(recordingsPath+"/"+ids[0]+"/keep", contentTypeForm, strings.NewReader(keepFormOf(t, maxKeepFormBytes)))
+
+	assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	assert.True(t, onlyRecording(t, store).Keep)
+}
+
+func TestRecordingKeep_FormOneByteOverIsBadRequest(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+
+	resp := h.post(recordingsPath+"/"+ids[0]+"/keep", contentTypeForm, strings.NewReader(keepFormOf(t, maxKeepFormBytes+1)))
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Contains(t, errorMessage(t, resp), "invalid keep form")
+	assert.False(t, onlyRecording(t, store).Keep)
+}
+
+// postUnfollowed posts body to path and returns the response itself, not
+// where a redirect leads.
+func (h *harness) postUnfollowed(path, contentType string, body io.Reader) *http.Response {
+	h.t.Helper()
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req, err := http.NewRequestWithContext(h.t.Context(), http.MethodPost, h.server.URL+path, body)
+	require.NoError(h.t, err)
+	req.Header.Set("Content-Type", contentType)
+	resp, err := client.Do(req)
+	require.NoError(h.t, err)
+	h.t.Cleanup(func() { closeQuietly(h.t, resp.Body) })
+
+	return resp
+}
+
+func skipUnderRoot(t *testing.T) {
+	t.Helper()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root reads files whatever their mode")
+	}
+}
+
+func TestRecordingsPage_UnreadableStoreIsServerError(t *testing.T) {
+	skipUnderRoot(t)
+	dir := t.TempDir()
+	plantRecordings(t, dir, 1)
+	h, _ := newRecordingHarnessIn(t, dir, recordedText)
+	require.NoError(t, os.Chmod(dir, 0))
+	t.Cleanup(func() { assert.NoError(t, os.Chmod(dir, 0o700)) })
+
+	resp := h.get(recordingsPath)
+
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"))
+	assert.Equal(t, "could not list recordings", errorMessage(t, resp))
+}
+
+func TestRecordingAudio_UnreadableFileIsServerError(t *testing.T) {
+	skipUnderRoot(t)
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, _ := newRecordingHarnessIn(t, dir, recordedText)
+	require.NoError(t, os.Chmod(filepath.Join(dir, ids[0]+".opus"), 0))
+
+	resp := h.get(recordingsPath + "/" + ids[0] + "/audio")
+
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+	assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"))
+	assert.Equal(t, "could not read the recording", errorMessage(t, resp))
 }

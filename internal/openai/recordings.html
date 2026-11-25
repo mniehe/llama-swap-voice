@@ -14,14 +14,14 @@ tr.kept { background: #eef6ee; }
 </head>
 <body>
 <h1>Recordings</h1>
-<p>{{len .}} recordings. A recording that is not kept is deleted after {{retentionDays}} days.</p>
-{{if .}}
+<p>Showing {{len .Rows}} of {{.Total}} recordings. A recording that is not kept is deleted after {{retentionDays}} days.</p>
+{{if .Rows}}
 <table>
 <thead>
 <tr><th>Recorded (UTC)</th><th>Length</th><th>Source</th><th>Transcript</th><th>Audio</th><th>Keep</th></tr>
 </thead>
 <tbody>
-{{range .}}
+{{range .Rows}}
 <tr{{if .Keep}} class="kept"{{end}}>
 <td><time datetime="{{.At}}">{{.Shown}}</time></td>
 <td>{{.Length}}</td>
@@ -37,6 +37,7 @@ tr.kept { background: #eef6ee; }
 {{end}}
 </tbody>
 </table>
+{{if .Older}}<p><a href="/recordings?before={{.Older}}">Older</a></p>{{end}}
 {{else}}
 <p>No recordings yet.</p>
 {{end}}

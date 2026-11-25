@@ -3,6 +3,7 @@ package pipeline
 import (
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -138,7 +139,7 @@ func TestPipeline_Transcribe_RealStoreSavesOnePair(t *testing.T) {
 	_, err = p.Transcribe(t.Context(), strings.NewReader(streamedWAV), SourceOpenAI)
 
 	require.NoError(t, err)
-	list, err := store.List()
+	list, _, err := store.List("", math.MaxInt)
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	assert.Equal(t, "openai", list[0].Source)

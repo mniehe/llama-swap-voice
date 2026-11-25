@@ -18,9 +18,12 @@ import (
 const (
 	recordingsRoute = "/recordings"
 	recordingIDKey  = "id"
-	keepFieldName   = "keep"
-	keepOn          = "true"
-	keepOff         = "false"
+	beforeParam     = "before"
+	// pageSize is how many recordings one page shows, newest first.
+	pageSize      = 100
+	keepFieldName = "keep"
+	keepOn        = "true"
+	keepOff       = "false"
 	// maxKeepFormBytes bounds the keep form, whose one field fits in a few
 	// bytes.
 	maxKeepFormBytes = 1 << 10
@@ -45,6 +48,14 @@ type recordingRow struct {
 	Source     string
 	Transcript string
 	Keep       bool
+}
+
+// recordingsView is what the page template renders. Older is the id that
+// the link to the next older page starts before, empty on the last page.
+type recordingsView struct {
+	Rows  []recordingRow
+	Total int
+	Older string
 }
 
 // Option changes how New builds a Server.
@@ -72,21 +83,33 @@ func (s *Server) recordingRoutes() []route {
 
 // The page is rendered whole before it is sent, so a template failure is a
 // JSON 500 rather than half a page.
-func (s *Server) handleRecordings(w http.ResponseWriter, _ *http.Request) {
-	list, err := s.recordings.List()
+func (s *Server) handleRecordings(w http.ResponseWriter, r *http.Request) {
+	before, err := pageCursor(r)
 	if err != nil {
-		s.log.Error("could not list recordings", slog.Any("error", err))
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// One row past the page tells whether an older page exists.
+	list, total, err := s.recordings.List(before, pageSize+1)
+	if err != nil {
+		s.log.Error("could not list recordings", slog.String("request_id", record(r).id), slog.Any("error", err))
 		s.writeError(w, http.StatusInternalServerError, errors.New("could not list recordings"))
 		return
 	}
 
-	rows := make([]recordingRow, 0, len(list))
+	view := recordingsView{Total: total}
+	if len(list) > pageSize {
+		list = list[:pageSize]
+		view.Older = list[pageSize-1].ID
+	}
+	view.Rows = make([]recordingRow, 0, len(list))
 	for i := range list {
-		rows = append(rows, newRecordingRow(&list[i]))
+		view.Rows = append(view.Rows, newRecordingRow(&list[i]))
 	}
 
 	var page bytes.Buffer
-	if err := recordingsPage.Execute(&page, rows); err != nil {
+	if err := recordingsPage.Execute(&page, &view); err != nil {
 		s.log.Error("could not render recordings page", slog.Any("error", err))
 		s.writeError(w, http.StatusInternalServerError, errors.New("could not render recordings page"))
 		return
@@ -98,6 +121,20 @@ func (s *Server) handleRecordings(w http.ResponseWriter, _ *http.Request) {
 	if _, err := page.WriteTo(w); err != nil {
 		s.logWriteFailure(err)
 	}
+}
+
+// pageCursor returns the before parameter, empty for the newest page.
+func pageCursor(r *http.Request) (string, error) {
+	values, present := r.URL.Query()[beforeParam]
+	if !present {
+		return "", nil
+	}
+
+	if len(values) != 1 || !recordings.ValidID(values[0]) {
+		return "", fmt.Errorf("%s must be one recording id, got %q", beforeParam, values)
+	}
+
+	return values[0], nil
 }
 
 func newRecordingRow(rec *recordings.Recording) recordingRow {
