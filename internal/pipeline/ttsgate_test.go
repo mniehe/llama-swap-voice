@@ -223,7 +223,7 @@ func TestPipeline_Admit_QueuedSpeechLeavesTranscriptionSlots(t *testing.T) {
 
 	ctx, releaseTranscription, err := p.Admit(t.Context(), WorkTranscribe, p.RequestDeadline(time.Now()))
 	require.NoError(t, err, "a transcription was refused while speech waited")
-	text, err := p.Transcribe(ctx, strings.NewReader(streamedWAV))
+	text, err := p.Transcribe(ctx, strings.NewReader(streamedWAV), SourceOpenAI)
 	releaseTranscription()
 	require.NoError(t, err)
 	assert.Contains(t, text, transcriptText)

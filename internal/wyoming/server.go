@@ -92,11 +92,13 @@ type Server struct {
 // cancelling base ends every request.
 func New(base context.Context, cfg *Config, p *pipeline.Pipeline, log *slog.Logger) *Server {
 	s := &Server{
-		base:              base,
-		cfg:               *cfg,
-		pipeline:          p,
-		log:               log,
-		transcribe:        p.Transcribe,
+		base:     base,
+		cfg:      *cfg,
+		pipeline: p,
+		log:      log,
+		transcribe: func(ctx context.Context, upload io.Reader) (string, error) {
+			return p.Transcribe(ctx, upload, pipeline.SourceWyoming)
+		},
 		idleTimeout:       idleTimeout,
 		writeTimeout:      writeTimeout,
 		maxStreamDuration: maxStreamDuration,

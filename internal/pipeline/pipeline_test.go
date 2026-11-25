@@ -413,7 +413,7 @@ func TestPipeline_Transcribe_SendsOneUploadAndStripsPrefix(t *testing.T) {
 		cfg.ASRPrefixRegex = qwenPrefix
 	})
 
-	text, err := p.Transcribe(t.Context(), strings.NewReader(streamedWAV))
+	text, err := p.Transcribe(t.Context(), strings.NewReader(streamedWAV), SourceOpenAI)
 
 	require.NoError(t, err)
 	assert.Equal(t, transcriptText, text)
@@ -428,7 +428,7 @@ func TestPipeline_Transcribe_KeepsTextWithoutPrefixMatch(t *testing.T) {
 		cfg.ASRPrefixRegex = qwenPrefix
 	})
 
-	text, err := p.Transcribe(t.Context(), strings.NewReader(streamedWAV))
+	text, err := p.Transcribe(t.Context(), strings.NewReader(streamedWAV), SourceOpenAI)
 
 	require.NoError(t, err)
 	assert.Equal(t, "plain words", text)
@@ -439,7 +439,7 @@ func TestPipeline_Transcribe_UpstreamStatusErrorIsUpstream(t *testing.T) {
 		http.Error(w, "asr unavailable", http.StatusServiceUnavailable)
 	})
 
-	_, err := p.Transcribe(t.Context(), strings.NewReader(streamedWAV))
+	_, err := p.Transcribe(t.Context(), strings.NewReader(streamedWAV), SourceOpenAI)
 
 	requireKind(t, err, KindUpstream, "upstream returned 503: asr unavailable")
 	failed := pipelineError(t, err)
@@ -453,7 +453,7 @@ func TestPipeline_Transcribe_MalformedTranscriptKeepsUpstreamStatusZero(t *testi
 		writeOrFail(t, w, "{not json")
 	})
 
-	_, err := p.Transcribe(t.Context(), strings.NewReader(streamedWAV))
+	_, err := p.Transcribe(t.Context(), strings.NewReader(streamedWAV), SourceOpenAI)
 
 	requireKind(t, err, KindUpstream, "")
 	failed := pipelineError(t, err)
@@ -464,7 +464,7 @@ func TestPipeline_Transcribe_MalformedTranscriptKeepsUpstreamStatusZero(t *testi
 func TestPipeline_Transcribe_EndedRequestIsTimeout(t *testing.T) {
 	p, fake := newPipeline(t, serveTranscript(t, transcriptText))
 
-	_, err := p.Transcribe(expiredContext(t), strings.NewReader(streamedWAV))
+	_, err := p.Transcribe(expiredContext(t), strings.NewReader(streamedWAV), SourceOpenAI)
 
 	requireKind(t, err, KindTimeout, "decoding audio: context deadline exceeded")
 	assert.Zero(t, fake.callCount())

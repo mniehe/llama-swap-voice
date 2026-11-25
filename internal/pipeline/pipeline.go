@@ -31,6 +31,15 @@ type Config struct {
 	MaxConcurrentTTS int
 	TTSConcurrency   int
 	ASRPrefixRegex   string
+	// Recorder keeps the audio of each successful transcription; nil keeps
+	// nothing.
+	Recorder Recorder
+}
+
+// Recorder saves wav, the 16 kHz mono WAV sent upstream, with the source
+// entrypoint and the transcript returned to the client.
+type Recorder interface {
+	Save(wav []byte, source, transcript string) error
 }
 
 type Pipeline struct {
