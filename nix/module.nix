@@ -383,6 +383,19 @@ flakeSelf: {
     })
   recordingsOverrides;
 
+  # nixpkgs writes each entry as Environment="name=value" without checking
+  # the name, and systemd splits it at the first "=". A key with "=" or a
+  # non-ASCII letter would set a variable that the checks above, which
+  # compare names, never see.
+  environmentName = "[A-Za-z_][A-Za-z0-9_]*";
+
+  environmentNameAssertions =
+    map (key: {
+      assertion = builtins.match environmentName key != null;
+      message = "${opt}.extraEnvironment.${key} is not an environment variable name; a key must match ${environmentName}.";
+    })
+    (lib.attrNames cfg.extraEnvironment);
+
   # What a Host header carries, joined with commas into one variable: the
   # service checks the rest when it starts.
   allowedHost =
@@ -749,7 +762,9 @@ in {
       example = {LLAMA_SWAP_VOICE_LOG_LEVEL = "debug";};
       description = ''
         Extra environment variables for the service, by full name. They win
-        over the variables the module generates. Evaluation checks only the
+        over the variables the module generates. Evaluation refuses a key
+        that is not an environment variable name, one that does not match
+        [A-Za-z_][A-Za-z0-9_]*. Of the values, it checks only the
         variables the module reads back after this merge: the shutdown
         durations, TTS_MAXINPUTCHARS, UPSTREAM_TTSCONCURRENCY,
         REQUEST_MAXCONCURRENT and WYOMING_STREAMINGMAXCHARS. It fails when
@@ -780,6 +795,7 @@ in {
         }
       ]
       ++ lib.concatLists (lib.mapAttrsToList voiceAssertions cfg.voices)
+      ++ environmentNameAssertions
       ++ checkedAssertions
       ++ recordingsAssertions
       ++ lib.optionals cfg.wyoming.enable wyomingAssertions;

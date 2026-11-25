@@ -1160,7 +1160,27 @@
         ["${opt}.extraEnvironment.${prefix}Recordings_AllowedHosts" "${prefix}RECORDINGS_ALLOWEDHOSTS"])
       (evaluates "a key whose prefix is not the service's exact prefix is not a recordings variable"
         (base // {extraEnvironment."llama_swap_voice_RECORDINGS_ENABLE" = "true";}))
+      # systemd splits Environment="name=value" at the first "=", so this
+      # key sets RECORDINGS_DIR to "/srv/elsewhere=unexpected".
+      (failsWith "an extraEnvironment key with \"=\" is refused as no variable name"
+        (base
+          // {
+            recordings.enable = true;
+            extraEnvironment."${prefix}RECORDINGS_DIR=/srv/elsewhere" = "unexpected";
+          })
+        ["${opt}.extraEnvironment.${prefix}RECORDINGS_DIR=/srv/elsewhere" "[A-Za-z_][A-Za-z0-9_]*"])
+      # lib.toLower folds ASCII only, while Go's strings.ToLower folds
+      # U+0130 to "i", so the service reads this key as RECORDINGS_ENABLE.
+      (failsWith "an extraEnvironment key with a non-ASCII letter is refused as no variable name"
+        (base // {extraEnvironment."${prefix}RECORD${dottedCapitalI}NGS_ENABLE" = "true";})
+        ["${opt}.extraEnvironment.${prefix}RECORD${dottedCapitalI}NGS_ENABLE" "[A-Za-z_][A-Za-z0-9_]*"])
+      (evaluates "a lower-case key with a leading underscore and digits is a variable name"
+        (base // {extraEnvironment."_extra_setting_2" = "x";}))
     ];
+
+  # U+0130, Latin capital letter I with dot above. Nix strings have no \u
+  # escape, so JSON decodes it.
+  dottedCapitalI = builtins.fromJSON ''"İ"'';
 
   allCases = cases ++ recordingsSpellingCases ++ swapCases ++ wyomingCases;
 
