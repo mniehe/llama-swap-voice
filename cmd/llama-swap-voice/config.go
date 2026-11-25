@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -48,6 +49,7 @@ type ServiceConfig struct {
 	Logger         LoggerConfig         `koanf:"log"`
 	ShutdownTiming ShutdownTimingConfig `koanf:"shutdown"`
 	Wyoming        WyomingConfig        `koanf:"wyoming"`
+	Recordings     RecordingsConfig     `koanf:"recordings"`
 }
 
 type UpstreamConfig struct {
@@ -93,6 +95,13 @@ type WyomingConfig struct {
 	Speed             float64      `koanf:"speed"`
 	Streaming         wyoming.Mode `koanf:"streaming"`
 	StreamingMaxChars int          `koanf:"streamingmaxchars"`
+}
+
+// RecordingsConfig turns on keeping the audio of each successful
+// transcription in Dir, an absolute path created at startup when missing.
+type RecordingsConfig struct {
+	Enable bool   `koanf:"enable"`
+	Dir    string `koanf:"dir"`
 }
 
 type ShutdownTimingConfig struct {
@@ -155,6 +164,7 @@ func (c *ServiceConfig) Validate() error {
 		c.validateLogger(),
 		c.validateShutdown(),
 		c.validateWyoming(),
+		c.validateRecordings(),
 	}
 
 	return errors.Join(errs...)
@@ -302,6 +312,18 @@ func (c *ServiceConfig) validateWyoming() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func (c *ServiceConfig) validateRecordings() error {
+	if !c.Recordings.Enable {
+		return nil
+	}
+
+	if !filepath.IsAbs(c.Recordings.Dir) {
+		return fmt.Errorf("recordings.dir must be an absolute path when recordings.enable is true, got %q", c.Recordings.Dir)
+	}
+
+	return nil
 }
 
 // splitLanguages splits a comma-separated list and trims each entry, so an

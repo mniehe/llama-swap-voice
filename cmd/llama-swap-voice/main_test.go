@@ -2,14 +2,19 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,8 +24,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/mniehe/llama-swap-voice/internal/openai"
-	"github.com/mniehe/llama-swap-voice/internal/pipeline"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 	"github.com/mniehe/llama-swap-voice/internal/wyoming"
 )
@@ -117,11 +120,10 @@ func serviceFor(t *testing.T, cfg *ServiceConfig, respond http.HandlerFunc, http
 	client, err := upstream.New(fake.URL, "tts", "asr", httpClient)
 	require.NoError(t, err)
 
-	serverCfg := cfg.serverConfig(map[string]string{"alice": filepath.Join(cfg.Voices.Dir, "alice.mp3")})
-	pipe, err := pipeline.New(&serverCfg, client, slog.New(slog.DiscardHandler))
+	service, err := newServices(cfg, map[string]string{"alice": filepath.Join(cfg.Voices.Dir, "alice.mp3")}, client, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
-	return &services{api: openai.New(pipe, slog.New(slog.DiscardHandler)), pipeline: pipe}
+	return service
 }
 
 func get(ctx context.Context, url string) (int, error) {
@@ -1071,4 +1073,213 @@ func nextListener(t *testing.T, bound <-chan net.Listener) net.Listener {
 		require.FailNow(t, "serveWith did not bind")
 		return nil
 	}
+}
+
+const (
+	recordedTranscript = "turn on the porch light"
+	eventTranscribe    = "transcribe"
+	eventTranscript    = "transcript"
+	homeAssistantAudio = `{"rate":16000,"width":2,"channels":1}`
+)
+
+// serveASR answers every upstream call with recordedTranscript as an OpenAI
+// transcription.
+func serveASR(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := io.WriteString(w, `{"text":"`+recordedTranscript+`"}`); err != nil {
+		panic(err)
+	}
+}
+
+func recordingsOn(t *testing.T, cfg *ServiceConfig) string {
+	t.Helper()
+
+	dir := filepath.Join(t.TempDir(), "recordings")
+	cfg.Recordings = RecordingsConfig{Enable: true, Dir: dir}
+
+	return dir
+}
+
+func savedFiles(t *testing.T, dir string) []string {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	slices.Sort(names)
+
+	return names
+}
+
+func readSaved(t *testing.T, dir, name string) map[string]any {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join(dir, name))
+	require.NoError(t, err)
+	var meta map[string]any
+	require.NoError(t, json.Unmarshal(data, &meta))
+
+	return meta
+}
+
+func postTranscription(t *testing.T, base string) string {
+	t.Helper()
+
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	part, err := form.CreateFormFile("file", "clip.wav")
+	require.NoError(t, err)
+	_, err = part.Write([]byte(wavHeader + strings.Repeat("\x01\x02", halfSecondSamples)))
+	require.NoError(t, err)
+	require.NoError(t, form.Close())
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, base+"/v1/audio/transcriptions", &body)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, resp.Body.Close()) }()
+	data, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body %s", data)
+
+	return string(data)
+}
+
+func (c *wyomingClient) sendChunk(data string, payload []byte) {
+	c.t.Helper()
+
+	require.NoError(c.t, c.conn.SetWriteDeadline(time.Now().Add(probeTimeout)))
+	require.NoError(c.t, wyoming.WriteEvent(c.conn, &wyoming.Event{Type: eventAudioChunk, Data: []byte(data), Payload: payload}))
+}
+
+func TestServe_RecordingsOff_WritesNothing(t *testing.T) {
+	cfg := validConfig(t)
+	dir := filepath.Join(t.TempDir(), "recordings")
+	cfg.Recordings = RecordingsConfig{Enable: false, Dir: dir}
+	s := startServe(t, &cfg, serviceFor(t, &cfg, serveASR, &http.Client{}))
+	waitReady(t, s.base)
+
+	assert.Contains(t, postTranscription(t, s.base), recordedTranscript)
+
+	assert.NoDirExists(t, dir)
+	status, err := get(t.Context(), s.base+"/recordings")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusNotFound, status)
+	s.cancel()
+	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+}
+
+func TestServe_RecordingsOn_SavesHTTPTranscription(t *testing.T) {
+	cfg := validConfig(t)
+	dir := recordingsOn(t, &cfg)
+	s := startServe(t, &cfg, serviceFor(t, &cfg, serveASR, &http.Client{}))
+	waitReady(t, s.base)
+
+	postTranscription(t, s.base)
+
+	files := savedFiles(t, dir)
+	require.Len(t, files, 2)
+	id := strings.TrimSuffix(files[0], ".json")
+	assert.Equal(t, []string{id + ".json", id + ".opus"}, files)
+	meta := readSaved(t, dir, files[0])
+	assert.Equal(t, "openai", meta["source"])
+	assert.Equal(t, recordedTranscript, meta["transcript"])
+	assert.Equal(t, false, meta["keep"])
+	assert.InDelta(t, 500, meta["durationMs"], 1)
+	atText, ok := meta["at"].(string)
+	require.True(t, ok, "at is %T", meta["at"])
+	at, err := time.Parse(time.RFC3339, atText)
+	require.NoError(t, err)
+	assert.WithinDuration(t, time.Now(), at, time.Minute)
+
+	status, err := get(t.Context(), s.base+"/recordings")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, status)
+	s.cancel()
+	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+}
+
+func TestServe_RecordingsOn_SavesWyomingTranscriptionAsWyoming(t *testing.T) {
+	cfg := wyomingEnabled(t)
+	dir := recordingsOn(t, &cfg)
+	s := startServe(t, &cfg, serviceFor(t, &cfg, serveASR, &http.Client{}))
+	c := dialWyoming(t, s)
+
+	c.send(eventTranscribe, `{"language":"en"}`)
+	c.send(eventAudioStart, homeAssistantAudio)
+	c.sendChunk(homeAssistantAudio, []byte(strings.Repeat("\x01\x02", halfSecondSamples)))
+	c.send(eventAudioStop, "")
+	transcript := c.readType(eventTranscript)
+
+	assert.Contains(t, string(transcript.Data), recordedTranscript)
+	files := savedFiles(t, dir)
+	require.Len(t, files, 2)
+	meta := readSaved(t, dir, files[0])
+	assert.Equal(t, "wyoming", meta["source"])
+	assert.Equal(t, recordedTranscript, meta["transcript"])
+	s.cancel()
+	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+}
+
+func TestNewServices_RecordingsDirUnwritable_FailsWrapped(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to a read-only directory")
+	}
+	parent := t.TempDir()
+	require.NoError(t, os.Chmod(parent, 0o500))
+	t.Cleanup(func() { assert.NoError(t, os.Chmod(parent, 0o700)) })
+	cfg := validConfig(t)
+	cfg.Recordings = RecordingsConfig{Enable: true, Dir: filepath.Join(parent, "recordings")}
+	client, err := upstream.New("http://127.0.0.1:1", "tts", "asr", &http.Client{})
+	require.NoError(t, err)
+
+	_, err = newServices(&cfg, map[string]string{}, client, slog.New(slog.DiscardHandler))
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "recordings")
+	assert.ErrorIs(t, err, os.ErrPermission)
+}
+
+func TestNewServices_RecordingsOn_CreatesPrivateDir(t *testing.T) {
+	cfg := validConfig(t)
+	dir := recordingsOn(t, &cfg)
+	client, err := upstream.New("http://127.0.0.1:1", "tts", "asr", &http.Client{})
+	require.NoError(t, err)
+
+	service, err := newServices(&cfg, map[string]string{}, client, slog.New(slog.DiscardHandler))
+
+	require.NoError(t, err)
+	require.NotNil(t, service.recordings)
+	info, err := os.Stat(dir)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+}
+
+func TestRunCollector_StopWaitsForTheCollector(t *testing.T) {
+	cfg := validConfig(t)
+	dir := recordingsOn(t, &cfg)
+	store, err := openRecordings(&cfg.Recordings, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	require.DirExists(t, dir)
+
+	stopped := make(chan struct{})
+	go func() {
+		runCollector(store)()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(probeTimeout):
+		require.FailNow(t, "stopping the collector did not return")
+	}
+}
+
+func TestRunCollector_RecordingsOffIsNoOp(t *testing.T) {
+	runCollector(nil)()
 }

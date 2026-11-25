@@ -136,6 +136,8 @@ func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 		"WYOMING_SPEED":             "1.25",
 		"WYOMING_STREAMING":         "whole",
 		"WYOMING_STREAMINGMAXCHARS": "120",
+		"RECORDINGS_ENABLE":         "true",
+		"RECORDINGS_DIR":            "/var/lib/llama-swap-voice/recordings",
 	}
 	for key, value := range env {
 		t.Setenv(envPrefix+key, value)
@@ -155,6 +157,7 @@ func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 		Logger:         LoggerConfig{Level: "debug", Format: "console"},
 		ShutdownTiming: ShutdownTimingConfig{Total: 20 * time.Second, Grace: 5 * time.Second, Hard: time.Second},
 		Wyoming:        WyomingConfig{Enabled: true, Host: "::1", Port: 10301, Languages: "en,de", Speed: 1.25, Streaming: wyoming.ModeWhole, StreamingMaxChars: 120},
+		Recordings:     RecordingsConfig{Enable: true, Dir: "/var/lib/llama-swap-voice/recordings"},
 	}, cfg)
 }
 
@@ -189,6 +192,7 @@ func TestLoadConfig_NoEnvironment_ReturnsDefaults(t *testing.T) {
 		Streaming:         wyoming.ModeSentences,
 		StreamingMaxChars: 300,
 	}, cfg.Wyoming)
+	assert.Equal(t, RecordingsConfig{Enable: false, Dir: ""}, cfg.Recordings)
 }
 
 func TestLoadConfig_UnknownTTSBackend_FailsStartup(t *testing.T) {
@@ -344,4 +348,32 @@ func TestServiceConfig_WyomingConfig_CopiesSettings(t *testing.T) {
 		StreamingMaxChars: 42,
 		Version:           "9.9.9",
 	}, got)
+}
+
+func TestServiceConfig_Validate_RecordingsRejectsMissingOrRelativeDir(t *testing.T) {
+	for name, dir := range map[string]string{"empty": "", "relative": "recordings", "dot relative": "./var/recordings"} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.Recordings = RecordingsConfig{Enable: true, Dir: dir}
+
+			err := cfg.Validate()
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "recordings.dir must be an absolute path")
+		})
+	}
+}
+
+func TestServiceConfig_Validate_RecordingsAcceptsAbsoluteDir(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Recordings = RecordingsConfig{Enable: true, Dir: "/var/lib/llama-swap-voice/recordings"}
+
+	require.NoError(t, cfg.Validate())
+}
+
+func TestServiceConfig_Validate_RecordingsDisabledIsNotChecked(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Recordings = RecordingsConfig{Enable: false, Dir: "relative"}
+
+	require.NoError(t, cfg.Validate())
 }

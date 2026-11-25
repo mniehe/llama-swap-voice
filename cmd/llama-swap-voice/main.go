@@ -17,6 +17,7 @@ import (
 	"github.com/mniehe/llama-swap-voice/internal/observability"
 	"github.com/mniehe/llama-swap-voice/internal/openai"
 	"github.com/mniehe/llama-swap-voice/internal/pipeline"
+	"github.com/mniehe/llama-swap-voice/internal/recordings"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 	"github.com/mniehe/llama-swap-voice/internal/voices"
 	"github.com/mniehe/llama-swap-voice/internal/wyoming"
@@ -73,13 +74,10 @@ func run(cfg *ServiceConfig, logger *slog.Logger) error {
 		return err
 	}
 
-	serverLogger := logger.With(slog.String(observability.ComponentLabel, "server"))
-	serverCfg := cfg.serverConfig(voiceFiles)
-	pipe, err := pipeline.New(&serverCfg, client, serverLogger)
+	service, err := newServices(cfg, voiceFiles, client, logger)
 	if err != nil {
 		return err
 	}
-	service := &services{api: openai.New(pipe, serverLogger), pipeline: pipe}
 
 	logger.Info("server starting",
 		slog.String("name", serviceName),
@@ -94,10 +92,68 @@ func run(cfg *ServiceConfig, logger *slog.Logger) error {
 }
 
 // services pairs the HTTP entrypoint with the pipeline whose admission the
-// shutdown drains.
+// shutdown drains, and the recordings store when recordings are on.
 type services struct {
-	api      *openai.Server
-	pipeline *pipeline.Pipeline
+	api        *openai.Server
+	pipeline   *pipeline.Pipeline
+	recordings *recordings.Store
+}
+
+func newServices(cfg *ServiceConfig, voiceFiles map[string]string, client *upstream.Client, logger *slog.Logger) (*services, error) {
+	store, err := openRecordings(&cfg.Recordings, logger.With(slog.String(observability.ComponentLabel, "recordings")))
+	if err != nil {
+		return nil, err
+	}
+
+	serverLogger := logger.With(slog.String(observability.ComponentLabel, "server"))
+	serverCfg := cfg.serverConfig(voiceFiles)
+	var options []openai.Option
+	if store != nil {
+		serverCfg.Recorder = store
+		options = append(options, openai.WithRecordings(store))
+	}
+
+	pipe, err := pipeline.New(&serverCfg, client, serverLogger)
+	if err != nil {
+		return nil, err
+	}
+
+	return &services{api: openai.New(pipe, serverLogger, options...), pipeline: pipe, recordings: store}, nil
+}
+
+// openRecordings returns nil when recordings are off.
+func openRecordings(cfg *RecordingsConfig, logger *slog.Logger) (*recordings.Store, error) {
+	if !cfg.Enable {
+		return nil, nil
+	}
+
+	store, err := recordings.Open(cfg.Dir, time.Now, logger)
+	if err != nil {
+		return nil, fmt.Errorf("recordings in %s: %w", cfg.Dir, err)
+	}
+	logger.Info("recordings enabled", slog.String("dir", cfg.Dir))
+
+	return store, nil
+}
+
+// runCollector deletes expired recordings in the background. The returned
+// function stops it and waits until it has returned.
+func runCollector(store *recordings.Store) (stop func()) {
+	if store == nil {
+		return func() {}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		store.Run(ctx)
+	}()
+
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 // entrypoints are the two listeners that shutdown stops together. The
@@ -162,6 +218,7 @@ func bind(ctx context.Context, cfg *ServiceConfig, logger *slog.Logger, listen l
 // serveOn owns the listeners in ls and closes them before it returns.
 func serveOn(ctx context.Context, cfg *ServiceConfig, service *services, ls *listeners, logger *slog.Logger) error {
 	defer closeListeners(ls, logger)
+	defer runCollector(service.recordings)()
 	ongoingCtx, stopOngoing := context.WithCancel(context.Background())
 	defer stopOngoing()
 
