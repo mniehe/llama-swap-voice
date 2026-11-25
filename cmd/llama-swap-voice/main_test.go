@@ -446,7 +446,7 @@ func postSpeechBody(ctx context.Context, base, body string) (string, error) {
 		return "", err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := unpooledClient().Do(req)
 	if err != nil {
 		return "", err
 	}
