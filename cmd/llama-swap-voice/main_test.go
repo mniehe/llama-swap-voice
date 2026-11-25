@@ -1115,6 +1115,20 @@ func savedFiles(t *testing.T, dir string) []string {
 	return names
 }
 
+// waitForSaved waits until the background worker has saved one recording
+// in dir and returns its two file names.
+func waitForSaved(t *testing.T, dir string) []string {
+	t.Helper()
+
+	var files []string
+	require.Eventually(t, func() bool {
+		files = savedFiles(t, dir)
+		return len(files) == 2
+	}, probeTimeout, 10*time.Millisecond, "the recording was not saved")
+
+	return files
+}
+
 func readSaved(t *testing.T, dir, name string) map[string]any {
 	t.Helper()
 
@@ -1182,8 +1196,7 @@ func TestServe_RecordingsOn_SavesHTTPTranscription(t *testing.T) {
 
 	postTranscription(t, s.base)
 
-	files := savedFiles(t, dir)
-	require.Len(t, files, 2)
+	files := waitForSaved(t, dir)
 	id := strings.TrimSuffix(files[0], ".json")
 	assert.Equal(t, []string{id + ".json", id + ".opus"}, files)
 	meta := readSaved(t, dir, files[0])
@@ -1217,8 +1230,7 @@ func TestServe_RecordingsOn_SavesWyomingTranscriptionAsWyoming(t *testing.T) {
 	transcript := c.readType(eventTranscript)
 
 	assert.Contains(t, string(transcript.Data), recordedTranscript)
-	files := savedFiles(t, dir)
-	require.Len(t, files, 2)
+	files := waitForSaved(t, dir)
 	meta := readSaved(t, dir, files[0])
 	assert.Equal(t, "wyoming", meta["source"])
 	assert.Equal(t, recordedTranscript, meta["transcript"])
@@ -1255,31 +1267,144 @@ func TestNewServices_RecordingsOn_CreatesPrivateDir(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, service.recordings)
+	require.NotNil(t, service.runRecordings)
 	info, err := os.Stat(dir)
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm())
 }
 
-func TestRunCollector_StopWaitsForTheCollector(t *testing.T) {
+// stopWaitCheck is how long a test watches a stop that must not return
+// yet.
+const stopWaitCheck = 200 * time.Millisecond
+
+// syncBuffer is a log destination that tests read while the service writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+func TestServe_StartsTheRecordingsRunAndWaitsForIt(t *testing.T) {
 	cfg := validConfig(t)
-	dir := recordingsOn(t, &cfg)
-	store, err := openRecordings(&cfg.Recordings, slog.New(slog.DiscardHandler))
-	require.NoError(t, err)
-	require.DirExists(t, dir)
+	service := serviceFor(t, &cfg, serveASR, &http.Client{})
+	started, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	service.runRecordings = func(ctx, _ context.Context) {
+		close(started)
+		<-ctx.Done()
+		<-release
+		close(returned)
+	}
+	s := startServe(t, &cfg, service)
+	waitReady(t, s.base)
+
+	select {
+	case <-started:
+	case <-time.After(probeTimeout):
+		require.FailNow(t, "serve did not start the recordings run")
+	}
+
+	s.cancel()
+	select {
+	case err := <-s.done:
+		require.FailNow(t, "serve returned while the recordings run was still running", "error %v", err)
+	case <-time.After(stopWaitCheck):
+	}
+	close(release)
+	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+	select {
+	case <-returned:
+	default:
+		require.FailNow(t, "serve returned before the recordings run did")
+	}
+}
+
+func TestStartRecordings_StopWaitsForTheRun(t *testing.T) {
+	release, returned := make(chan struct{}), make(chan struct{})
+	stop := startRecordings(func(ctx, _ context.Context) {
+		<-ctx.Done()
+		<-release
+		close(returned)
+	}, slog.New(slog.DiscardHandler))
 
 	stopped := make(chan struct{})
 	go func() {
-		runCollector(store)()
-		close(stopped)
+		defer close(stopped)
+		stop(time.Now().Add(time.Minute))
 	}()
 
 	select {
 	case <-stopped:
+		require.FailNow(t, "stop returned while the run was still running")
+	case <-time.After(stopWaitCheck):
+	}
+	close(release)
+	select {
+	case <-stopped:
 	case <-time.After(probeTimeout):
-		require.FailNow(t, "stopping the collector did not return")
+		require.FailNow(t, "stop did not return after the run did")
+	}
+	select {
+	case <-returned:
+	default:
+		require.FailNow(t, "stop returned before the run did")
 	}
 }
 
-func TestRunCollector_RecordingsOffIsNoOp(t *testing.T) {
-	runCollector(nil)()
+func TestStartRecordings_DrainEndsAtTheDeadline(t *testing.T) {
+	drained := make(chan time.Time, 1)
+	stop := startRecordings(func(ctx, drain context.Context) {
+		<-ctx.Done()
+		<-drain.Done()
+		drained <- time.Now()
+	}, slog.New(slog.DiscardHandler))
+	deadline := time.Now().Add(stopWaitCheck)
+
+	stop(deadline)
+
+	select {
+	case at := <-drained:
+		assert.False(t, at.Before(deadline), "drain ended %s before the deadline", deadline.Sub(at))
+	case <-time.After(probeTimeout):
+		require.FailNow(t, "the drain never ended")
+	}
+}
+
+func TestStartRecordings_StopGivesUpAtTheDeadline(t *testing.T) {
+	logs := &syncBuffer{}
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	stop := startRecordings(func(context.Context, context.Context) { <-block }, slog.New(slog.NewJSONHandler(logs, nil)))
+
+	began := time.Now()
+	stop(began.Add(stopWaitCheck))
+
+	elapsed := time.Since(began)
+	assert.GreaterOrEqual(t, elapsed, stopWaitCheck)
+	assert.Less(t, elapsed, probeTimeout)
+	assert.Contains(t, logs.String(), "recordings still saving at the shutdown deadline")
+}
+
+func TestStartRecordings_RecordingsOffIsNoOp(t *testing.T) {
+	startRecordings(nil, slog.New(slog.DiscardHandler))(time.Now())
+}
+
+func TestRecordingsDeadline_IsTheShutdownBudgetFromItsStart(t *testing.T) {
+	timing := ShutdownTimingConfig{Total: 15 * time.Second, Grace: time.Hour, Hard: 3 * time.Second}
+	began := time.Date(2026, time.November, 25, 15, 30, 0, 0, time.UTC)
+
+	assert.Equal(t, began.Add(18*time.Second), recordingsDeadline(began, &timing))
+	assert.WithinDuration(t, time.Now().Add(18*time.Second), recordingsDeadline(time.Time{}, &timing), time.Second, "an unset start is now")
 }

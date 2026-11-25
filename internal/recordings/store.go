@@ -5,7 +5,6 @@ package recordings
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -115,6 +114,14 @@ type Store struct {
 	mu    sync.Mutex
 	byID  map[string]*indexed
 	order []*indexed // oldest first, by at and then id
+
+	// queueMu guards the recordings waiting for the worker; Record takes
+	// only it, never mu, so it does not wait on the disk.
+	queueMu     sync.Mutex
+	queue       []queued
+	queuedBytes int64
+	maxQueued   int64
+	wake        chan struct{}
 }
 
 // Open creates dir if it is missing, checks that it can be written, indexes
@@ -129,6 +136,9 @@ func Open(dir string, now func() time.Time, log *slog.Logger) (*Store, error) {
 		ticks:    newTicks,
 		newID:    randomID,
 		byID:     map[string]*indexed{},
+		// maxQueued is a field so that a test can fill the queue cheaply.
+		maxQueued: maxQueuedBytes,
+		wake:      make(chan struct{}, 1),
 	}
 	s.write = s.writeAtomic
 
@@ -627,23 +637,6 @@ func (s *Store) leftover(name string) bool {
 	}
 
 	return false
-}
-
-// Run collects every interval until ctx ends.
-func (s *Store) Run(ctx context.Context) {
-	ticks, stop := s.ticks()
-	defer stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticks:
-			if err := s.Collect(); err != nil {
-				s.log.Warn("could not collect expired recordings", slog.Any("error", err))
-			}
-		}
-	}
 }
 
 // remove deletes the files of id and drops it from the index. The caller

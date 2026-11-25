@@ -238,6 +238,8 @@ in
           assert status == "200", reply
           transcript = json.loads(body)["text"]
 
+          # The service saves in the background, after it has answered.
+          qwentts.wait_until_succeeds(f"test $(ls -1 {RECORDINGS} | wc -l) -eq 2", timeout=30)
           names = sorted(qwentts.succeed(f"ls -1 {RECORDINGS}").split())
           assert len(names) == 2, names
           recording_id = names[0].removesuffix(".json")

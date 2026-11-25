@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"log/slog"
 	"strings"
 	"time"
 
@@ -30,8 +29,8 @@ const (
 // Transcribe decodes an untrusted upload to 16 kHz mono WAV, sends it
 // upstream and strips the configured prefix from the text. It reads upload
 // whole, so the caller must bound it by Limits().MaxUploadBytes. When
-// recordings are on, a successful transcription is saved before Transcribe
-// returns; a failed save is logged and does not change the result.
+// recordings are on, a successful transcription is handed to the recorder,
+// which saves it in the background.
 func (p *Pipeline) Transcribe(ctx context.Context, upload io.Reader, source Source) (string, error) {
 	wav, err := audio.NormaliseUpload(ctx, upload, asrLimits)
 	if err != nil {
@@ -46,19 +45,20 @@ func (p *Pipeline) Transcribe(ctx context.Context, upload io.Reader, source Sour
 	}
 
 	transcript := p.stripPrefix(text)
-	p.record(ctx, wav, source, transcript)
+	p.record(wav, source, transcript)
 
 	return transcript, nil
 }
 
-func (p *Pipeline) record(ctx context.Context, wav []byte, source Source, transcript string) {
+// record hands wav to the recorder. NormaliseUpload returns a fresh slice
+// for each request and nothing here touches it afterwards, so the recorder
+// may keep it without a copy.
+func (p *Pipeline) record(wav []byte, source Source, transcript string) {
 	if p.cfg.Recorder == nil {
 		return
 	}
 
-	if err := p.cfg.Recorder.Save(wav, string(source), transcript); err != nil {
-		p.log.Warn("could not save recording", requestID(ctx), slog.String("source", string(source)), slog.Any("error", err))
-	}
+	p.cfg.Recorder.Record(wav, string(source), transcript)
 }
 
 func (p *Pipeline) stripPrefix(text string) string {

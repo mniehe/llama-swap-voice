@@ -97,6 +97,9 @@ type services struct {
 	api        *openai.Server
 	pipeline   *pipeline.Pipeline
 	recordings *recordings.Store
+	// runRecordings is the store's background work, nil when recordings are
+	// off; a field so that a test can watch serve start and stop it.
+	runRecordings func(ctx, drain context.Context)
 }
 
 func newServices(cfg *ServiceConfig, voiceFiles map[string]string, client *upstream.Client, logger *slog.Logger) (*services, error) {
@@ -118,7 +121,12 @@ func newServices(cfg *ServiceConfig, voiceFiles map[string]string, client *upstr
 		return nil, err
 	}
 
-	return &services{api: openai.New(pipe, serverLogger, options...), pipeline: pipe, recordings: store}, nil
+	service := &services{api: openai.New(pipe, serverLogger, options...), pipeline: pipe, recordings: store}
+	if store != nil {
+		service.runRecordings = store.Run
+	}
+
+	return service, nil
 }
 
 // openRecordings returns nil when recordings are off.
@@ -136,24 +144,48 @@ func openRecordings(cfg *RecordingsConfig, logger *slog.Logger) (*recordings.Sto
 	return store, nil
 }
 
-// runCollector deletes expired recordings in the background. The returned
-// function stops it and waits until it has returned.
-func runCollector(store *recordings.Store) (stop func()) {
-	if store == nil {
-		return func() {}
+// startRecordings runs the recordings store's background work. The returned
+// stop ends run's ctx at once and its drain at deadline, and waits for run
+// to return until deadline: a save under way when the deadline passes is
+// left to finish or die with the process.
+func startRecordings(run func(ctx, drain context.Context), logger *slog.Logger) (stop func(deadline time.Time)) {
+	if run == nil {
+		return func(time.Time) {}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	drain, endDrain := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		store.Run(ctx)
+		run(ctx, drain)
 	}()
 
-	return func() {
+	return func(deadline time.Time) {
 		cancel()
-		<-done
+		defer endDrain()
+
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+
+		select {
+		case <-done:
+		case <-timer.C:
+			endDrain()
+			logger.Warn("recordings still saving at the shutdown deadline")
+		}
 	}
+}
+
+// recordingsDeadline is when the recordings worker must stop: the shutdown
+// budget, timing.Total and timing.Hard, counted from the start of shutdown,
+// or from now when shutdown has not started.
+func recordingsDeadline(start time.Time, timing *ShutdownTimingConfig) time.Time {
+	if start.IsZero() {
+		start = time.Now()
+	}
+
+	return start.Add(timing.Total + timing.Hard)
 }
 
 // entrypoints are the two listeners that shutdown stops together. The
@@ -218,7 +250,9 @@ func bind(ctx context.Context, cfg *ServiceConfig, logger *slog.Logger, listen l
 // serveOn owns the listeners in ls and closes them before it returns.
 func serveOn(ctx context.Context, cfg *ServiceConfig, service *services, ls *listeners, logger *slog.Logger) error {
 	defer closeListeners(ls, logger)
-	defer runCollector(service.recordings)()
+	stopRecordings := startRecordings(service.runRecordings, logger)
+	var shutdownStart time.Time
+	defer func() { stopRecordings(recordingsDeadline(shutdownStart, &cfg.ShutdownTiming)) }()
 	ongoingCtx, stopOngoing := context.WithCancel(context.Background())
 	defer stopOngoing()
 
@@ -248,6 +282,7 @@ func serveOn(ctx context.Context, cfg *ServiceConfig, service *services, ls *lis
 	select {
 	case <-ctx.Done():
 	case err := <-listenErr:
+		shutdownStart = time.Now()
 		return errors.Join(err, shutdown(servers, service, stopOngoing, &cfg.ShutdownTiming, logger))
 	}
 
@@ -255,6 +290,7 @@ func serveOn(ctx context.Context, cfg *ServiceConfig, service *services, ls *lis
 	service.api.SetShuttingDown()
 	time.Sleep(cfg.ShutdownTiming.Grace)
 
+	shutdownStart = time.Now()
 	return shutdown(servers, service, stopOngoing, &cfg.ShutdownTiming, logger)
 }
 

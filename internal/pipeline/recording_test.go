@@ -1,9 +1,8 @@
 package pipeline
 
 import (
-	"errors"
+	"context"
 	"log/slog"
-	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -28,19 +27,17 @@ type savedRecording struct {
 	transcript string
 }
 
-// fakeRecorder records each Save and fails with err when it is set.
+// fakeRecorder records each recording it is handed.
 type fakeRecorder struct {
 	mu    sync.Mutex
 	saved []savedRecording
-	err   error
 }
 
-func (f *fakeRecorder) Save(wav []byte, source, transcript string) error {
+func (f *fakeRecorder) Record(wav []byte, source, transcript string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.saved = append(f.saved, savedRecording{wav: wav, source: source, transcript: transcript})
-	return f.err
 }
 
 func (f *fakeRecorder) all() []savedRecording {
@@ -55,6 +52,31 @@ func withRecorder(recorder Recorder) func(*Config) {
 		cfg.Recorder = recorder
 		cfg.ASRPrefixRegex = qwenPrefix
 	}
+}
+
+// runStore runs the store's background work until the test ends.
+func runStore(t *testing.T, store *recordings.Store) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		store.Run(ctx, ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+}
+
+func storedCount(t *testing.T, store *recordings.Store) int {
+	t.Helper()
+
+	_, total, err := store.List("", 1)
+	require.NoError(t, err)
+
+	return total
 }
 
 func TestPipeline_Transcribe_SavesStrippedTranscriptWithSource(t *testing.T) {
@@ -88,43 +110,50 @@ func TestPipeline_Transcribe_FailedTranscriptionSavesNothing(t *testing.T) {
 	assert.Empty(t, recorder.all())
 }
 
-func TestPipeline_Transcribe_SaveFailureKeepsTranscriptAndWarns(t *testing.T) {
-	logs := &logLines{}
-	recorder := &fakeRecorder{err: errors.New("disk full")}
-	p, _ := newLoggedPipeline(t, slog.New(slog.NewJSONHandler(logs, nil)), serveTranscript(t, transcriptText), withRecorder(recorder))
+func TestPipeline_Transcribe_DoesNotWaitForTheSave(t *testing.T) {
+	store, err := recordings.Open(t.TempDir(), time.Now, discardLogger())
+	require.NoError(t, err)
+	p, _ := newPipeline(t, serveTranscript(t, transcriptText), withRecorder(store))
 
-	text, err := p.Transcribe(WithRequestID(t.Context(), "req-1"), strings.NewReader(streamedWAV), SourceOpenAI)
+	text, err := p.Transcribe(t.Context(), strings.NewReader(streamedWAV), SourceOpenAI)
 
 	require.NoError(t, err)
 	assert.Equal(t, transcriptText, text)
-	require.Len(t, recorder.all(), 1)
-	warned := false
-	for _, line := range logs.all(t) {
-		if line["msg"] == "could not save recording" {
-			warned = true
-			assert.Equal(t, "WARN", line["level"])
-			assert.Equal(t, "req-1", line["request_id"])
-			assert.Equal(t, "disk full", line["error"])
-		}
-	}
-	assert.True(t, warned, "no warning for the failed save")
+	assert.Zero(t, storedCount(t, store), "nothing is saved until the worker runs")
+	runStore(t, store)
+	assert.Eventually(t, func() bool { return storedCount(t, store) == 1 }, time.Second, 5*time.Millisecond)
 }
 
-func TestPipeline_Transcribe_UnwritableStoreKeepsTranscript(t *testing.T) {
+func TestPipeline_Transcribe_SaveFailureKeepsTranscriptAndWarns(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root writes to a read-only directory")
 	}
 	dir := t.TempDir()
-	store, err := recordings.Open(dir, time.Now, discardLogger())
+	logs := &logLines{}
+	store, err := recordings.Open(dir, time.Now, slog.New(slog.NewJSONHandler(logs, nil)))
 	require.NoError(t, err)
 	require.NoError(t, os.Chmod(dir, readOnlyDir))
 	t.Cleanup(func() { assert.NoError(t, os.Chmod(dir, privateDir)) })
+	runStore(t, store)
 	p, _ := newPipeline(t, serveTranscript(t, transcriptText), withRecorder(store))
 
 	text, err := p.Transcribe(t.Context(), strings.NewReader(streamedWAV), SourceWyoming)
 
 	require.NoError(t, err)
 	assert.Equal(t, transcriptText, text)
+	var warning map[string]any
+	require.Eventually(t, func() bool {
+		for _, line := range logs.all(t) {
+			if line["msg"] == "could not save recording" {
+				warning = line
+				return true
+			}
+		}
+		return false
+	}, time.Second, 5*time.Millisecond, "no warning for the failed save")
+	assert.Equal(t, "WARN", warning["level"])
+	assert.Equal(t, "wyoming", warning["source"])
+	assert.Contains(t, warning["error"], "permission denied")
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	assert.Empty(t, entries)
@@ -134,12 +163,14 @@ func TestPipeline_Transcribe_RealStoreSavesOnePair(t *testing.T) {
 	dir := t.TempDir()
 	store, err := recordings.Open(dir, time.Now, discardLogger())
 	require.NoError(t, err)
+	runStore(t, store)
 	p, _ := newPipeline(t, serveTranscript(t, transcriptText), withRecorder(store))
 
 	_, err = p.Transcribe(t.Context(), strings.NewReader(streamedWAV), SourceOpenAI)
 
 	require.NoError(t, err)
-	list, _, err := store.List("", math.MaxInt)
+	require.Eventually(t, func() bool { return storedCount(t, store) == 1 }, time.Second, 5*time.Millisecond)
+	list, _, err := store.List("", 1)
 	require.NoError(t, err)
 	require.Len(t, list, 1)
 	assert.Equal(t, "openai", list[0].Source)

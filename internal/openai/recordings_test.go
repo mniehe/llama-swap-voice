@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -55,6 +56,17 @@ func newRecordingHarnessIn(t *testing.T, dir, transcript string) (*harness, *rec
 	h.service = New(h.pipeline, discardLogger(), WithRecordings(store))
 	h.server.Config.Handler = h.service.Handler()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		store.Run(ctx, ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
 	return h, store
 }
 
@@ -82,14 +94,25 @@ func dirNames(t *testing.T, dir string) []string {
 	return names
 }
 
+// waitForRecordings waits until the worker has saved count recordings and
+// returns them, newest first.
+func waitForRecordings(t *testing.T, store *recordings.Store, count int) []recordings.Recording {
+	t.Helper()
+
+	var list []recordings.Recording
+	require.Eventually(t, func() bool {
+		var err error
+		list, _, err = store.List("", math.MaxInt)
+		return err == nil && len(list) == count
+	}, 2*time.Second, 5*time.Millisecond, "want %d recordings", count)
+
+	return list
+}
+
 func onlyRecording(t *testing.T, store *recordings.Store) recordings.Recording {
 	t.Helper()
 
-	list, _, err := store.List("", math.MaxInt)
-	require.NoError(t, err)
-	require.Len(t, list, 1)
-
-	return list[0]
+	return waitForRecordings(t, store, 1)[0]
 }
 
 func (h *harness) postForm(path string, form url.Values) *http.Response {
@@ -133,10 +156,7 @@ func TestRecordingsPage_NewestFirst(t *testing.T) {
 	require.Equal(t, http.StatusOK, h.transcribe(nil, []byte(streamedWAV)).StatusCode)
 	older := onlyRecording(t, store)
 	require.Equal(t, http.StatusOK, h.transcribe(nil, []byte(streamedWAV)).StatusCode)
-	list, _, err := store.List("", math.MaxInt)
-	require.NoError(t, err)
-	require.Len(t, list, 2)
-	newer := list[0]
+	newer := waitForRecordings(t, store, 2)[0]
 	require.NotEqual(t, older.ID, newer.ID)
 
 	page := string(readBody(t, h.get(recordingsPath)))

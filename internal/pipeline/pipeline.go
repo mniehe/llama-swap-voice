@@ -36,10 +36,11 @@ type Config struct {
 	Recorder Recorder
 }
 
-// Recorder saves wav, the 16 kHz mono WAV sent upstream, with the source
-// entrypoint and the transcript returned to the client.
+// Recorder keeps wav, the 16 kHz mono WAV sent upstream, with the source
+// entrypoint and the transcript returned to the client. Record must not wait
+// on the disk, and takes ownership of wav.
 type Recorder interface {
-	Save(wav []byte, source, transcript string) error
+	Record(wav []byte, source, transcript string)
 }
 
 type Pipeline struct {

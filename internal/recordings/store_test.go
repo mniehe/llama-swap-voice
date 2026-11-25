@@ -417,7 +417,7 @@ func TestRun_StopsWhenContextEnds(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		store.Run(ctx)
+		store.Run(ctx, ctx)
 		close(done)
 	}()
 	cancel()
@@ -437,7 +437,7 @@ func TestRun_CollectsEveryInterval(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
-		store.Run(ctx)
+		store.Run(ctx, ctx)
 		close(done)
 	}()
 	defer func() {
