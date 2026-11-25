@@ -1578,6 +1578,12 @@ func TestServe_RecordingsDrainDeadlineRunsFromShutdownStart(t *testing.T) {
 		}
 		upstreamDone := make(chan error, 1)
 		go func() { upstreamDone <- fake.Serve(upstreamListener) }()
+		// Cleanups run in reverse order, so the fake upstream stops after the
+		// service, and a failed assertion still leaves no goroutine blocked.
+		t.Cleanup(func() {
+			assert.NoError(t, fake.Close())
+			assert.ErrorIs(t, receiveWithin(t, upstreamDone, probeTimeout, "the fake upstream never stopped"), http.ErrServerClosed)
+		})
 
 		service := serviceAt(t, &cfg, bubbleUpstream, upstreamListener.client())
 		drainEnded := make(chan time.Time, 1)
@@ -1588,23 +1594,34 @@ func TestServe_RecordingsDrainDeadlineRunsFromShutdownStart(t *testing.T) {
 		}
 
 		listener := newPipeListener()
+		budget := drainGrace + drainTotal + drainHard
 		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
 		done := make(chan error, 1)
-		go func() { done <- serveOn(ctx, &cfg, service, &listeners{http: listener}, slog.New(slog.DiscardHandler)) }()
-
-		requestEnded := make(chan time.Time, 1)
+		served := make(chan struct{})
 		go func() {
+			defer close(served)
+			done <- serveOn(ctx, &cfg, service, &listeners{http: listener}, slog.New(slog.DiscardHandler))
+		}()
+		t.Cleanup(func() {
+			cancel()
+			receiveWithin(t, served, budget+probeTimeout, "serve did not return")
+		})
+
+		// t.Context ends before the cleanups run, which ends this request.
+		requestEnded := make(chan time.Time, 1)
+		requested := make(chan struct{})
+		go func() {
+			defer close(requested)
 			_, err := postSpeechVia(t.Context(), listener.client(), bubbleService, `{"input":"hi","response_format":"mp3"}`)
 			assert.Error(t, err, "a cancelled stream must not end cleanly")
 			requestEnded <- time.Now()
 		}()
+		t.Cleanup(func() { receiveWithin(t, requested, probeTimeout, "the speech request never ended") })
 		receiveWithin(t, paused, probeTimeout, "the upstream reply never started")
 
 		signalled := time.Now()
 		cancel()
 
-		budget := drainGrace + drainTotal + drainHard
 		require.NoError(t, receiveWithin(t, done, budget+probeTimeout, "serve did not return"))
 		// Without a request that holds shutdown for all of Total, a budget
 		// counted from the end of shutdown would end at the same instant.
@@ -1612,9 +1629,6 @@ func TestServe_RecordingsDrainDeadlineRunsFromShutdownStart(t *testing.T) {
 		assert.Equal(t, drainGrace+drainTotal, requestEnd.Sub(signalled), "the stuck request holds shutdown until Total has passed")
 		drainEnd := receiveWithin(t, drainEnded, probeTimeout, "the recordings drain never ended")
 		assert.Equal(t, budget, drainEnd.Sub(signalled), "the drain ends Total and Hard after shutdown starts, which is Grace after the signal")
-
-		require.NoError(t, fake.Close())
-		assert.ErrorIs(t, receiveWithin(t, upstreamDone, probeTimeout, "the fake upstream never stopped"), http.ErrServerClosed)
 	})
 }
 
