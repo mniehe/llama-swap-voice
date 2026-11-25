@@ -14,7 +14,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -126,13 +125,20 @@ func serviceFor(t *testing.T, cfg *ServiceConfig, respond http.HandlerFunc, http
 	return service
 }
 
+// unpooledClient gives each request a connection of its own: a pooled
+// client can dial a spare connection that never sends a request, and
+// Shutdown waits 5 s for it to go idle.
+func unpooledClient() *http.Client {
+	return &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+}
+
 func get(ctx context.Context, url string) (int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return 0, err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := unpooledClient().Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -1100,30 +1106,42 @@ func recordingsOn(t *testing.T, cfg *ServiceConfig) string {
 	return dir
 }
 
-func savedFiles(t *testing.T, dir string) []string {
+// savedPair returns the two file names of the one recording saved in dir,
+// or nil until its metadata is in place. The store writes the audio first and
+// renames each file into place from a temporary name, so a final .json beside
+// its .opus is a whole recording.
+func savedPair(t *testing.T, dir string) []string {
 	t.Helper()
 
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
 
-	names := make([]string, 0, len(entries))
+	present := map[string]bool{}
 	for _, entry := range entries {
-		names = append(names, entry.Name())
+		if !strings.HasSuffix(entry.Name(), ".tmp") {
+			present[entry.Name()] = true
+		}
 	}
-	slices.Sort(names)
 
-	return names
+	for name := range present {
+		id, ok := strings.CutSuffix(name, ".json")
+		if ok && present[id+".opus"] {
+			return []string{id + ".json", id + ".opus"}
+		}
+	}
+
+	return nil
 }
 
 // waitForSaved waits until the background worker has saved one recording
-// in dir and returns its two file names.
+// in dir and returns its two file names, the .json first.
 func waitForSaved(t *testing.T, dir string) []string {
 	t.Helper()
 
 	var files []string
 	require.Eventually(t, func() bool {
-		files = savedFiles(t, dir)
-		return len(files) == 2
+		files = savedPair(t, dir)
+		return files != nil
 	}, probeTimeout, 10*time.Millisecond, "the recording was not saved")
 
 	return files
@@ -1154,7 +1172,7 @@ func postTranscription(t *testing.T, base string) string {
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, base+"/v1/audio/transcriptions", &body)
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", form.FormDataContentType())
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := unpooledClient().Do(req)
 	require.NoError(t, err)
 	defer func() { assert.NoError(t, resp.Body.Close()) }()
 	data, err := io.ReadAll(resp.Body)
@@ -1238,13 +1256,11 @@ func TestServe_RecordingsOn_SavesWyomingTranscriptionAsWyoming(t *testing.T) {
 	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
 }
 
-// statusAs is the status of a GET of url sent with Host set to host. Each
-// request has a connection of its own: a pooled client can dial a spare
-// connection that never sends a request, and Shutdown waits 5 s for one.
+// statusAs is the status of a GET of url sent with Host set to host.
 func statusAs(t *testing.T, url, host string) int {
 	t.Helper()
 
-	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	client := unpooledClient()
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
 	require.NoError(t, err)
 	req.Host = host

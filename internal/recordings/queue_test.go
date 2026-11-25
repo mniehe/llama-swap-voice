@@ -2,6 +2,7 @@ package recordings
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -234,12 +235,30 @@ func diskBytes(t *testing.T, dir string) int64 {
 	return total
 }
 
+// keepNewest keeps the newest recording. A save can evict it between the
+// List and the SetKeep, so not found is an answer too.
+func keepNewest(t *testing.T, store *Store) {
+	t.Helper()
+
+	list, _, err := store.List("", 1)
+	if err != nil || len(list) != 1 {
+		return
+	}
+
+	if keepErr := store.SetKeep(list[0].ID, true); !errors.Is(keepErr, ErrNotFound) {
+		assert.NoError(t, keepErr)
+	}
+}
+
 func TestStore_ConcurrentRecordKeepAndCollectStayUnderTheCap(t *testing.T) {
 	dir := t.TempDir()
 	store, _ := openLogged(t, dir, steppingNow())
 	seed := save(t, store, "seed")
 	size := recordingBytes(t, dir, seed)
 	store.maxBytes = 5 * size
+	// The kept seed is never evicted or expired, so keeping it again must
+	// succeed however the other calls interleave.
+	require.NoError(t, store.SetKeep(seed.ID, true))
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
@@ -254,10 +273,8 @@ func TestStore_ConcurrentRecordKeepAndCollectStayUnderTheCap(t *testing.T) {
 			for i := range rounds {
 				store.Record(wav(t, halfSecond), sourceOpenAI, "concurrent")
 				if (w+i)%3 == 0 {
-					list, _, err := store.List("", 1)
-					if err == nil && len(list) == 1 {
-						assert.NoError(t, store.SetKeep(list[0].ID, true))
-					}
+					assert.NoError(t, store.SetKeep(seed.ID, true))
+					keepNewest(t, store)
 				}
 				if i%5 == 0 {
 					assert.NoError(t, store.Collect())

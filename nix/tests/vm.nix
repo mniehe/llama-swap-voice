@@ -238,9 +238,15 @@ in
           assert status == "200", reply
           transcript = json.loads(body)["text"]
 
-          # The service saves in the background, after it has answered.
-          qwentts.wait_until_succeeds(f"test $(ls -1 {RECORDINGS} | wc -l) -eq 2", timeout=30)
-          names = sorted(qwentts.succeed(f"ls -1 {RECORDINGS}").split())
+          # The service saves in the background, after it has answered, and
+          # renames each file into place from a .tmp name, the audio first: a
+          # final .json beside its .opus is a whole recording.
+          qwentts.wait_until_succeeds(
+              f"ls -1 {RECORDINGS} | grep -v '[.]tmp$' | sed -n 's/[.]json$//p'"
+              f" | while read -r id; do test -e {RECORDINGS}/$id.opus && echo $id; done | grep -q .",
+              timeout=30,
+          )
+          names = sorted(n for n in qwentts.succeed(f"ls -1 {RECORDINGS}").split() if not n.endswith(".tmp"))
           assert len(names) == 2, names
           recording_id = names[0].removesuffix(".json")
           assert names == [f"{recording_id}.json", f"{recording_id}.opus"], names
