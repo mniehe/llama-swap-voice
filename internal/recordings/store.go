@@ -52,7 +52,9 @@ var (
 	ErrNotFound = errors.New("recording not found")
 	ErrFull     = errors.New("kept recordings fill the store")
 
-	errCorrupt = errors.New("corrupt recording metadata")
+	// errUnusable marks metadata that cannot be read once open, does not
+	// decode or is over maxMetadataBytes.
+	errUnusable = errors.New("unusable recording metadata")
 
 	idPattern = regexp.MustCompile(`^\d{8}T\d{6}Z-[0-9a-f]{8}$`)
 	// tempPattern matches only the names os.CreateTemp gives the probe and
@@ -114,6 +116,14 @@ type Store struct {
 	mu    sync.Mutex
 	byID  map[string]*indexed
 	order []*indexed // oldest first, by at and then id
+	// skipped holds the size of each pair Open left out of the index because
+	// its metadata is unusable. The keep flag of such a pair cannot be read,
+	// so the store never deletes it; the operator does.
+	skipped map[string]int64
+	// stray holds the size of each file of the store's that a removal or the
+	// last sweep could not delete. Skipped and stray bytes count against the
+	// cap, and no eviction can reclaim them.
+	stray map[string]int64
 
 	// queueMu guards the recordings waiting for the worker; Record takes
 	// only it, never mu, so it does not wait on the disk.
@@ -125,8 +135,8 @@ type Store struct {
 }
 
 // Open creates dir if it is missing, checks that it can be written, indexes
-// the recordings in it, deletes any whose metadata does not decode, and
-// collects.
+// the recordings in it, leaves out with a warning any whose metadata is
+// unusable, and collects. It fails when a metadata file cannot be opened.
 func Open(dir string, now func() time.Time, log *slog.Logger) (*Store, error) {
 	s := &Store{
 		dir:      dir,
@@ -136,6 +146,8 @@ func Open(dir string, now func() time.Time, log *slog.Logger) (*Store, error) {
 		ticks:    newTicks,
 		newID:    randomID,
 		byID:     map[string]*indexed{},
+		skipped:  map[string]int64{},
+		stray:    map[string]int64{},
 		// maxQueued is a field so that a test can fill the queue cheaply.
 		maxQueued: maxQueuedBytes,
 		wake:      make(chan struct{}, 1),
@@ -175,14 +187,20 @@ func probeWrite(dir string) error {
 	return errors.Join(probe.Close(), os.Remove(probe.Name()))
 }
 
-// ValidID reports whether id has the form Save gives it. Callers check an id
-// from a request with it before the id reaches a path.
+// ValidID reports whether id has the form Save gives it, a real time
+// included. Callers check an id from a request with it before the id reaches
+// a path.
 func ValidID(id string) bool {
-	return idPattern.MatchString(id)
+	if !idPattern.MatchString(id) {
+		return false
+	}
+
+	_, err := time.Parse(idTime, id[:len(idTime)])
+	return err == nil
 }
 
-// load indexes every recording that has both its files. Collect then deletes
-// the files that belong to no indexed recording.
+// load indexes every recording that has both its files and usable
+// metadata. Collect then deletes the files that belong to no recording.
 func (s *Store) load() error {
 	sizes, err := s.fileSizes()
 	if err != nil {
@@ -201,14 +219,14 @@ func (s *Store) load() error {
 		}
 
 		meta, readErr := s.readMetadata(id)
-		if errors.Is(readErr, errCorrupt) {
-			if err := s.deleteFiles(id); err != nil {
-				return err
-			}
-			s.log.Warn("deleted unreadable recording", slog.String("id", id), slog.Any("error", readErr))
+		switch {
+		case errors.Is(readErr, fs.ErrNotExist):
 			continue
-		}
-		if readErr != nil {
+		case errors.Is(readErr, errUnusable):
+			s.skipped[id] = opusBytes + jsonBytes
+			s.log.Warn("recording left on disk: its metadata is unusable", slog.String("id", id), slog.Any("error", readErr))
+			continue
+		case readErr != nil:
 			return readErr
 		}
 
@@ -290,7 +308,7 @@ func (s *Store) Save(wav []byte, source, transcript string) error {
 	}
 
 	if err := s.write(id+jsonSuffix, meta); err != nil {
-		return errors.Join(err, s.deleteFiles(id))
+		return errors.Join(err, s.unlink(id+opusSuffix, rec.opusBytes))
 	}
 
 	s.insert(rec)
@@ -354,7 +372,9 @@ func (s *Store) freshID(at time.Time) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if _, taken := s.byID[id]; !taken {
+		_, indexed := s.byID[id]
+		_, skipped := s.skipped[id]
+		if !indexed && !skipped {
 			return id, nil
 		}
 	}
@@ -363,10 +383,13 @@ func (s *Store) freshID(at time.Time) (string, error) {
 }
 
 // makeRoom deletes the oldest unkept recordings until size more bytes fit
-// under the cap. It deletes nothing when kept recordings alone leave no room.
-// The caller holds mu.
+// under the cap. It deletes nothing when kept recordings and the bytes no
+// eviction can reclaim leave no room. A failed deletion is logged and the
+// others still run; the joined error then fails the save. The caller holds
+// mu.
 func (s *Store) makeRoom(size int64) error {
-	var total, kept int64
+	unevictable := s.unevictable()
+	total, kept := unevictable, unevictable
 	for _, rec := range s.order {
 		total += rec.bytes()
 		if rec.keep {
@@ -390,13 +413,29 @@ func (s *Store) makeRoom(size int64) error {
 		total -= rec.bytes()
 	}
 
+	var errs []error
 	for _, id := range evict {
 		if err := s.remove(id); err != nil {
-			return err
+			s.log.Warn("could not evict recording", slog.String("id", id), slog.Any("error", err))
+			errs = append(errs, err)
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
+}
+
+// unevictable is the size of the skipped pairs and stray files. The caller
+// holds mu.
+func (s *Store) unevictable() int64 {
+	var total int64
+	for _, size := range s.skipped {
+		total += size
+	}
+	for _, size := range s.stray {
+		total += size
+	}
+
+	return total
 }
 
 // writeAtomic writes data to a temporary file in the store and renames it
@@ -449,8 +488,9 @@ func (s *Store) List(before string, limit int) ([]Recording, int, error) {
 }
 
 // olderThan returns how many recordings sort before the recording id. A
-// recording deleted since a page linked to it is placed by the time in its
-// id, which is its save time cut to the second. The caller holds mu.
+// recording deleted since a page linked to it is placed at the end of the
+// second in its id: a recording saved later in that second may then show on
+// two pages, but none saved earlier in it is skipped. The caller holds mu.
 func (s *Store) olderThan(id string) int {
 	cursor, ok := s.byID[id]
 	if !ok {
@@ -458,7 +498,7 @@ func (s *Store) olderThan(id string) int {
 		if err != nil {
 			return 0
 		}
-		cursor = &indexed{id: id, at: at}
+		cursor = &indexed{id: id, at: at.Add(time.Second - time.Nanosecond)}
 	}
 
 	position, _ := slices.BinarySearchFunc(s.order, cursor, compareIndexed)
@@ -569,7 +609,8 @@ func (s *Store) SetKeep(id string, keep bool) error {
 
 // Collect deletes every recording nobody kept that is older than the
 // retention, then every file that an interrupted save or delete left: a
-// temporary file of the store's, or one half of a recording.
+// temporary file of the store's, or one half of a recording. A failed
+// deletion is logged and the others still run; Collect returns them joined.
 func (s *Store) Collect() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -582,35 +623,47 @@ func (s *Store) Collect() error {
 		}
 	}
 
+	var errs []error
+	deleted := 0
 	for _, id := range expired {
 		if err := s.remove(id); err != nil {
-			return err
+			s.log.Warn("could not delete expired recording", slog.String("id", id), slog.Any("error", err))
+			errs = append(errs, err)
+			continue
 		}
+		deleted++
 	}
 
-	if len(expired) > 0 {
-		s.log.Info("expired recordings deleted", slog.Int("count", len(expired)))
+	if deleted > 0 {
+		s.log.Info("expired recordings deleted", slog.Int("count", deleted))
 	}
 
-	return s.sweep()
+	return errors.Join(append(errs, s.sweep())...)
 }
 
-// sweep deletes the store's leftover files. The caller holds mu, so no save
-// is writing one of them.
+// sweep deletes the store's leftover files and recounts the skipped pairs
+// and the files it could not delete. The caller holds mu, so no save is
+// writing one of them.
 func (s *Store) sweep() error {
 	sizes, err := s.fileSizes()
 	if err != nil {
 		return err
 	}
 
+	s.recountSkipped(sizes)
+	s.stray = map[string]int64{}
+
+	var errs []error
 	deleted := 0
-	for name := range sizes {
+	for name, size := range sizes {
 		if !s.leftover(name) {
 			continue
 		}
 
-		if err := os.Remove(filepath.Join(s.dir, name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("remove leftover recording file: %w", err)
+		if err := s.unlink(name, size); err != nil {
+			s.log.Warn("could not delete leftover recording file", slog.String("name", name), slog.Any("error", err))
+			errs = append(errs, err)
+			continue
 		}
 		deleted++
 	}
@@ -619,7 +672,21 @@ func (s *Store) sweep() error {
 		s.log.Info("leftover recording files deleted", slog.Int("count", deleted))
 	}
 
-	return nil
+	return errors.Join(errs...)
+}
+
+// recountSkipped updates the size of each skipped pair from sizes and forgets
+// a pair the operator has deleted. The caller holds mu.
+func (s *Store) recountSkipped(sizes map[string]int64) {
+	for id := range s.skipped {
+		opusBytes, haveOpus := sizes[id+opusSuffix]
+		jsonBytes, haveJSON := sizes[id+jsonSuffix]
+		if !haveOpus && !haveJSON {
+			delete(s.skipped, id)
+			continue
+		}
+		s.skipped[id] = opusBytes + jsonBytes
+	}
 }
 
 // leftover reports whether name is a temporary file of the store's or half
@@ -631,41 +698,50 @@ func (s *Store) leftover(name string) bool {
 
 	for _, suffix := range []string{opusSuffix, jsonSuffix} {
 		if id, ok := strings.CutSuffix(name, suffix); ok && ValidID(id) {
-			_, held := s.byID[id]
-			return !held
+			_, indexed := s.byID[id]
+			_, skipped := s.skipped[id]
+			return !indexed && !skipped
 		}
 	}
 
 	return false
 }
 
-// remove deletes the files of id and drops it from the index. The caller
+// remove deletes the files of the indexed recording id, the metadata first,
+// so a crash between the two leaves an orphan audio file that the next sweep
+// deletes, never a listed recording without audio. Once the metadata is gone
+// id leaves the index, even when its audio cannot be deleted. The caller
 // holds mu.
 func (s *Store) remove(id string) error {
-	if err := s.deleteFiles(id); err != nil {
-		return err
+	rec, ok := s.byID[id]
+	if !ok {
+		return nil
+	}
+
+	err := os.Remove(filepath.Join(s.dir, id+jsonSuffix))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("delete recording %s: %w", id, err)
 	}
 
 	s.forget(id)
-	return nil
+	return s.unlink(id+opusSuffix, rec.opusBytes)
 }
 
-// deleteFiles deletes the metadata first, so a crash between the two leaves
-// an orphan audio file that the next Collect removes, never a listed
-// recording without audio.
-func (s *Store) deleteFiles(id string) error {
-	for _, suffix := range []string{jsonSuffix, opusSuffix} {
-		err := os.Remove(filepath.Join(s.dir, id+suffix))
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("delete recording %s: %w", id, err)
-		}
+// unlink deletes the store's file name. A file it cannot delete counts
+// against the cap as stray until a sweep deletes it. The caller holds mu.
+func (s *Store) unlink(name string, size int64) error {
+	err := os.Remove(filepath.Join(s.dir, name))
+	if err == nil || errors.Is(err, fs.ErrNotExist) {
+		return nil
 	}
 
-	return nil
+	s.stray[name] = size
+	return fmt.Errorf("delete recording file %s: %w", name, err)
 }
 
 // readMetadata reads the metadata of id through maxMetadataBytes. A file
-// that is too long or does not decode is errCorrupt.
+// that cannot be read once open, is too long or does not decode is
+// errUnusable; one that cannot be opened is not.
 func (s *Store) readMetadata(id string) (metadata, error) {
 	var meta metadata
 	file, err := os.Open(filepath.Join(s.dir, id+jsonSuffix))
@@ -676,15 +752,15 @@ func (s *Store) readMetadata(id string) (metadata, error) {
 
 	data, err := io.ReadAll(io.LimitReader(file, maxMetadataBytes+1))
 	if err != nil {
-		return meta, fmt.Errorf("read recording metadata %s: %w", id, err)
+		return meta, fmt.Errorf("%w: read %s: %w", errUnusable, id, err)
 	}
 
 	if len(data) > maxMetadataBytes {
-		return meta, fmt.Errorf("%w: %s is over %d bytes", errCorrupt, id, maxMetadataBytes)
+		return meta, fmt.Errorf("%w: %s is over %d bytes", errUnusable, id, maxMetadataBytes)
 	}
 
 	if err := json.Unmarshal(data, &meta); err != nil {
-		return meta, fmt.Errorf("%w: %s: %w", errCorrupt, id, err)
+		return meta, fmt.Errorf("%w: %s: %w", errUnusable, id, err)
 	}
 
 	return meta, nil

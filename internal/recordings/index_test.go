@@ -33,6 +33,12 @@ const (
 	nextID           = "20261125T153000Z-0000000b"
 	plantedOrphanID  = "20261125T120000Z-0000000d"
 	plantedCorruptID = "20261125T120000Z-0000000e"
+	// maxTranscriptBytes is the upstream client's bound on a transcript
+	// (internal/upstream), written out so a lowered metadata bound fails here.
+	maxTranscriptBytes = 1 << 20
+	// jsonEscapedByte is a character JSON escapes to six bytes, the worst
+	// case for the metadata bound.
+	jsonEscapedByte = "<"
 )
 
 // logBuffer collects JSON log lines from a store.
@@ -191,6 +197,14 @@ func TestSave_JSONWriteFailureRemovesTheOpus(t *testing.T) {
 
 	require.ErrorIs(t, err, errDiskFull)
 	assert.Empty(t, names(t, dir), "no audio without its metadata")
+	store.mu.Lock()
+	assert.Empty(t, store.order, "a failed save is not indexed")
+	assert.Empty(t, store.byID, "a failed save is not indexed")
+	store.mu.Unlock()
+
+	store.write = write
+	require.NoError(t, store.Save(wav(t, halfSecond), sourceOpenAI, "saved"))
+	assert.Equal(t, []string{"saved"}, transcripts(t, store))
 }
 
 func TestSave_RegeneratesACollidingID(t *testing.T) {
@@ -241,20 +255,177 @@ func TestOpen_KeepsTmpFilesItDidNotCreate(t *testing.T) {
 	}
 }
 
-func TestOpen_DeletesACorruptPairWithAWarning(t *testing.T) {
-	dir := t.TempDir()
-	store, _ := openStore(t, dir)
-	whole := save(t, store, "whole")
-	require.NoError(t, os.WriteFile(filepath.Join(dir, plantedCorruptID+opusSuffix), []byte("audio"), 0o600))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, plantedCorruptID+jsonSuffix), []byte("{not json"), 0o600))
+// plantPair writes a recording's two files with the given metadata and
+// returns their total size.
+func plantPair(t *testing.T, dir, id string, meta []byte) int64 {
+	t.Helper()
 
-	_, logs := openLogged(t, dir, (&clock{now: start}).Now)
+	audioBytes := []byte("audio")
+	require.NoError(t, os.WriteFile(filepath.Join(dir, id+opusSuffix), audioBytes, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, id+jsonSuffix), meta, 0o600))
 
-	assert.Equal(t, []string{whole.ID + jsonSuffix, whole.ID + opusSuffix}, names(t, dir))
-	warnings := logs.withMessage(t, "deleted unreadable recording")
+	return int64(len(audioBytes) + len(meta))
+}
+
+// paddedMetadata is valid metadata padded with trailing spaces to exactly
+// size bytes.
+func paddedMetadata(t *testing.T, size int) []byte {
+	t.Helper()
+
+	meta := []byte(`{"at":"2026-11-25T12:00:00Z","durationMs":500,"source":"openai","transcript":"padded","keep":true}`)
+	require.LessOrEqual(t, len(meta), size)
+
+	return append(meta, bytes.Repeat([]byte(" "), size-len(meta))...)
+}
+
+func requireLeftOnDisk(t *testing.T, logs *logBuffer, dir, id string) {
+	t.Helper()
+
+	assert.FileExists(t, filepath.Join(dir, id+opusSuffix))
+	assert.FileExists(t, filepath.Join(dir, id+jsonSuffix))
+	warnings := logs.withMessage(t, "recording left on disk: its metadata is unusable")
 	require.Len(t, warnings, 1)
 	assert.Equal(t, "WARN", warnings[0]["level"])
-	assert.Equal(t, plantedCorruptID, warnings[0]["id"])
+	assert.Equal(t, id, warnings[0]["id"])
+	assert.NotEmpty(t, warnings[0]["error"])
+}
+
+func TestOpen_KeepsARecordingWithAMaximalTranscript(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := openStore(t, dir)
+	transcript := strings.Repeat(jsonEscapedByte, maxTranscriptBytes)
+	require.NoError(t, store.Save(wav(t, halfSecond), sourceOpenAI, transcript))
+
+	reopened, logs := openLogged(t, dir, (&clock{now: start}).Now)
+
+	list, total, err := reopened.List("", 1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, total)
+	require.Len(t, list, 1)
+	assert.Equal(t, transcript, list[0].Transcript)
+	assert.Empty(t, logs.withMessage(t, "recording left on disk: its metadata is unusable"))
+}
+
+func TestOpen_LoadsMetadataOfExactlyTheLimit(t *testing.T) {
+	dir := t.TempDir()
+	plantPair(t, dir, plantedCorruptID, paddedMetadata(t, maxMetadataBytes))
+
+	store, logs := openLogged(t, dir, (&clock{now: start}).Now)
+
+	assert.Equal(t, []string{plantedCorruptID}, ids(t, store))
+	assert.Empty(t, logs.withMessage(t, "recording left on disk: its metadata is unusable"))
+}
+
+func TestOpen_LeavesMetadataOneByteOverOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	plantPair(t, dir, plantedCorruptID, paddedMetadata(t, maxMetadataBytes+1))
+
+	store, logs := openLogged(t, dir, (&clock{now: start}).Now)
+
+	assert.Empty(t, ids(t, store))
+	requireLeftOnDisk(t, logs, dir, plantedCorruptID)
+}
+
+func TestOpen_LeavesUndecodableMetadataOnDiskAndCountsIt(t *testing.T) {
+	dir := t.TempDir()
+	skippedBytes := plantPair(t, dir, plantedCorruptID, []byte("{not json"))
+
+	store, logs := openLogged(t, dir, (&clock{now: start}).Now)
+
+	assert.Empty(t, ids(t, store))
+	requireLeftOnDisk(t, logs, dir, plantedCorruptID)
+	require.NoError(t, store.Collect())
+	requireLeftOnDisk(t, logs, dir, plantedCorruptID)
+	_, err := store.Audio(plantedCorruptID)
+	require.ErrorIs(t, err, ErrNotFound)
+	require.ErrorIs(t, store.SetKeep(plantedCorruptID, true), ErrNotFound)
+
+	first := save(t, store, "first")
+	size := recordingBytes(t, dir, first)
+	// Room for the skipped pair and one recording: a second evicts the first
+	// only because the skipped pair counts.
+	store.maxBytes = skippedBytes + 2*size - 1
+	second := save(t, store, "second")
+
+	assert.Equal(t, []string{second.ID}, ids(t, store))
+	requireLeftOnDisk(t, logs, dir, plantedCorruptID)
+}
+
+func TestOpen_UnopenableMetadataFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads files whatever their mode")
+	}
+	dir := t.TempDir()
+	store, _ := openStore(t, dir)
+	rec := save(t, store, "locked")
+	metaPath := filepath.Join(dir, rec.ID+jsonSuffix)
+	require.NoError(t, os.Chmod(metaPath, 0))
+	t.Cleanup(func() { assert.NoError(t, os.Chmod(metaPath, 0o600)) })
+
+	_, err := Open(dir, (&clock{now: start}).Now, slog.New(slog.DiscardHandler))
+
+	require.ErrorIs(t, err, os.ErrPermission)
+	assert.FileExists(t, filepath.Join(dir, rec.ID+opusSuffix))
+	assert.FileExists(t, metaPath)
+}
+
+// blockAudio replaces the audio of rec with a directory that is not empty,
+// which os.Remove refuses to delete.
+func blockAudio(t *testing.T, dir string, rec *Recording) {
+	t.Helper()
+
+	audioPath := filepath.Join(dir, rec.ID+opusSuffix)
+	require.NoError(t, os.Remove(audioPath))
+	require.NoError(t, os.Mkdir(audioPath, privateDir))
+	require.NoError(t, os.WriteFile(filepath.Join(audioPath, "blocker"), []byte("x"), 0o600))
+}
+
+func TestCollect_UndeletableAudioLeavesTheIndex(t *testing.T) {
+	dir := t.TempDir()
+	store, c := openStore(t, dir)
+	stuck := save(t, store, "stuck")
+	c.advance(time.Minute)
+	other := save(t, store, "other")
+	blockAudio(t, dir, stuck)
+	c.advance(Retention + time.Hour)
+
+	err := store.Collect()
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), stuck.ID)
+	list, total, listErr := store.List("", 10)
+	require.NoError(t, listErr, "the page still lists")
+	assert.Empty(t, list)
+	assert.Zero(t, total)
+	assert.NoFileExists(t, filepath.Join(dir, stuck.ID+jsonSuffix))
+	assert.NoFileExists(t, filepath.Join(dir, other.ID+jsonSuffix), "the other expired recording is still deleted")
+	assert.NoFileExists(t, filepath.Join(dir, other.ID+opusSuffix))
+}
+
+func TestSave_UndeletableAudioStillEvictsTheRestAndFails(t *testing.T) {
+	dir := t.TempDir()
+	store, logs := openLogged(t, dir, steppingNow())
+	saved := make([]*Recording, 0, 3)
+	for _, transcript := range []string{"rec0", "rec1", "rec2"} {
+		saved = append(saved, save(t, store, transcript))
+	}
+	size := recordingBytes(t, dir, saved[2])
+	require.NoError(t, store.SetKeep(saved[2].ID, true))
+	blockAudio(t, dir, saved[0])
+	// Room for two recordings: the next save evicts both unkept ones.
+	store.maxBytes = 2*size + 1
+
+	err := store.Save(wav(t, halfSecond), sourceOpenAI, "rec3")
+
+	require.Error(t, err)
+	assert.Equal(t, []string{saved[2].ID}, ids(t, store))
+	assert.NoFileExists(t, filepath.Join(dir, saved[1].ID+opusSuffix), "the eviction after the failed one still runs")
+	store.mu.Lock()
+	assert.Contains(t, store.stray, saved[0].ID+opusSuffix, "the undeleted audio counts against the cap")
+	store.mu.Unlock()
+	warnings := logs.withMessage(t, "could not evict recording")
+	require.Len(t, warnings, 1)
+	assert.Equal(t, saved[0].ID, warnings[0]["id"])
 }
 
 // sameSizeRecordings saves count recordings a minute apart whose two files
@@ -389,6 +560,29 @@ func TestList_CursorOfADeletedRecordingStillPages(t *testing.T) {
 	page, total := listIDs(t, store, saved[1].ID, 10)
 
 	assert.Equal(t, []string{saved[0].ID}, page)
+	assert.Equal(t, 2, total)
+}
+
+func TestList_CursorOfADeletedRecordingKeepsEarlierOnesInItsSecond(t *testing.T) {
+	dir := t.TempDir()
+	c := &clock{now: start.Add(100 * time.Millisecond)}
+	store, err := Open(dir, c.Now, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	earlier := save(t, store, "earlier")
+	require.NoError(t, store.SetKeep(earlier.ID, true))
+	c.advance(400 * time.Millisecond)
+	cursor := save(t, store, "cursor")
+	c.advance(400 * time.Millisecond)
+	later := save(t, store, "later")
+	page, _ := listIDs(t, store, "", 2)
+	require.Equal(t, []string{later.ID, cursor.ID}, page)
+	store.mu.Lock()
+	require.NoError(t, store.remove(cursor.ID))
+	store.mu.Unlock()
+
+	page, total := listIDs(t, store, cursor.ID, 10)
+
+	assert.Contains(t, page, earlier.ID, "a recording saved earlier in the cursor's second is on the next page")
 	assert.Equal(t, 2, total)
 }
 

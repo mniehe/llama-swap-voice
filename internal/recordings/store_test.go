@@ -29,6 +29,8 @@ const (
 	day           = 24 * time.Hour
 	privateDir    = 0o700
 	readOnlyDir   = 0o500
+	// impossibleDateID has the shape of an id but names month 13.
+	impossibleDateID = "20261399T000000Z-00000000"
 )
 
 var start = time.Date(2026, time.November, 25, 15, 30, 0, 0, time.UTC)
@@ -261,7 +263,7 @@ func TestInvalidID_TouchesNoFile(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600))
 	}
 
-	for _, id := range []string{"x", "../x", "", "20261125T153000Z-0000000", "20261125T153000Z-0000000G", "20261125T153000Z-00000000/../x"} {
+	for _, id := range []string{"x", "../x", "", "20261125T153000Z-0000000", "20261125T153000Z-0000000G", "20261125T153000Z-00000000/../x", impossibleDateID} {
 		_, err := store.Audio(id)
 		require.ErrorIs(t, err, ErrNotFound, "audio %q", id)
 		require.ErrorIs(t, store.SetKeep(id, true), ErrNotFound, "keep %q", id)
@@ -272,6 +274,13 @@ func TestInvalidID_TouchesNoFile(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, content, string(data))
 	}
+}
+
+func TestValidID_RequiresARealTime(t *testing.T) {
+	assert.True(t, ValidID("20261125T153000Z-0123abcd"))
+	assert.False(t, ValidID(impossibleDateID), "month 13")
+	assert.False(t, ValidID("20261131T000000Z-00000000"), "31 November")
+	assert.False(t, ValidID("20261125T250000Z-00000000"), "hour 25")
 }
 
 func TestAudio_OpensTheOpusFile(t *testing.T) {
