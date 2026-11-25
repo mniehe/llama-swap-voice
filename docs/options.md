@@ -298,8 +298,10 @@ partner, and its own temporary files, `probe-<digits>.tmp` and
 alone.
 
 At start the service logs one warning for each recording whose `.json` does
-not decode, is over 7 MiB, or cannot be read once open, naming its id and
-the reason. It leaves both files of such a recording on disk for you to
+not decode, has no `keep` of `true` or `false` or no recording time, is over
+7 MiB, or cannot be read once open, and for each recording with a file whose
+size it cannot read. The warning names its id and, for a `.json`, the
+reason. It leaves both files of such a recording on disk for you to
 delete: it does not list, expire or evict it, because it cannot read its
 keep mark, but its files count toward the cap. A `.json` the service cannot
 open at all, for example because of its permissions, stops the service from
