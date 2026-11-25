@@ -3,6 +3,7 @@ package recordings
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -12,8 +13,9 @@ const (
 	// the upstream's 1 MiB bound, and room to spare.
 	maxQueuedBytes = 64 << 20
 	// queuedItemOverhead is charged for each queued recording besides its
-	// WAV and transcript: the item, its strings' headers and the slice slot,
-	// rounded up, so that many tiny recordings cannot queue for free.
+	// WAV buffer and transcript: the item, its strings' headers and the
+	// slice slot, rounded up, so that many tiny recordings cannot queue for
+	// free.
 	queuedItemOverhead = 512
 )
 
@@ -31,15 +33,16 @@ type queued struct {
 // Record queues wav for the worker to save, and owns it from then on. The
 // recording is dated now, not when the worker saves it. Record never waits
 // on the disk: when the queue would pass maxQueuedBytes it drops the
-// recording and logs a warning.
+// recording and logs a warning. The queue counts the memory it holds: the
+// whole buffer behind wav, and a copy of transcript, which may be a slice
+// of a much longer reply.
 func (s *Store) Record(wav []byte, source, transcript, requestID string) {
 	item := queued{
-		wav:        wav,
-		source:     source,
-		transcript: transcript,
-		requestID:  requestID,
-		at:         s.now(),
-		charge:     int64(len(wav)+len(transcript)) + queuedItemOverhead,
+		wav:       wav,
+		source:    source,
+		requestID: requestID,
+		at:        s.now(),
+		charge:    int64(cap(wav)+len(transcript)) + queuedItemOverhead,
 	}
 
 	s.queueMu.Lock()
@@ -49,6 +52,7 @@ func (s *Store) Record(wav []byte, source, transcript, requestID string) {
 			slog.String("request_id", requestID), slog.String("source", source), slog.Int64("bytes", item.charge))
 		return
 	}
+	item.transcript = strings.Clone(transcript)
 	s.queue = append(s.queue, item)
 	s.queuedBytes += item.charge
 	s.queueMu.Unlock()

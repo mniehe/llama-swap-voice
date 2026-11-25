@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,9 +32,10 @@ const (
 	testRequestID        = "req-42"
 )
 
-// chargeOf is what the queue charges for one recording.
+// chargeOf is what the queue charges for one recording: the WAV's whole
+// buffer, the transcript and the overhead.
 func chargeOf(wavData []byte, transcript string) int64 {
-	return int64(len(wavData)+len(transcript)) + itemOverhead
+	return int64(cap(wavData)+len(transcript)) + itemOverhead
 }
 
 // steppingNow moves a millisecond on every reading, so recordings saved one
@@ -179,6 +181,59 @@ func TestRecord_ChargesTheTranscriptAndOverhead(t *testing.T) {
 	dropped := oneUnderLogs.withMessage(t, droppedMessage)
 	require.Len(t, dropped, 1)
 	assert.InDelta(t, charge, dropped[0]["bytes"], 0)
+}
+
+func TestRecord_AfterTheWorkerSavesTheQueueTakesAnotherAtTheLimit(t *testing.T) {
+	store, logs := openLogged(t, t.TempDir(), steppingNow())
+	first := wav(t, halfSecond)
+	store.maxQueued = chargeOf(first, "first")
+	store.Record(first, sourceOpenAI, "first", testRequestID)
+	require.Equal(t, 1, queuedCount(store))
+
+	store.saveQueued(t.Context(), nil)
+
+	second := wav(t, halfSecond)
+	require.Equal(t, chargeOf(first, "first"), chargeOf(second, "again"), "both recordings charge the same")
+	store.Record(second, sourceOpenAI, "again", testRequestID)
+	assert.Empty(t, logs.withMessage(t, droppedMessage), "the save released the whole charge of the first")
+	assert.Equal(t, 1, queuedCount(store))
+}
+
+func TestRecord_ChargesTheWAVBufferNotItsLength(t *testing.T) {
+	short := wav(t, halfSecond)
+	spare := make([]byte, len(short), len(short)+4096)
+	copy(spare, short)
+	charge := int64(cap(spare)+len("spare")) + itemOverhead
+
+	atLimit, atLimitLogs := openLogged(t, t.TempDir(), steppingNow())
+	atLimit.maxQueued = charge
+	atLimit.Record(spare, sourceOpenAI, "spare", testRequestID)
+	assert.Equal(t, 1, queuedCount(atLimit))
+	assert.Empty(t, atLimitLogs.withMessage(t, droppedMessage))
+
+	oneUnder, oneUnderLogs := openLogged(t, t.TempDir(), steppingNow())
+	oneUnder.maxQueued = charge - 1
+	oneUnder.Record(spare, sourceOpenAI, "spare", testRequestID)
+	assert.Zero(t, queuedCount(oneUnder))
+	dropped := oneUnderLogs.withMessage(t, droppedMessage)
+	require.Len(t, dropped, 1)
+	assert.InDelta(t, charge, dropped[0]["bytes"], 0, "the spare capacity is charged")
+}
+
+func TestRecord_KeepsACopyOfTheTranscript(t *testing.T) {
+	store, _ := openStore(t, t.TempDir())
+	upstreamText := strings.Repeat("t", maxTranscriptBytes)
+	transcript := upstreamText[:len("turn on the lights")]
+
+	store.Record(wav(t, halfSecond), sourceOpenAI, transcript, testRequestID)
+
+	store.queueMu.Lock()
+	defer store.queueMu.Unlock()
+	require.Len(t, store.queue, 1)
+	queuedText := store.queue[0].transcript
+	assert.Equal(t, transcript, queuedText)
+	assert.NotSame(t, unsafe.StringData(upstreamText), unsafe.StringData(queuedText), "the queue does not hold the upstream's whole reply")
+	assert.Equal(t, int64(cap(store.queue[0].wav)+len(transcript))+itemOverhead, store.queuedBytes)
 }
 
 func TestRecord_DefaultQueueHoldsTheLongestUpload(t *testing.T) {
