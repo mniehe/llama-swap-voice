@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -414,6 +415,34 @@ func TestServiceConfig_Validate_RecordingsAllowedHostsRejected(t *testing.T) {
 
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "recordings.allowedhosts")
+		})
+	}
+}
+
+func TestServiceConfig_Validate_RecordingsAllowedHostBounds(t *testing.T) {
+	for _, entry := range []string{"voice.example:1", "voice.example:65535", "[::1]:1"} {
+		t.Run(entry, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.Recordings = RecordingsConfig{Enable: true, Dir: "/var/lib/llama-swap-voice/recordings", AllowedHosts: entry}
+
+			require.NoError(t, cfg.Validate())
+		})
+	}
+
+	for entry, reason := range map[string]string{
+		"[voice.example]":     "is not an IPv6 address in brackets",
+		"[::1":                "is not an IPv6 address in brackets",
+		"voice.example:65536": "has a port that is not between 1 and 65535",
+		"voice.example:0":     "has a port that is not between 1 and 65535",
+	} {
+		t.Run(entry, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.Recordings = RecordingsConfig{Enable: true, Dir: "/var/lib/llama-swap-voice/recordings", AllowedHosts: entry}
+
+			err := cfg.Validate()
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), fmt.Sprintf("recordings.allowedhosts entry %q %s", entry, reason))
 		})
 	}
 }

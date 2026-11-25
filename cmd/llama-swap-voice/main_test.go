@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -1277,9 +1278,14 @@ func TestServe_RecordingsOn_AnswersOnlyAllowedHosts(t *testing.T) {
 	cfg := validConfig(t)
 	recordingsOn(t, &cfg)
 	cfg.Recordings.AllowedHosts = "voice.example"
+	// The listener still binds loopback; only the allow-list sees this host.
+	cfg.Host = "listen.example"
 	s := startServe(t, &cfg, serviceFor(t, &cfg, serveASR, &http.Client{}))
 	waitReady(t, s.base)
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(s.base, "http://"))
+	require.NoError(t, err)
 
+	assert.Equal(t, http.StatusOK, statusAs(t, s.base+"/recordings", net.JoinHostPort("listen.example", port)), "the listen host")
 	assert.Equal(t, http.StatusOK, statusAs(t, s.base+"/recordings", "voice.example"))
 	assert.Equal(t, http.StatusOK, statusAs(t, s.base+"/recordings", "voice.example:443"))
 	assert.Equal(t, http.StatusOK, statusAs(t, s.base+"/recordings", strings.TrimPrefix(s.base, "http://")))
@@ -1381,70 +1387,115 @@ func TestServe_StartsTheRecordingsRunAndWaitsForIt(t *testing.T) {
 	}
 }
 
+// synctestDeadline is how far ahead the startRecordings tests set the
+// shutdown deadline; time in a synctest bubble moves only when every
+// goroutine in it is blocked, so its length costs nothing.
+const synctestDeadline = time.Minute
+
 func TestStartRecordings_StopWaitsForTheRun(t *testing.T) {
-	release, returned := make(chan struct{}), make(chan struct{})
-	stop := startRecordings(func(ctx, _ context.Context) {
-		<-ctx.Done()
-		<-release
-		close(returned)
-	}, slog.New(slog.DiscardHandler))
+	synctest.Test(t, func(t *testing.T) {
+		release, returned := make(chan struct{}), make(chan struct{})
+		stop := startRecordings(func(ctx, _ context.Context) {
+			<-ctx.Done()
+			<-release
+			close(returned)
+		}, slog.New(slog.DiscardHandler))
 
-	stopped := make(chan struct{})
-	go func() {
-		defer close(stopped)
-		stop(time.Now().Add(time.Minute))
-	}()
+		stopped := make(chan struct{})
+		go func() {
+			defer close(stopped)
+			stop(time.Now().Add(synctestDeadline))
+		}()
 
-	select {
-	case <-stopped:
-		require.FailNow(t, "stop returned while the run was still running")
-	case <-time.After(stopWaitCheck):
-	}
-	close(release)
-	select {
-	case <-stopped:
-	case <-time.After(probeTimeout):
-		require.FailNow(t, "stop did not return after the run did")
-	}
-	select {
-	case <-returned:
-	default:
-		require.FailNow(t, "stop returned before the run did")
-	}
+		synctest.Wait()
+		select {
+		case <-stopped:
+			require.FailNow(t, "stop returned while the run was still running")
+		default:
+		}
+		close(release)
+		synctest.Wait()
+		select {
+		case <-stopped:
+		default:
+			require.FailNow(t, "stop did not return after the run did")
+		}
+		select {
+		case <-returned:
+		default:
+			require.FailNow(t, "stop returned before the run did")
+		}
+	})
 }
 
 func TestStartRecordings_DrainEndsAtTheDeadline(t *testing.T) {
-	drained := make(chan time.Time, 1)
-	stop := startRecordings(func(ctx, drain context.Context) {
-		<-ctx.Done()
-		<-drain.Done()
-		drained <- time.Now()
-	}, slog.New(slog.DiscardHandler))
-	deadline := time.Now().Add(stopWaitCheck)
+	synctest.Test(t, func(t *testing.T) {
+		drained := make(chan time.Time, 1)
+		stop := startRecordings(func(ctx, drain context.Context) {
+			<-ctx.Done()
+			<-drain.Done()
+			drained <- time.Now()
+		}, slog.New(slog.DiscardHandler))
+		deadline := time.Now().Add(synctestDeadline)
 
-	stop(deadline)
+		stop(deadline)
 
-	select {
-	case at := <-drained:
-		assert.False(t, at.Before(deadline), "drain ended %s before the deadline", deadline.Sub(at))
-	case <-time.After(probeTimeout):
-		require.FailNow(t, "the drain never ended")
-	}
+		assert.Equal(t, deadline, <-drained, "the drain ends at the deadline, not before")
+	})
 }
 
 func TestStartRecordings_StopGivesUpAtTheDeadline(t *testing.T) {
-	logs := &syncBuffer{}
-	block := make(chan struct{})
-	t.Cleanup(func() { close(block) })
-	stop := startRecordings(func(context.Context, context.Context) { <-block }, slog.New(slog.NewJSONHandler(logs, nil)))
+	synctest.Test(t, func(t *testing.T) {
+		logs := &syncBuffer{}
+		block := make(chan struct{})
+		defer close(block)
+		stop := startRecordings(func(context.Context, context.Context) { <-block }, slog.New(slog.NewJSONHandler(logs, nil)))
 
-	began := time.Now()
-	stop(began.Add(stopWaitCheck))
+		began := time.Now()
+		stop(began.Add(synctestDeadline))
 
-	elapsed := time.Since(began)
-	assert.GreaterOrEqual(t, elapsed, stopWaitCheck)
-	assert.Less(t, elapsed, probeTimeout)
-	assert.Contains(t, logs.String(), "recordings still saving at the shutdown deadline")
+		assert.Equal(t, synctestDeadline, time.Since(began), "stop returns at the deadline")
+		assert.Contains(t, logs.String(), "recordings still saving at the shutdown deadline")
+	})
+}
+
+const (
+	// drainTotal and drainHard are the shutdown budget of the drain test:
+	// Total is long enough that a deadline counted from the end of
+	// shutdown, Total later, misses the slack.
+	drainTotal = time.Second
+	drainHard  = 300 * time.Millisecond
+)
+
+func TestServe_RecordingsDrainDeadlineRunsFromShutdownStart(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.ShutdownTiming = ShutdownTimingConfig{Total: drainTotal, Hard: drainHard}
+	paused := make(chan struct{})
+	service := serviceFor(t, &cfg, func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.WriteString(w, slowAudio)
+		assert.NoError(t, err)
+		assert.NoError(t, http.NewResponseController(w).Flush())
+		close(paused)
+		<-r.Context().Done()
+	}, &http.Client{})
+	drainEnded := make(chan time.Time, 1)
+	service.runRecordings = func(ctx, drain context.Context) {
+		<-ctx.Done()
+		<-drain.Done()
+		drainEnded <- time.Now()
+	}
+	// The stuck request holds shutdown for all of Total, so shutdown ends
+	// Total after it starts.
+	s := stuckSpeech(t, &cfg, service, paused)
+	signalled := time.Now()
+	s.cancel()
+
+	budget := drainTotal + drainHard
+	require.NoError(t, requireServeReturns(t, s.done, budget+probeTimeout))
+	ended := <-drainEnded
+
+	assert.GreaterOrEqual(t, ended.Sub(signalled), budget, "the drain lasts the whole budget")
+	assert.Less(t, ended.Sub(signalled), budget+shutdownSlack, "the budget counts from the start of shutdown, not its end")
 }
 
 func TestStartRecordings_RecordingsOffIsNoOp(t *testing.T) {
