@@ -28,7 +28,8 @@ type Server struct {
 	controlTimeout time.Duration
 	// recordings is nil when recordings are off, and then its routes are not
 	// registered.
-	recordings *recordings.Store
+	recordings     *recordings.Store
+	recordingHosts *hostAllowList
 }
 
 func New(p *pipeline.Pipeline, log *slog.Logger, opts ...Option) *Server {

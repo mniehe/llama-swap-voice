@@ -1238,6 +1238,35 @@ func TestServe_RecordingsOn_SavesWyomingTranscriptionAsWyoming(t *testing.T) {
 	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
 }
 
+// statusAs is the status of a GET of url sent with Host set to host.
+func statusAs(t *testing.T, url, host string) int {
+	t.Helper()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
+	require.NoError(t, err)
+	req.Host = host
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
+
+	return resp.StatusCode
+}
+
+func TestServe_RecordingsOn_AnswersOnlyAllowedHosts(t *testing.T) {
+	cfg := validConfig(t)
+	recordingsOn(t, &cfg)
+	cfg.Recordings.AllowedHosts = "voice.example"
+	s := startServe(t, &cfg, serviceFor(t, &cfg, serveASR, &http.Client{}))
+	waitReady(t, s.base)
+
+	assert.Equal(t, http.StatusOK, statusAs(t, s.base+"/recordings", "voice.example"))
+	assert.Equal(t, http.StatusOK, statusAs(t, s.base+"/recordings", "voice.example:443"))
+	assert.Equal(t, http.StatusOK, statusAs(t, s.base+"/recordings", strings.TrimPrefix(s.base, "http://")))
+	assert.Equal(t, http.StatusForbidden, statusAs(t, s.base+"/recordings", "evil.example"))
+	s.cancel()
+	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+}
+
 func TestNewServices_RecordingsDirUnwritable_FailsWrapped(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root writes to a read-only directory")

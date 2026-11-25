@@ -251,6 +251,11 @@ in
           assert meta["durationMs"] > 0, meta
           print(qwentts.succeed(f"opusinfo {RECORDINGS}/{recording_id}.opus"))
 
+          status = qwentts.succeed(
+              "curl -sS -o /dev/null -w '%{http_code}' -H 'Host: rebound.example' http://127.0.0.1:8920/recordings"
+          ).strip()
+          assert status == "403", f"a foreign Host got {status}"
+
           page = qwentts.succeed("curl -sSf http://127.0.0.1:8920/recordings")
           assert transcript in page, page
           assert f"/recordings/{recording_id}/audio" in page, page

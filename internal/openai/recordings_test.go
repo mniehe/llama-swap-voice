@@ -49,11 +49,19 @@ func newRecordingHarness(t *testing.T, transcript string) (*harness, *recordings
 func newRecordingHarnessIn(t *testing.T, dir, transcript string) (*harness, *recordings.Store) {
 	t.Helper()
 
+	return newRecordingHarnessAllowing(t, dir, transcript, nil)
+}
+
+// newRecordingHarnessAllowing is newRecordingHarnessIn with hosts allowed on
+// the recordings routes besides loopback.
+func newRecordingHarnessAllowing(t *testing.T, dir, transcript string, hosts []string) (*harness, *recordings.Store) {
+	t.Helper()
+
 	store, err := recordings.Open(dir, steppingClock(), discardLogger())
 	require.NoError(t, err)
 
 	h := newHarness(t, serveTranscript(t, transcript), func(cfg *Config) { cfg.Recorder = store })
-	h.service = New(h.pipeline, discardLogger(), WithRecordings(store))
+	h.service = New(h.pipeline, discardLogger(), WithRecordings(store, hosts))
 	h.server.Config.Handler = h.service.Handler()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -402,4 +410,113 @@ func TestRecordingAudio_UnreadableFileIsServerError(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
 	assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"))
 	assert.Equal(t, "could not read the recording", errorMessage(t, resp))
+}
+
+// requestAs sends method to path with the Host header set to host and the
+// given extra headers, and returns the response without following a
+// redirect.
+func (h *harness) requestAs(method, path, host, body string, headers map[string]string) *http.Response {
+	h.t.Helper()
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req, err := http.NewRequestWithContext(h.t.Context(), method, h.server.URL+path, strings.NewReader(body))
+	require.NoError(h.t, err)
+	req.Host = host
+	if body != "" {
+		req.Header.Set("Content-Type", contentTypeForm)
+	}
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
+	resp, err := client.Do(req)
+	require.NoError(h.t, err)
+	h.t.Cleanup(func() { closeQuietly(h.t, resp.Body) })
+
+	return resp
+}
+
+// recordingRequest is one request to each recordings route.
+type recordingRequest struct {
+	method string
+	path   string
+	body   string
+}
+
+func recordingRequests(id string) []recordingRequest {
+	return []recordingRequest{
+		{http.MethodGet, recordingsPath, ""},
+		{http.MethodGet, recordingsPath + "/" + id + "/audio", ""},
+		{http.MethodPost, recordingsPath + "/" + id + "/keep", "keep=true"},
+	}
+}
+
+func TestRecordingRoutes_ForeignHostIsForbidden(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessAllowing(t, dir, recordedText, []string{"voice.example", "proxy.example:8443"})
+
+	for _, host := range []string{"evil.example", "evil.example:8920", "voice.example.evil.example", "proxy.example", "proxy.example:443", "127.0.0.2"} {
+		for _, req := range recordingRequests(ids[0]) {
+			resp := h.requestAs(req.method, req.path, host, req.body, map[string]string{"X-Forwarded-Host": "127.0.0.1"})
+
+			assert.Equal(t, http.StatusForbidden, resp.StatusCode, "%s %s as %s", req.method, req.path, host)
+			assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"))
+			assert.NotEmpty(t, errorMessage(t, resp))
+		}
+	}
+	assert.False(t, onlyRecording(t, store).Keep)
+}
+
+func TestRecordingRoutes_AllowedHostsAreServed(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, _ := newRecordingHarnessAllowing(t, dir, recordedText, []string{"Voice.Example", "proxy.example:8443"})
+
+	for _, host := range []string{"127.0.0.1", "127.0.0.1:8920", "localhost", "localhost:8920", "[::1]", "[::1]:8920", "voice.example", "VOICE.example:443", "proxy.example:8443"} {
+		page := h.requestAs(http.MethodGet, recordingsPath, host, "", nil)
+		assert.Equal(t, http.StatusOK, page.StatusCode, "page as %s", host)
+
+		audio := h.requestAs(http.MethodGet, recordingsPath+"/"+ids[0]+"/audio", host, "", nil)
+		assert.Equal(t, http.StatusOK, audio.StatusCode, "audio as %s", host)
+
+		keep := h.requestAs(http.MethodPost, recordingsPath+"/"+ids[0]+"/keep", host, "keep=true", nil)
+		assert.Equal(t, http.StatusSeeOther, keep.StatusCode, "keep as %s", host)
+	}
+}
+
+func TestRecordingKeep_CrossSiteIsForbidden(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+	path := recordingsPath + "/" + ids[0] + "/keep"
+
+	for name, headers := range map[string]map[string]string{
+		"cross-site fetch": {"Sec-Fetch-Site": "cross-site"},
+		"same-site fetch":  {"Sec-Fetch-Site": "same-site"},
+		"foreign origin":   {"Origin": "http://evil.example"},
+	} {
+		resp := h.requestAs(http.MethodPost, path, "127.0.0.1", "keep=true", headers)
+
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode, name)
+		assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"), name)
+		assert.NotEmpty(t, errorMessage(t, resp), name)
+	}
+	assert.False(t, onlyRecording(t, store).Keep)
+
+	sameOrigin := h.requestAs(http.MethodPost, path, "127.0.0.1", "keep=true", map[string]string{"Sec-Fetch-Site": "same-origin"})
+	assert.Equal(t, http.StatusSeeOther, sameOrigin.StatusCode, "the page's own form")
+}
+
+func TestRecordingKeep_DuplicateValueIsBadRequest(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+
+	for _, form := range []string{"keep=true&keep=true", "keep=true&keep=false", "keep=false&keep=true"} {
+		resp := h.requestAs(http.MethodPost, recordingsPath+"/"+ids[0]+"/keep", "127.0.0.1", form, nil)
+
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "form %q", form)
+		assert.Contains(t, errorMessage(t, resp), "keep", "form %q", form)
+	}
+	assert.False(t, onlyRecording(t, store).Keep)
 }

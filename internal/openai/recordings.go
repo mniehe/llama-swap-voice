@@ -8,8 +8,10 @@ import (
 	"html/template"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mniehe/llama-swap-voice/internal/recordings"
@@ -62,10 +64,12 @@ type recordingsView struct {
 type Option func(*Server)
 
 // WithRecordings serves the recordings page and its audio and keep routes
-// from store.
-func WithRecordings(store *recordings.Store) Option {
+// from store, to requests whose Host header names loopback or one of hosts.
+// An entry of hosts is a bare host, matching any port, or a host:port.
+func WithRecordings(store *recordings.Store, hosts []string) Option {
 	return func(s *Server) {
 		s.recordings = store
+		s.recordingHosts = newHostAllowList(hosts)
 	}
 }
 
@@ -74,10 +78,29 @@ func (s *Server) recordingRoutes() []route {
 		return nil
 	}
 
+	protection := http.NewCrossOriginProtection()
+	protection.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		s.writeError(w, http.StatusForbidden, errors.New("cross-origin request refused"))
+	}))
+	keep := protection.Handler(http.HandlerFunc(s.handleRecordingKeep))
+
 	return []route{
-		{http.MethodGet, recordingsRoute, s.handleRecordings},
-		{http.MethodGet, recordingsRoute + "/{" + recordingIDKey + "}/audio", s.handleRecordingAudio},
-		{http.MethodPost, recordingsRoute + "/{" + recordingIDKey + "}/keep", s.handleRecordingKeep},
+		{http.MethodGet, recordingsRoute, s.allowedHost(s.handleRecordings)},
+		{http.MethodGet, recordingsRoute + "/{" + recordingIDKey + "}/audio", s.allowedHost(s.handleRecordingAudio)},
+		{http.MethodPost, recordingsRoute + "/{" + recordingIDKey + "}/keep", s.allowedHost(keep.ServeHTTP)},
+	}
+}
+
+// allowedHost answers 403 unless the request's Host header is on the
+// recordings allow-list.
+func (s *Server) allowedHost(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.recordingHosts.allows(r.Host) {
+			s.writeError(w, http.StatusForbidden, fmt.Errorf("host %q may not reach the recordings", r.Host))
+			return
+		}
+
+		next(w, r)
 	}
 }
 
@@ -183,8 +206,14 @@ func (s *Server) handleRecordingKeep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	values := r.PostForm[keepFieldName]
+	if len(values) != 1 {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("give %s exactly once, got %d values", keepFieldName, len(values)))
+		return
+	}
+
 	var keep bool
-	switch value := r.PostFormValue(keepFieldName); value {
+	switch value := values[0]; value {
 	case keepOn:
 		keep = true
 	case keepOff:
@@ -210,4 +239,57 @@ func (s *Server) recordingFailure(w http.ResponseWriter, r *http.Request, err er
 
 	s.log.Error("recording request failed", slog.String("request_id", record(r).id), slog.Any("error", err))
 	s.writeError(w, http.StatusInternalServerError, errors.New("could not read the recording"))
+}
+
+// loopbackHosts reach the recordings routes whatever the configuration.
+var loopbackHosts = []string{"127.0.0.1", "::1", "localhost"}
+
+// hostAllowList holds the authorities a recordings request may name in its
+// Host header. A DNS-rebinding page reaches the service under its own name,
+// so the Host header, never X-Forwarded-Host, decides.
+type hostAllowList struct {
+	// anyPort holds hosts that match on every port, without brackets.
+	anyPort map[string]bool
+	// exact holds host:port authorities that match only on that port.
+	exact map[string]bool
+}
+
+// newHostAllowList takes entries that are a bare host, which matches on any
+// port, or a host:port, which matches only that authority.
+func newHostAllowList(entries []string) *hostAllowList {
+	list := &hostAllowList{anyPort: map[string]bool{}, exact: map[string]bool{}}
+	for _, entry := range append(append([]string(nil), loopbackHosts...), entries...) {
+		list.add(entry)
+	}
+
+	return list
+}
+
+func (l *hostAllowList) add(entry string) {
+	entry = strings.ToLower(strings.TrimSpace(entry))
+	if entry == "" {
+		return
+	}
+
+	if host, port, err := net.SplitHostPort(entry); err == nil {
+		l.exact[net.JoinHostPort(host, port)] = true
+		return
+	}
+
+	l.anyPort[strings.Trim(entry, "[]")] = true
+}
+
+func (l *hostAllowList) allows(authority string) bool {
+	authority = strings.ToLower(authority)
+
+	host, port, err := net.SplitHostPort(authority)
+	if err != nil {
+		host, port = strings.Trim(authority, "[]"), ""
+	}
+
+	if host != "" && l.anyPort[host] {
+		return true
+	}
+
+	return port != "" && l.exact[net.JoinHostPort(host, port)]
 }

@@ -113,7 +113,7 @@ func newServices(cfg *ServiceConfig, voiceFiles map[string]string, client *upstr
 	var options []openai.Option
 	if store != nil {
 		serverCfg.Recorder = store
-		options = append(options, openai.WithRecordings(store))
+		options = append(options, openai.WithRecordings(store, cfg.recordingHosts()))
 	}
 
 	pipe, err := pipeline.New(&serverCfg, client, serverLogger)

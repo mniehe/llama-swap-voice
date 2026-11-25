@@ -398,6 +398,45 @@
       "RECORDINGS_ENABLE ${show (env."${prefix}RECORDINGS_ENABLE" or null)}; RECORDINGS_DIR ${show (env."${prefix}RECORDINGS_DIR" or null)}; rule ${show rule}; ReadWritePaths ${show (service.ReadWritePaths or null)}")
 
     (evaluates "recordings.enable evaluates to a system" (base // {recordings.enable = true;}))
+
+    (let
+      env = serviceEnv (base
+        // {
+          recordings = {
+            enable = true;
+            allowedHosts = ["voice.example" "proxy.example:8443"];
+          };
+        });
+    in
+      holds "recordings.allowedHosts sets RECORDINGS_ALLOWEDHOSTS as a comma-separated list"
+      (env."${prefix}RECORDINGS_ALLOWEDHOSTS" or null == "voice.example,proxy.example:8443")
+      "RECORDINGS_ALLOWEDHOSTS ${show (env."${prefix}RECORDINGS_ALLOWEDHOSTS" or null)}")
+
+    (let
+      env = serviceEnv (base // {recordings.allowedHosts = ["voice.example"];});
+    in
+      holds "recordings.allowedHosts writes nothing while recordings are off"
+      (!(env ? "${prefix}RECORDINGS_ALLOWEDHOSTS"))
+      "RECORDINGS_ALLOWEDHOSTS ${show (env."${prefix}RECORDINGS_ALLOWEDHOSTS" or null)}")
+
+    (refusesElement "a recordings.allowedHosts entry with a comma is refused" ["recordings" "allowedHosts"] "a.example,b.example")
+    (refusesElement "a recordings.allowedHosts entry with a space is refused" ["recordings" "allowedHosts"] "voice example")
+    (refusesElement "a recordings.allowedHosts entry with a scheme is refused" ["recordings" "allowedHosts"] "https://voice.example")
+    (acceptsElement "a recordings.allowedHosts entry with a port is accepted" ["recordings" "allowedHosts"] "voice.example:8443")
+
+    (failsWith "RECORDINGS_ENABLE in extraEnvironment fails naming recordings.enable"
+      (base // {extraEnvironment."${prefix}RECORDINGS_ENABLE" = "true";})
+      ["${opt}.extraEnvironment.${prefix}RECORDINGS_ENABLE" "${opt}.recordings.enable"])
+    (failsWith "RECORDINGS_DIR in extraEnvironment fails naming stateDir"
+      (base // {extraEnvironment."${prefix}RECORDINGS_DIR" = "/srv/elsewhere";})
+      ["${opt}.extraEnvironment.${prefix}RECORDINGS_DIR" "${opt}.stateDir"])
+    (failsWith "RECORDINGS_ALLOWEDHOSTS in extraEnvironment fails naming recordings.allowedHosts"
+      (base
+        // {
+          recordings.enable = true;
+          extraEnvironment."${prefix}RECORDINGS_ALLOWEDHOSTS" = "voice.example";
+        })
+      ["${opt}.extraEnvironment.${prefix}RECORDINGS_ALLOWEDHOSTS" "${opt}.recordings.allowedHosts"])
   ];
 
   # A consumer's own llama-swap configuration, in the legacy group layout.

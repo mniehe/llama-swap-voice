@@ -333,7 +333,30 @@ flakeSelf: {
     // lib.optionalAttrs cfg.recordings.enable {
       RECORDINGS_ENABLE = "true";
       RECORDINGS_DIR = recordingsDir;
+      RECORDINGS_ALLOWEDHOSTS = lib.concatStringsSep "," cfg.recordings.allowedHosts;
     };
+
+  # The recordings directory, its tmpfiles rule and its sandbox exception
+  # follow the options, so an override of these variables would split the
+  # service from them.
+  recordingsVariables = {
+    RECORDINGS_ENABLE = "${opt}.recordings.enable";
+    RECORDINGS_DIR = "${opt}.recordings.enable and ${opt}.stateDir";
+    RECORDINGS_ALLOWEDHOSTS = "${opt}.recordings.allowedHosts";
+  };
+
+  recordingsAssertions =
+    lib.mapAttrsToList (name: options: {
+      assertion = !(cfg.extraEnvironment ? "${envPrefix}${name}");
+      message = "${opt}.extraEnvironment.${envPrefix}${name} is set; use ${options} instead, because the recordings directory and the sandbox follow the options, not the variable.";
+    })
+    recordingsVariables;
+
+  # What a Host header carries, joined with commas into one variable: the
+  # service checks the rest when it starts.
+  allowedHost =
+    types.strMatching "[^,/[:space:]]+"
+    // {description = "host or host:port without a comma, a slash or a space";};
 
   # Every character Go's unicode.IsSpace accepts. Nix strings have no \u
   # escape, so JSON decodes each code point.
@@ -641,6 +664,21 @@ in {
       '';
     };
 
+    recordings.allowedHosts = mkOption {
+      type = types.listOf allowedHost;
+      default = [];
+      example = ["voice.example.org" "voice.example.org:8443"];
+      description = ''
+        Hosts the recordings routes answer besides loopback (127.0.0.1,
+        [::1], localhost) and host (RECORDINGS_ALLOWEDHOSTS). Any other Host
+        header gets a 403, which stops DNS rebinding. An entry without a port
+        matches the host on every port; host:port matches that port only.
+        A reverse proxy must pass the public Host through unchanged, and that
+        host must be listed here; the service never reads X-Forwarded-Host.
+        Written only when recordings.enable is on.
+      '';
+    };
+
     voices = mkOption {
       type = types.attrsOf voiceModule;
       default = {};
@@ -688,7 +726,9 @@ in {
         checks every other override, the Wyoming variables included, when it
         starts, and refuses to start on a bad value. The check that the
         Wyoming host and port differ from the HTTP ones compares the
-        options, not overrides.
+        options, not overrides. Evaluation refuses the RECORDINGS_ENABLE,
+        RECORDINGS_DIR and RECORDINGS_ALLOWEDHOSTS variables here; set them
+        through recordings.enable, stateDir and recordings.allowedHosts.
       '';
     };
   };
@@ -707,6 +747,7 @@ in {
       ]
       ++ lib.concatLists (lib.mapAttrsToList voiceAssertions cfg.voices)
       ++ checkedAssertions
+      ++ recordingsAssertions
       ++ lib.optionals cfg.wyoming.enable wyomingAssertions;
 
     networking.firewall.allowedTCPPorts = lib.mkIf (cfg.wyoming.enable && cfg.wyoming.openFirewall) [cfg.wyoming.port];
