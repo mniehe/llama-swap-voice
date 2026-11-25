@@ -353,14 +353,35 @@ flakeSelf: {
   recordingsOverrideInert = name: value:
     !cfg.recordings.enable && (name != "RECORDINGS_ENABLE" || lib.elem value falseSpellings);
 
-  recordingsAssertions =
-    lib.mapAttrsToList (name: options: let
-      value = cfg.extraEnvironment."${envPrefix}${name}" or null;
-    in {
-      assertion = value == null || recordingsOverrideInert name value;
-      message = "${opt}.extraEnvironment.${envPrefix}${name} is \"${toString value}\"; use ${options} instead, because the recordings directory and the sandbox follow the options, not the variable. Only an override that leaves recordings off is accepted while ${opt}.recordings.enable is false.";
+  # The key the service reads a variable as: internal/config/config.go keeps
+  # names with the exact prefix, lower-cases the rest and reads "_" as ".".
+  serviceKey = suffix: builtins.replaceStrings ["_"] ["."] (lib.toLower suffix);
+
+  # Each extraEnvironment entry the service reads as a recordings variable,
+  # whatever its spelling, with the variable's canonical name.
+  recordingsOverrides = lib.concatLists (lib.mapAttrsToList (key: value: let
+    suffix = lib.removePrefix envPrefix key;
+    names = lib.filter (name: serviceKey name == serviceKey suffix) (lib.attrNames recordingsVariables);
+  in
+    lib.optional (lib.hasPrefix envPrefix key && names != []) {
+      inherit key value suffix;
+      name = lib.head names;
     })
-    recordingsVariables;
+  cfg.extraEnvironment);
+
+  recordingsAssertions = map (override: let
+    inherit (override) key name value;
+  in
+    if override.suffix != name
+    then {
+      assertion = false;
+      message = "${opt}.extraEnvironment.${key} is read by the service as ${envPrefix}${name}; spell it ${envPrefix}${name}, so that the module can check it.";
+    }
+    else {
+      assertion = recordingsOverrideInert name value;
+      message = "${opt}.extraEnvironment.${key} is \"${toString value}\"; use ${recordingsVariables.${name}} instead, because the recordings directory and the sandbox follow the options, not the variable. Only an override that leaves recordings off is accepted while ${opt}.recordings.enable is false.";
+    })
+  recordingsOverrides;
 
   # What a Host header carries, joined with commas into one variable: the
   # service checks the rest when it starts.

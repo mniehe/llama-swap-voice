@@ -1126,7 +1126,43 @@
       holds "wyoming.openFirewall without wyoming.enable opens no port" (ports == []) "allowedTCPPorts is ${show ports}")
   ];
 
-  allCases = cases ++ swapCases ++ wyomingCases;
+  # Go's strconv.ParseBool spellings, written out here so that a changed
+  # list in the module fails a case.
+  falseSpellings = ["" "0" "f" "F" "false" "FALSE" "False"];
+  trueSpellings = ["1" "t" "T" "TRUE" "true" "True"];
+
+  recordingsSpellingCases =
+    map (value:
+      evaluates "RECORDINGS_ENABLE = ${show value} in extraEnvironment is accepted while recordings are off"
+      (base // {extraEnvironment."${prefix}RECORDINGS_ENABLE" = value;}))
+    falseSpellings
+    ++ map (value:
+      failsWith "RECORDINGS_ENABLE = ${show value} in extraEnvironment turns recordings on and fails"
+      (base // {extraEnvironment."${prefix}RECORDINGS_ENABLE" = value;})
+      ["${opt}.extraEnvironment.${prefix}RECORDINGS_ENABLE" "${opt}.recordings.enable"])
+    trueSpellings
+    ++ [
+      (failsWith "a mixed-case RECORDINGS_ENABLE in extraEnvironment is refused, naming the canonical key"
+        (base // {extraEnvironment."${prefix}Recordings_Enable" = "true";})
+        ["${opt}.extraEnvironment.${prefix}Recordings_Enable" "${prefix}RECORDINGS_ENABLE"])
+      (failsWith "a lower-case RECORDINGS_ENABLE set to false is refused too"
+        (base // {extraEnvironment."${prefix}recordings_enable" = "false";})
+        ["${opt}.extraEnvironment.${prefix}recordings_enable" "${prefix}RECORDINGS_ENABLE"])
+      (failsWith "RECORDINGS_DIR spelt with a dot is refused, naming the canonical key"
+        (base // {extraEnvironment."${prefix}RECORDINGS.DIR" = "/srv/elsewhere";})
+        ["${opt}.extraEnvironment.${prefix}RECORDINGS.DIR" "${prefix}RECORDINGS_DIR"])
+      (failsWith "a mixed-case RECORDINGS_ALLOWEDHOSTS is refused while recordings are on"
+        (base
+          // {
+            recordings.enable = true;
+            extraEnvironment."${prefix}Recordings_AllowedHosts" = "voice.example";
+          })
+        ["${opt}.extraEnvironment.${prefix}Recordings_AllowedHosts" "${prefix}RECORDINGS_ALLOWEDHOSTS"])
+      (evaluates "a key whose prefix is not the service's exact prefix is not a recordings variable"
+        (base // {extraEnvironment."llama_swap_voice_RECORDINGS_ENABLE" = "true";}))
+    ];
+
+  allCases = cases ++ recordingsSpellingCases ++ swapCases ++ wyomingCases;
 
   report = lib.concatMapStrings (c:
     if c.ok
