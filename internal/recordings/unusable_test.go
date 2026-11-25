@@ -245,9 +245,20 @@ func TestCollect_AnIncompleteScanKeepsASkippedPairsLastSize(t *testing.T) {
 	assert.Equal(t, skippedBytes, counted, "a half the scan could not stat is not counted as empty")
 }
 
+// requireUnreadableWarning checks that the store warned once that it left
+// the pair id on disk because its files could not be read.
+func requireUnreadableWarning(t *testing.T, logs *logBuffer, id string) {
+	t.Helper()
+
+	warnings := logs.withMessage(t, "recording left on disk: its files cannot be read")
+	require.Len(t, warnings, 1)
+	assert.Equal(t, "WARN", warnings[0]["level"])
+	assert.Equal(t, id, warnings[0]["id"])
+}
+
 func TestOpen_AnUnstattablePairIsLeftOnDisk(t *testing.T) {
 	dir := t.TempDir()
-	store, _ := openStore(t, dir)
+	store, logs := openLogged(t, dir, (&clock{now: start}).Now)
 	planted := plantPair(t, dir, skippedOldID, []byte(`{"at":"2026-11-01T00:00:00Z","durationMs":500,"source":"openai","transcript":"x","keep":true}`))
 	failStat(store, skippedOldID+jsonSuffix)
 
@@ -259,6 +270,26 @@ func TestOpen_AnUnstattablePairIsLeftOnDisk(t *testing.T) {
 	counted, ok := skippedBytesOf(store, skippedOldID)
 	require.True(t, ok)
 	assert.Equal(t, planted-int64(len(`{"at":"2026-11-01T00:00:00Z","durationMs":500,"source":"openai","transcript":"x","keep":true}`)), counted, "what could be stat'd counts")
+	requireUnreadableWarning(t, logs, skippedOldID)
+}
+
+func TestOpen_APairWithUnstattableAudioIsLeftOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	store, logs := openLogged(t, dir, (&clock{now: start}).Now)
+	meta := []byte(`{"at":"2026-11-01T00:00:00Z","durationMs":500,"source":"openai","transcript":"x","keep":false}`)
+	plantPair(t, dir, skippedOldID, meta)
+	failStat(store, skippedOldID+opusSuffix)
+
+	require.NoError(t, store.load())
+	require.NoError(t, store.Collect())
+
+	assert.FileExists(t, filepath.Join(dir, skippedOldID+opusSuffix), "audio that could not be stat'd is kept")
+	assert.FileExists(t, filepath.Join(dir, skippedOldID+jsonSuffix), "expired metadata beside it is kept too")
+	assert.NotContains(t, ids(t, store), skippedOldID)
+	counted, ok := skippedBytesOf(store, skippedOldID)
+	require.True(t, ok, "the pair is counted as skipped")
+	assert.Equal(t, int64(len(meta)), counted, "what could be stat'd counts")
+	requireUnreadableWarning(t, logs, skippedOldID)
 }
 
 func TestCollect_NeverDeletesAFileItCouldNotStat(t *testing.T) {
