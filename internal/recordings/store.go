@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mniehe/llama-swap-voice/internal/audio"
 )
@@ -36,6 +37,10 @@ const (
 	// maxIDAttempts bounds the redraws of an id already in the store, which
 	// a 32-bit random suffix makes all but impossible.
 	maxIDAttempts = 8
+	// maxPreviewBytes bounds the transcript List returns for each recording,
+	// so a page of transcripts at the upstream's 1 MiB bound stays small.
+	maxPreviewBytes = 2 << 10
+	previewEllipsis = "…"
 
 	opusSuffix = ".opus"
 	jsonSuffix = ".json"
@@ -50,7 +55,7 @@ const (
 
 var (
 	ErrNotFound = errors.New("recording not found")
-	ErrFull     = errors.New("kept recordings fill the store")
+	ErrFull     = errors.New("the recordings store is full")
 
 	// errUnusable marks metadata that cannot be read once open, does not
 	// decode or is over maxMetadataBytes.
@@ -62,7 +67,8 @@ var (
 	tempPattern = regexp.MustCompile(`^(probe-\d+|\d{8}T\d{6}Z-[0-9a-f]{8}\.(opus|json)\.\d+)\.tmp$`)
 )
 
-// Recording describes one saved transcription.
+// Recording describes one saved transcription. List fills Transcript with
+// at most maxPreviewBytes of it, marked with an ellipsis when cut.
 type Recording struct {
 	ID         string
 	At         time.Time
@@ -81,6 +87,16 @@ type metadata struct {
 	Source     string    `json:"source"`
 	Transcript string    `json:"transcript"`
 	Keep       bool      `json:"keep"`
+}
+
+// storedMetadata is metadata as read back. Its pointers tell a missing or
+// null keep or at from a written one, which the store needs to trust a file.
+type storedMetadata struct {
+	At         *time.Time `json:"at"`
+	DurationMs int64      `json:"durationMs"`
+	Source     string     `json:"source"`
+	Transcript string     `json:"transcript"`
+	Keep       *bool      `json:"keep"`
 }
 
 // indexed is what the store remembers of a complete recording, everything
@@ -112,6 +128,9 @@ type Store struct {
 	ticks func() (<-chan time.Time, func())
 	write func(name string, data []byte) error
 	newID func(at time.Time) (string, error)
+	// entryInfo is a field so that a test can fail the stat of one file in
+	// a directory scan.
+	entryInfo func(fs.DirEntry) (fs.FileInfo, error)
 
 	mu    sync.Mutex
 	byID  map[string]*indexed
@@ -139,15 +158,16 @@ type Store struct {
 // unusable, and collects. It fails when a metadata file cannot be opened.
 func Open(dir string, now func() time.Time, log *slog.Logger) (*Store, error) {
 	s := &Store{
-		dir:      dir,
-		now:      now,
-		log:      log,
-		maxBytes: maxStoreBytes,
-		ticks:    newTicks,
-		newID:    randomID,
-		byID:     map[string]*indexed{},
-		skipped:  map[string]int64{},
-		stray:    map[string]int64{},
+		dir:       dir,
+		now:       now,
+		log:       log,
+		maxBytes:  maxStoreBytes,
+		ticks:     newTicks,
+		newID:     randomID,
+		entryInfo: fs.DirEntry.Info,
+		byID:      map[string]*indexed{},
+		skipped:   map[string]int64{},
+		stray:     map[string]int64{},
 		// maxQueued is a field so that a test can fill the queue cheaply.
 		maxQueued: maxQueuedBytes,
 		wake:      make(chan struct{}, 1),
@@ -202,19 +222,22 @@ func ValidID(id string) bool {
 // load indexes every recording that has both its files and usable
 // metadata. Collect then deletes the files that belong to no recording.
 func (s *Store) load() error {
-	sizes, err := s.fileSizes()
+	scan, err := s.scanFiles()
 	if err != nil {
 		return err
 	}
 
-	for name, jsonBytes := range sizes {
+	for _, name := range scan.names() {
 		id, ok := strings.CutSuffix(name, jsonSuffix)
-		if !ok || !ValidID(id) {
+		if !ok || !ValidID(id) || !scan.listed(id+opusSuffix) {
 			continue
 		}
 
-		opusBytes, haveOpus := sizes[id+opusSuffix]
-		if !haveOpus {
+		opusBytes, haveOpus := scan.sizes[id+opusSuffix]
+		jsonBytes, haveJSON := scan.sizes[name]
+		if !haveOpus || !haveJSON {
+			s.skipped[id] = opusBytes + jsonBytes
+			s.log.Warn("recording left on disk: its files cannot be read", slog.String("id", id))
 			continue
 		}
 
@@ -244,29 +267,62 @@ func (s *Store) load() error {
 	return nil
 }
 
-// fileSizes maps the name of each regular file in the store to its size.
-func (s *Store) fileSizes() (map[string]int64, error) {
+// fileScan is one listing of the store: the size of each regular file in
+// it, and the names it listed but could not stat. A name in neither is
+// absent or not a regular file.
+type fileScan struct {
+	sizes     map[string]int64
+	unstatted map[string]bool
+}
+
+// listed reports whether the scan saw name, sized or not.
+func (f *fileScan) listed(name string) bool {
+	_, sized := f.sizes[name]
+	return sized || f.unstatted[name]
+}
+
+// names returns every name the scan saw.
+func (f *fileScan) names() []string {
+	names := make([]string, 0, len(f.sizes)+len(f.unstatted))
+	for name := range f.sizes {
+		names = append(names, name)
+	}
+	for name := range f.unstatted {
+		names = append(names, name)
+	}
+
+	return names
+}
+
+// scanFiles lists the store. A file that vanishes between the listing and
+// its stat is absent; any other stat failure leaves it unstatted, so no
+// caller takes it for gone.
+func (s *Store) scanFiles() (*fileScan, error) {
 	files, err := os.ReadDir(s.dir)
 	if err != nil {
 		return nil, fmt.Errorf("read recordings directory: %w", err)
 	}
 
-	sizes := map[string]int64{}
+	scan := &fileScan{sizes: map[string]int64{}, unstatted: map[string]bool{}}
 	for _, file := range files {
-		info, infoErr := file.Info()
-		if infoErr != nil || !info.Mode().IsRegular() {
-			continue
+		info, infoErr := s.entryInfo(file)
+		switch {
+		case errors.Is(infoErr, fs.ErrNotExist):
+		case infoErr != nil:
+			scan.unstatted[file.Name()] = true
+		case info.Mode().IsRegular():
+			scan.sizes[file.Name()] = info.Size()
 		}
-		sizes[file.Name()] = info.Size()
 	}
 
-	return sizes, nil
+	return scan, nil
 }
 
 // Save encodes wav, the 16 kHz mono WAV the recogniser was sent, and writes
 // it with its metadata, dated now. When the store would pass its cap it first
 // deletes the oldest recordings nobody kept; it returns ErrFull and saves
-// nothing when kept recordings alone leave no room.
+// nothing when kept recordings and the bytes no eviction can reclaim leave
+// no room.
 func (s *Store) Save(wav []byte, source, transcript string) error {
 	return s.saveAt(s.now(), wav, source, transcript)
 }
@@ -394,7 +450,7 @@ func (s *Store) freshID(at time.Time) (string, error) {
 // mu.
 func (s *Store) makeRoom(size int64) error {
 	unevictable := s.unevictable()
-	total, kept := unevictable, unevictable
+	total, kept := unevictable, int64(0)
 	for _, rec := range s.order {
 		total += rec.bytes()
 		if rec.keep {
@@ -402,8 +458,9 @@ func (s *Store) makeRoom(size int64) error {
 		}
 	}
 
-	if kept+size > s.maxBytes {
-		return fmt.Errorf("%w: %d bytes kept, %d more would pass the %d-byte cap", ErrFull, kept, size, s.maxBytes)
+	if kept+unevictable+size > s.maxBytes {
+		return fmt.Errorf("%w: %d bytes kept and %d bytes that no eviction can reclaim leave no room for %d more under the %d-byte cap",
+			ErrFull, kept, unevictable, size, s.maxBytes)
 	}
 
 	var evict []string
@@ -510,8 +567,8 @@ func (s *Store) olderThan(id string) int {
 	return position
 }
 
-// recording reads the transcript of rec from its metadata. The caller holds
-// mu.
+// recording reads the preview of the transcript of rec from its metadata.
+// The caller holds mu.
 func (s *Store) recording(rec *indexed) (Recording, error) {
 	meta, err := s.readMetadata(rec.id)
 	if err != nil {
@@ -523,9 +580,25 @@ func (s *Store) recording(rec *indexed) (Recording, error) {
 		At:         rec.at,
 		Duration:   time.Duration(rec.durationMs) * time.Millisecond,
 		Source:     rec.source,
-		Transcript: meta.Transcript,
+		Transcript: preview(meta.Transcript),
 		Keep:       rec.keep,
 	}, nil
+}
+
+// preview cuts transcript to maxPreviewBytes on a character boundary and
+// marks the cut with an ellipsis. It returns a copy, so the preview does
+// not hold the whole transcript in memory.
+func preview(transcript string) string {
+	if len(transcript) <= maxPreviewBytes {
+		return strings.Clone(transcript)
+	}
+
+	cut := maxPreviewBytes
+	for cut > 0 && !utf8.RuneStart(transcript[cut]) {
+		cut--
+	}
+
+	return transcript[:cut] + previewEllipsis
 }
 
 func compareIndexed(a, b *indexed) int {
@@ -650,17 +723,17 @@ func (s *Store) Collect() error {
 // and the files it could not delete. The caller holds mu, so no save is
 // writing one of them.
 func (s *Store) sweep() error {
-	sizes, err := s.fileSizes()
+	scan, err := s.scanFiles()
 	if err != nil {
 		return err
 	}
 
-	s.recountSkipped(sizes)
+	s.recountSkipped(scan)
 	s.stray = map[string]int64{}
 
 	var errs []error
 	deleted := 0
-	for name, size := range sizes {
+	for name, size := range scan.sizes {
 		if !s.leftover(name) {
 			continue
 		}
@@ -680,17 +753,21 @@ func (s *Store) sweep() error {
 	return errors.Join(errs...)
 }
 
-// recountSkipped updates the size of each skipped pair from sizes and forgets
-// a pair the operator has deleted. The caller holds mu.
-func (s *Store) recountSkipped(sizes map[string]int64) {
+// recountSkipped updates the size of each skipped pair from scan and
+// forgets a pair the operator has deleted, which only a listing without
+// either of its names shows. A pair with a name the scan could not stat
+// keeps the size last counted. The caller holds mu.
+func (s *Store) recountSkipped(scan *fileScan) {
 	for id := range s.skipped {
-		opusBytes, haveOpus := sizes[id+opusSuffix]
-		jsonBytes, haveJSON := sizes[id+jsonSuffix]
-		if !haveOpus && !haveJSON {
+		opus, meta := id+opusSuffix, id+jsonSuffix
+		if !scan.listed(opus) && !scan.listed(meta) {
 			delete(s.skipped, id)
 			continue
 		}
-		s.skipped[id] = opusBytes + jsonBytes
+		if scan.unstatted[opus] || scan.unstatted[meta] {
+			continue
+		}
+		s.skipped[id] = scan.sizes[opus] + scan.sizes[meta]
 	}
 }
 
@@ -745,28 +822,38 @@ func (s *Store) unlink(name string, size int64) error {
 }
 
 // readMetadata reads the metadata of id through maxMetadataBytes. A file
-// that cannot be read once open, is too long or does not decode is
-// errUnusable; one that cannot be opened is not.
+// that cannot be read once open, is too long, does not decode, or lacks a
+// boolean keep or a time is errUnusable; one that cannot be opened is not.
 func (s *Store) readMetadata(id string) (metadata, error) {
-	var meta metadata
 	file, err := os.Open(filepath.Join(s.dir, id+jsonSuffix))
 	if err != nil {
-		return meta, fmt.Errorf("read recording metadata %s: %w", id, err)
+		return metadata{}, fmt.Errorf("read recording metadata %s: %w", id, err)
 	}
 	defer file.Close()
 
 	data, err := io.ReadAll(io.LimitReader(file, maxMetadataBytes+1))
 	if err != nil {
-		return meta, fmt.Errorf("%w: read %s: %w", errUnusable, id, err)
+		return metadata{}, fmt.Errorf("%w: read %s: %w", errUnusable, id, err)
 	}
 
 	if len(data) > maxMetadataBytes {
-		return meta, fmt.Errorf("%w: %s is over %d bytes", errUnusable, id, maxMetadataBytes)
+		return metadata{}, fmt.Errorf("%w: %s is over %d bytes", errUnusable, id, maxMetadataBytes)
 	}
 
-	if err := json.Unmarshal(data, &meta); err != nil {
-		return meta, fmt.Errorf("%w: %s: %w", errUnusable, id, err)
+	var stored storedMetadata
+	if err := json.Unmarshal(data, &stored); err != nil {
+		return metadata{}, fmt.Errorf("%w: %s: %w", errUnusable, id, err)
 	}
 
-	return meta, nil
+	if stored.Keep == nil || stored.At == nil || stored.At.IsZero() {
+		return metadata{}, fmt.Errorf("%w: %s has no boolean keep or no time", errUnusable, id)
+	}
+
+	return metadata{
+		At:         *stored.At,
+		DurationMs: stored.DurationMs,
+		Source:     stored.Source,
+		Transcript: stored.Transcript,
+		Keep:       *stored.Keep,
+	}, nil
 }

@@ -36,6 +36,9 @@ const (
 	// maxTranscriptBytes is the upstream client's bound on a transcript
 	// (internal/upstream), written out so a lowered metadata bound fails here.
 	maxTranscriptBytes = 1 << 20
+	// previewBytes is the transcript preview bound, written out so a changed
+	// constant fails here.
+	previewBytes = 2 << 10
 	// jsonEscapedByte is a character JSON escapes to six bytes, the worst
 	// case for the metadata bound.
 	jsonEscapedByte = "<"
@@ -338,11 +341,9 @@ func TestOpen_KeepsARecordingWithAMaximalTranscript(t *testing.T) {
 
 	reopened, logs := openLogged(t, dir, (&clock{now: start}).Now)
 
-	list, total, err := reopened.List("", 1)
-	require.NoError(t, err)
-	assert.Equal(t, 1, total)
-	require.Len(t, list, 1)
-	assert.Equal(t, transcript, list[0].Transcript)
+	found := ids(t, reopened)
+	require.Len(t, found, 1)
+	assert.Equal(t, transcript, readMetadata(t, filepath.Join(dir, found[0]+jsonSuffix)).Transcript)
 	assert.Empty(t, logs.withMessage(t, "recording left on disk: its metadata is unusable"))
 }
 
@@ -587,6 +588,31 @@ func TestList_ReadsTheTranscriptOfEachReturnedRow(t *testing.T) {
 	require.Len(t, list, 1)
 	assert.Equal(t, 2, total)
 	assert.Equal(t, "newer", list[0].Transcript)
+}
+
+func TestList_ReturnsABoundedTranscriptPreview(t *testing.T) {
+	store, _ := openStore(t, t.TempDir())
+	// The 'a' puts the preview bound inside a two-byte character.
+	transcript := "a" + strings.Repeat("é", maxTranscriptBytes/2)
+	require.NoError(t, store.Save(wav(t, halfSecond), sourceOpenAI, transcript))
+
+	list, _, err := store.List("", 1)
+
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, transcript[:previewBytes-1]+"…", list[0].Transcript)
+}
+
+func TestList_TranscriptAtThePreviewBoundIsWhole(t *testing.T) {
+	store, _ := openStore(t, t.TempDir())
+	transcript := strings.Repeat("x", previewBytes)
+	require.NoError(t, store.Save(wav(t, halfSecond), sourceOpenAI, transcript))
+
+	list, _, err := store.List("", 1)
+
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, transcript, list[0].Transcript)
 }
 
 func TestList_CursorOfADeletedRecordingStillPages(t *testing.T) {
