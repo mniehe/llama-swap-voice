@@ -3,11 +3,14 @@ package openai
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -25,13 +28,19 @@ import (
 )
 
 const (
-	recordingsPath     = "/recordings"
-	contentTypeForm    = "application/x-www-form-urlencoded"
-	recordingsPageSize = 100
-	unknownID          = "20261125T153000Z-00000000"
-	recordedText       = "turn on the kitchen lights"
-	scriptTranscript   = `<script>alert("x")</script> & more`
-	escapedTranscript  = `&lt;script&gt;alert(&#34;x&#34;)&lt;/script&gt; &amp; more`
+	// previewBytes is the transcript preview bound, written out so a changed
+	// constant fails here.
+	previewBytes = 2 << 10
+	// transcriptLimitBytes is the upstream's bound on a transcript.
+	transcriptLimitBytes = 1 << 20
+	impossibleDateID     = "20261399T000000Z-00000000"
+	recordingsPath       = "/recordings"
+	contentTypeForm      = "application/x-www-form-urlencoded"
+	recordingsPageSize   = 100
+	unknownID            = "20261125T153000Z-00000000"
+	recordedText         = "turn on the kitchen lights"
+	scriptTranscript     = `<script>alert("x")</script> & more`
+	escapedTranscript    = `&lt;script&gt;alert(&#34;x&#34;)&lt;/script&gt; &amp; more`
 )
 
 var clockStart = time.Date(2026, time.November, 25, 15, 30, 0, 0, time.UTC)
@@ -320,12 +329,97 @@ func TestRecordingsPage_ShowsTheNewestPageAndLinksToOlder(t *testing.T) {
 func TestRecordingsPage_InvalidBeforeIsBadRequest(t *testing.T) {
 	h, _, _ := newRecordingHarness(t, recordedText)
 
-	for _, query := range []string{"?before=x", "?before=..%2Fx", "?before=", "?before=" + unknownID + "&before=" + unknownID} {
+	for _, query := range []string{"?before=x", "?before=..%2Fx", "?before=", "?before=" + unknownID + "&before=" + unknownID, "?before=" + impossibleDateID} {
 		resp := h.get(recordingsPath + query)
 
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "query %q", query)
 		assert.Contains(t, errorMessage(t, resp), "before", "query %q", query)
 	}
+
+	malformed := h.get(recordingsPath + "?before=%zz")
+	assert.Equal(t, http.StatusBadRequest, malformed.StatusCode, "a malformed escape")
+	assert.Equal(t, contentTypeJSON, malformed.Header.Get("Content-Type"))
+	assert.Contains(t, errorMessage(t, malformed), "query")
+}
+
+func TestRecordingsPage_PastTheOldestSaysThePageIsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 2)
+	h, _ := newRecordingHarnessIn(t, dir, recordedText)
+
+	page := string(readBody(t, h.get(recordingsPath+"?before="+ids[0])))
+
+	assert.Contains(t, page, "Showing 0 of 2 recordings.")
+	assert.Contains(t, page, "No recordings on this page.")
+	assert.NotContains(t, page, "No recordings yet.")
+}
+
+func TestRecordingsPage_EmptyStoreSaysNoRecordingsYet(t *testing.T) {
+	h, _, _ := newRecordingHarness(t, recordedText)
+
+	page := string(readBody(t, h.get(recordingsPath)))
+
+	assert.Contains(t, page, "No recordings yet.")
+}
+
+func TestRecordingsPage_ExactlyOnePageHasNoOlderLink(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, recordingsPageSize)
+	h, _ := newRecordingHarnessIn(t, dir, recordedText)
+
+	page := string(readBody(t, h.get(recordingsPath)))
+
+	assert.Contains(t, page, "Showing 100 of 100 recordings.")
+	assert.Contains(t, page, ids[0])
+	assert.NotContains(t, page, "Older</a>")
+}
+
+func TestRecordingsPage_RefusesFraming(t *testing.T) {
+	h, _, _ := newRecordingHarness(t, recordedText)
+
+	resp := h.get(recordingsPath)
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "frame-ancestors 'none'", resp.Header.Get("Content-Security-Policy"))
+}
+
+// plantTranscript writes one recording with transcript into dir and returns
+// its id.
+func plantTranscript(t *testing.T, dir, transcript string) string {
+	t.Helper()
+
+	id := clockStart.Format("20060102T150405Z") + "-0000abcd"
+	meta, err := json.Marshal(map[string]any{
+		"at": clockStart.Format(time.RFC3339Nano), "durationMs": 500, "source": "openai", "transcript": transcript, "keep": false,
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, id+".json"), meta, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, id+".opus"), []byte("audio"), 0o600))
+
+	return id
+}
+
+func TestRecordingsPage_ShowsABoundedTranscriptPreview(t *testing.T) {
+	dir := t.TempDir()
+	// The 'a' puts the preview bound inside a two-byte character.
+	transcript := "a" + strings.Repeat("é", transcriptLimitBytes)
+	plantTranscript(t, dir, transcript)
+	h, _ := newRecordingHarnessIn(t, dir, recordedText)
+
+	page := string(readBody(t, h.get(recordingsPath)))
+
+	want := transcript[:previewBytes-1] + "…"
+	assert.Contains(t, page, want)
+	assert.NotContains(t, page, transcript[:previewBytes+1])
+	assert.Less(t, len(page), 4*previewBytes, "the page stays small")
+}
+
+func TestNewRecordingRow_ShortTranscriptIsWhole(t *testing.T) {
+	rec := recordings.Recording{Transcript: strings.Repeat("x", previewBytes)}
+
+	row := newRecordingRow(&rec)
+
+	assert.Equal(t, rec.Transcript, row.Transcript, "a transcript at the bound is shown whole")
 }
 
 // keepFormOf returns a keep form padded with a second field to exactly size
@@ -612,6 +706,79 @@ func TestRecordingAudio_ServesRangesAndIsNotCached(t *testing.T) {
 	assert.Equal(t, strconv.Itoa(len(audio)), head.Header.Get("Content-Length"))
 	assert.Empty(t, readBody(t, head))
 
-	beyond := h.requestAs(http.MethodGet, path, "127.0.0.1", "", map[string]string{"Range": fmt.Sprintf("bytes=%d-", len(audio)+1)})
-	assert.Equal(t, http.StatusRequestedRangeNotSatisfiable, beyond.StatusCode)
+}
+
+func requireJSONError(t *testing.T, resp *http.Response, status int) {
+	t.Helper()
+
+	assert.Equal(t, status, resp.StatusCode)
+	assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"))
+	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	assert.NotEmpty(t, errorMessage(t, resp))
+}
+
+func TestRecordingAudio_UnsatisfiableRangeIsAJSONError(t *testing.T) {
+	dir := t.TempDir()
+	id, audio := plantLongRecording(t, dir, slowReadChunk)
+	h, _ := newRecordingHarnessIn(t, dir, recordedText)
+
+	resp := h.requestAs(http.MethodGet, recordingsPath+"/"+id+"/audio", "127.0.0.1", "", map[string]string{"Range": fmt.Sprintf("bytes=%d-", len(audio)+1)})
+
+	requireJSONError(t, resp, http.StatusRequestedRangeNotSatisfiable)
+	assert.Equal(t, fmt.Sprintf("bytes */%d", len(audio)), resp.Header.Get("Content-Range"))
+}
+
+func TestRecordingAudio_FailedPreconditionIsAJSONError(t *testing.T) {
+	dir := t.TempDir()
+	id, _ := plantLongRecording(t, dir, slowReadChunk)
+	h, _ := newRecordingHarnessIn(t, dir, recordedText)
+
+	resp := h.requestAs(http.MethodGet, recordingsPath+"/"+id+"/audio", "127.0.0.1", "", map[string]string{"If-Match": `"x"`})
+
+	requireJSONError(t, resp, http.StatusPreconditionFailed)
+	assert.Empty(t, resp.Header.Get("Content-Range"))
+}
+
+func TestRecordingAudio_UnchangedIsNotModified(t *testing.T) {
+	dir := t.TempDir()
+	id, _ := plantLongRecording(t, dir, slowReadChunk)
+	h, _ := newRecordingHarnessIn(t, dir, recordedText)
+	path := recordingsPath + "/" + id + "/audio"
+	whole := h.requestAs(http.MethodGet, path, "127.0.0.1", "", nil)
+	modified := whole.Header.Get("Last-Modified")
+	require.NotEmpty(t, modified)
+
+	resp := h.requestAs(http.MethodGet, path, "127.0.0.1", "", map[string]string{"If-Modified-Since": modified})
+
+	assert.Equal(t, http.StatusNotModified, resp.StatusCode)
+	assert.Empty(t, readBody(t, resp))
+}
+
+// failingSeeker fails every Seek, which makes http.ServeContent answer 500.
+type failingSeeker struct{ io.Reader }
+
+func (failingSeeker) Seek(int64, int) (int64, error) {
+	return 0, errors.New("disk gone")
+}
+
+func TestServeRecording_ServerErrorIsLoggedJSON(t *testing.T) {
+	logs := &logBuffer{}
+	s := &Server{log: slog.New(slog.NewJSONHandler(logs, nil))}
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, recordingsPath+"/"+unknownID+"/audio", http.NoBody)
+
+	s.serveRecording(recorder, req, time.Time{}, failingSeeker{strings.NewReader("audio")})
+
+	resp := recorder.Result()
+	defer closeQuietly(t, resp.Body)
+	requireJSONError(t, resp, http.StatusInternalServerError)
+	assert.Contains(t, logs.text(), "recording request failed")
+	assert.Contains(t, logs.text(), "seek")
+}
+
+func (b *logBuffer) text() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
 }

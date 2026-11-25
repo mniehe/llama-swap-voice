@@ -38,6 +38,8 @@ tr.kept { background: #eef6ee; }
 </tbody>
 </table>
 {{if .Older}}<p><a href="/recordings?before={{.Older}}">Older</a></p>{{end}}
+{{else if .Total}}
+<p>No recordings on this page.</p>
 {{else}}
 <p>No recordings yet.</p>
 {{end}}

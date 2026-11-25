@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"log/slog"
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mniehe/llama-swap-voice/internal/recordings"
 )
@@ -38,7 +41,20 @@ const (
 	maxPlaybackSeconds = int64(math.MaxInt64 / time.Second)
 	shownTime          = "2006-01-02 15:04:05"
 	hoursPerDay        = 24
+	// maxPreviewBytes bounds the transcript a page row shows, so a page of
+	// transcripts at the upstream's 1 MiB bound stays small.
+	maxPreviewBytes = 2 << 10
+	previewEllipsis = "…"
+	// framePolicy keeps another site from framing the page and its keep
+	// buttons.
+	framePolicy = "frame-ancestors 'none'"
+	// maxFailureDetailBytes bounds the error text kept from ServeContent.
+	maxFailureDetailBytes = 1 << 10
 )
+
+// servedHeaders are the headers http.ServeContent sets for the audio, which
+// a JSON error must not carry.
+var servedHeaders = []string{"Content-Type", "Content-Length", "Content-Encoding", "X-Content-Type-Options", "Last-Modified", "Etag"}
 
 //go:embed recordings.html
 var recordingsHTML string
@@ -146,15 +162,23 @@ func (s *Server) handleRecordings(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", contentTypeHTML)
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", framePolicy)
 	w.WriteHeader(http.StatusOK)
 	if _, err := page.WriteTo(w); err != nil {
 		s.logWriteFailure(err)
 	}
 }
 
-// pageCursor returns the before parameter, empty for the newest page.
+// pageCursor returns the before parameter, empty for the newest page. The
+// query is parsed strictly, so a malformed escape is refused rather than
+// dropped.
 func pageCursor(r *http.Request) (string, error) {
-	values, present := r.URL.Query()[beforeParam]
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return "", fmt.Errorf("invalid query: %w", err)
+	}
+
+	values, present := query[beforeParam]
 	if !present {
 		return "", nil
 	}
@@ -173,9 +197,24 @@ func newRecordingRow(rec *recordings.Recording) recordingRow {
 		Shown:      rec.At.UTC().Format(shownTime),
 		Length:     fmt.Sprintf("%.1f s", rec.Duration.Seconds()),
 		Source:     rec.Source,
-		Transcript: rec.Transcript,
+		Transcript: preview(rec.Transcript),
 		Keep:       rec.Keep,
 	}
+}
+
+// preview cuts transcript to maxPreviewBytes on a character boundary and
+// marks the cut with an ellipsis.
+func preview(transcript string) string {
+	if len(transcript) <= maxPreviewBytes {
+		return transcript
+	}
+
+	cut := maxPreviewBytes
+	for cut > 0 && !utf8.RuneStart(transcript[cut]) {
+		cut--
+	}
+
+	return transcript[:cut] + previewEllipsis
 }
 
 // handleRecordingAudio serves the file with its own deadline, long enough to
@@ -198,9 +237,77 @@ func (s *Server) handleRecordingAudio(w http.ResponseWriter, r *http.Request) {
 	deadline := time.Now().Add(s.playbackTimeout(info.Size()))
 	s.setDeadlines(w, deadline, deadline)
 
+	s.serveRecording(w, r, info.ModTime(), file)
+}
+
+// serveRecording serves content with ranges and conditional requests. An
+// error http.ServeContent would answer in plain text is answered as JSON.
+func (s *Server) serveRecording(w http.ResponseWriter, r *http.Request, modified time.Time, content io.ReadSeeker) {
 	w.Header().Set("Content-Type", contentTypeOgg)
 	w.Header().Set("Cache-Control", "no-store")
-	http.ServeContent(w, r, "", info.ModTime(), file)
+
+	held := &errorHoldingWriter{ResponseWriter: w}
+	http.ServeContent(held, r, "", modified, content)
+
+	if held.status != 0 {
+		s.contentFailure(w, r, held.status, string(held.detail))
+	}
+}
+
+// contentFailure answers status, which http.ServeContent chose, through
+// writeError. Only a 416 keeps the Content-Range that names the file's size.
+func (s *Server) contentFailure(w http.ResponseWriter, r *http.Request, status int, detail string) {
+	header := w.Header()
+	for _, name := range servedHeaders {
+		header.Del(name)
+	}
+	if status != http.StatusRequestedRangeNotSatisfiable {
+		header.Del("Content-Range")
+	}
+	header.Set("Cache-Control", "no-store")
+
+	if status >= http.StatusInternalServerError {
+		s.recordingFailure(w, r, fmt.Errorf("serve recording: %s", strings.TrimSpace(detail)))
+		return
+	}
+
+	s.writeError(w, status, errors.New(strings.ToLower(http.StatusText(status))))
+}
+
+// errorHoldingWriter passes a response through unless its status is an
+// error, which it holds back with a bounded copy of its body, so that the
+// handler can answer it instead. http.ServeContent writes its own 412 with no
+// body and its 416 and 500 in plain text.
+type errorHoldingWriter struct {
+	http.ResponseWriter
+	status  int
+	started bool
+	detail  []byte
+}
+
+func (e *errorHoldingWriter) WriteHeader(code int) {
+	if !e.started && code >= http.StatusBadRequest {
+		e.status = code
+		return
+	}
+
+	e.started = true
+	e.ResponseWriter.WriteHeader(code)
+}
+
+func (e *errorHoldingWriter) Write(p []byte) (int, error) {
+	if e.status != 0 {
+		room := max(0, maxFailureDetailBytes-len(e.detail))
+		e.detail = append(e.detail, p[:min(len(p), room)]...)
+		return len(p), nil
+	}
+
+	e.started = true
+	return e.ResponseWriter.Write(p)
+}
+
+func (e *errorHoldingWriter) Unwrap() http.ResponseWriter {
+	return e.ResponseWriter
 }
 
 // playbackTimeout is the time to send size bytes at
