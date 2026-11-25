@@ -22,7 +22,10 @@ import (
 const (
 	opusBitrate    = 24000
 	opusComplexity = 10
-	opusVBR        = 1
+	// recordingBitrate keeps wideband speech near-transparent for later
+	// analysis while a week of recordings stays small.
+	recordingBitrate = 32000
+	opusVBR          = 1
 
 	// libopus's own recommendation for an output buffer that any single
 	// packet fits in.
@@ -35,19 +38,21 @@ var (
 	opusDestroyed atomic.Int64
 )
 
-// libopus owns one C encoder for 20 ms mono frames at 24 kHz. The pcm and
-// packet buffers are C-typed so samples and bytes cross without unsafe.
+// libopus owns one C encoder for 20 ms mono frames at one of Opus's native
+// rates. The pcm and packet buffers are C-typed so samples and bytes cross
+// without unsafe.
 type libopus struct {
 	encoder   *C.OpusEncoder
+	bitrate   uint32
 	lookahead int
 	pcm       []C.opus_int16
 	packet    []C.uchar
 	out       []byte
 }
 
-func newLibopus() (*libopus, error) {
+func newLibopus(rate, bitrate uint32) (*libopus, error) {
 	var status C.int
-	encoder := C.opus_encoder_create(outputRate, outputChannels, C.OPUS_APPLICATION_AUDIO, &status)
+	encoder := C.opus_encoder_create(C.opus_int32(rate), outputChannels, C.OPUS_APPLICATION_AUDIO, &status)
 	if status != C.OPUS_OK {
 		return nil, opusError("create encoder", status)
 	}
@@ -55,7 +60,8 @@ func newLibopus() (*libopus, error) {
 
 	codec := &libopus{
 		encoder: encoder,
-		pcm:     make([]C.opus_int16, opusFrameSamples),
+		bitrate: bitrate,
+		pcm:     make([]C.opus_int16, rate/opusFramesPerSecond),
 		packet:  make([]C.uchar, opusMaxPacketBytes),
 		out:     make([]byte, opusMaxPacketBytes),
 	}
@@ -73,7 +79,7 @@ func (c *libopus) configure() error {
 		request C.int
 		value   C.opus_int32
 	}{
-		{C.OPUS_SET_BITRATE_REQUEST, opusBitrate},
+		{C.OPUS_SET_BITRATE_REQUEST, C.opus_int32(c.bitrate)},
 		{C.OPUS_SET_COMPLEXITY_REQUEST, opusComplexity},
 		{C.OPUS_SET_VBR_REQUEST, opusVBR},
 	}

@@ -91,7 +91,7 @@ func oggPages(t *testing.T, stream []byte) []oggPackets {
 func encoderPreSkip(t *testing.T) uint16 {
 	t.Helper()
 
-	encoder, err := newOpusEncoder(io.Discard)
+	encoder, err := newOpusEncoder(io.Discard, outputRate, opusBitrate)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, encoder.Close()) }()
 
