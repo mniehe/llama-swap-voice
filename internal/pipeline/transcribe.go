@@ -45,7 +45,7 @@ func (p *Pipeline) Transcribe(ctx context.Context, upload io.Reader, source Sour
 	}
 
 	transcript := p.stripPrefix(text)
-	p.record(wav, source, transcript)
+	p.record(ctx, wav, source, transcript)
 
 	return transcript, nil
 }
@@ -53,12 +53,12 @@ func (p *Pipeline) Transcribe(ctx context.Context, upload io.Reader, source Sour
 // record hands wav to the recorder. NormaliseUpload returns a fresh slice
 // for each request and nothing here touches it afterwards, so the recorder
 // may keep it without a copy.
-func (p *Pipeline) record(wav []byte, source Source, transcript string) {
+func (p *Pipeline) record(ctx context.Context, wav []byte, source Source, transcript string) {
 	if p.cfg.Recorder == nil {
 		return
 	}
 
-	p.cfg.Recorder.Record(wav, string(source), transcript)
+	p.cfg.Recorder.Record(wav, string(source), transcript, requestIDOf(ctx))
 }
 
 func (p *Pipeline) stripPrefix(text string) string {

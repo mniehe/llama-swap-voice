@@ -21,10 +21,13 @@ const (
 	readOnlyDir = 0o500
 )
 
+const recordedRequestID = "req-7"
+
 type savedRecording struct {
 	wav        []byte
 	source     string
 	transcript string
+	requestID  string
 }
 
 // fakeRecorder records each recording it is handed.
@@ -33,11 +36,11 @@ type fakeRecorder struct {
 	saved []savedRecording
 }
 
-func (f *fakeRecorder) Record(wav []byte, source, transcript string) {
+func (f *fakeRecorder) Record(wav []byte, source, transcript, requestID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.saved = append(f.saved, savedRecording{wav: wav, source: source, transcript: transcript})
+	f.saved = append(f.saved, savedRecording{wav: wav, source: source, transcript: transcript, requestID: requestID})
 }
 
 func (f *fakeRecorder) all() []savedRecording {
@@ -84,7 +87,7 @@ func TestPipeline_Transcribe_SavesStrippedTranscriptWithSource(t *testing.T) {
 	p, fake := newPipeline(t, serveTranscript(t, "language English<asr_text> "+transcriptText), withRecorder(recorder))
 
 	for _, source := range []Source{SourceOpenAI, SourceWyoming} {
-		text, err := p.Transcribe(t.Context(), strings.NewReader(streamedWAV), source)
+		text, err := p.Transcribe(WithRequestID(t.Context(), recordedRequestID), strings.NewReader(streamedWAV), source)
 		require.NoError(t, err)
 		assert.Equal(t, transcriptText, text)
 	}
@@ -94,7 +97,7 @@ func TestPipeline_Transcribe_SavesStrippedTranscriptWithSource(t *testing.T) {
 	sent := fake.callsTo(asrRoute)
 	require.Len(t, sent, 2)
 	assert.Equal(t, sent[0].files["file"], saved[0].wav, "the recording is the WAV sent upstream")
-	assert.Equal(t, savedRecording{wav: saved[0].wav, source: "openai", transcript: transcriptText}, saved[0])
+	assert.Equal(t, savedRecording{wav: saved[0].wav, source: "openai", transcript: transcriptText, requestID: recordedRequestID}, saved[0])
 	assert.Equal(t, "wyoming", saved[1].source)
 }
 
@@ -137,7 +140,7 @@ func TestPipeline_Transcribe_SaveFailureKeepsTranscriptAndWarns(t *testing.T) {
 	runStore(t, store)
 	p, _ := newPipeline(t, serveTranscript(t, transcriptText), withRecorder(store))
 
-	text, err := p.Transcribe(t.Context(), strings.NewReader(streamedWAV), SourceWyoming)
+	text, err := p.Transcribe(WithRequestID(t.Context(), recordedRequestID), strings.NewReader(streamedWAV), SourceWyoming)
 
 	require.NoError(t, err)
 	assert.Equal(t, transcriptText, text)
@@ -153,6 +156,7 @@ func TestPipeline_Transcribe_SaveFailureKeepsTranscriptAndWarns(t *testing.T) {
 	}, time.Second, 5*time.Millisecond, "no warning for the failed save")
 	assert.Equal(t, "WARN", warning["level"])
 	assert.Equal(t, "wyoming", warning["source"])
+	assert.Equal(t, recordedRequestID, warning["request_id"])
 	assert.Contains(t, warning["error"], "permission denied")
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)

@@ -264,10 +264,15 @@ func (s *Store) fileSizes() (map[string]int64, error) {
 }
 
 // Save encodes wav, the 16 kHz mono WAV the recogniser was sent, and writes
-// it with its metadata. When the store would pass its cap it first deletes the
-// oldest recordings nobody kept; it returns ErrFull and saves nothing when
-// kept recordings alone leave no room.
+// it with its metadata, dated now. When the store would pass its cap it first
+// deletes the oldest recordings nobody kept; it returns ErrFull and saves
+// nothing when kept recordings alone leave no room.
 func (s *Store) Save(wav []byte, source, transcript string) error {
+	return s.saveAt(s.now(), wav, source, transcript)
+}
+
+// saveAt is Save dated at.
+func (s *Store) saveAt(at time.Time, wav []byte, source, transcript string) error {
 	pcm, err := pcmOf(wav)
 	if err != nil {
 		return err
@@ -281,7 +286,7 @@ func (s *Store) Save(wav []byte, source, transcript string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	at := s.now().UTC()
+	at = at.UTC()
 	id, err := s.freshID(at)
 	if err != nil {
 		return err

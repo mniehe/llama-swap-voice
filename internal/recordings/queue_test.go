@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,12 +14,27 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mniehe/llama-swap-voice/internal/audio"
 )
 
 const (
 	waitFor   = 2 * time.Second
 	pollEvery = 5 * time.Millisecond
+	// itemOverhead is what the queue charges each recording besides its
+	// bytes, written out so a changed constant fails here.
+	itemOverhead = 512
+	// longestUploadSeconds is the transcription limit, 20 minutes
+	// (internal/pipeline).
+	longestUploadSeconds = 20 * 60
+	droppedMessage       = "recording dropped: the save queue is full"
+	testRequestID        = "req-42"
 )
+
+// chargeOf is what the queue charges for one recording.
+func chargeOf(wavData []byte, transcript string) int64 {
+	return int64(len(wavData)+len(transcript)) + itemOverhead
+}
 
 // steppingNow moves a millisecond on every reading, so recordings saved one
 // after the other keep their order.
@@ -51,7 +68,7 @@ func recordWithin(t *testing.T, store *Store, wavData []byte, source, transcript
 	returned := make(chan struct{})
 	go func() {
 		defer close(returned)
-		store.Record(wavData, source, transcript)
+		store.Record(wavData, source, transcript, testRequestID)
 	}()
 
 	select {
@@ -116,17 +133,18 @@ func TestRecord_ReturnsWhileASaveIsStuck(t *testing.T) {
 func TestRecord_DropsWhenTheQueueIsFull(t *testing.T) {
 	store, logs := openLogged(t, t.TempDir(), steppingNow())
 	one := wav(t, halfSecond)
-	store.maxQueued = int64(2 * len(one))
+	store.maxQueued = chargeOf(one, "first") + chargeOf(one, "second")
 
 	recordWithin(t, store, one, sourceOpenAI, "first")
 	recordWithin(t, store, wav(t, halfSecond), sourceOpenAI, "second")
 	recordWithin(t, store, wav(t, halfSecond), sourceWyoming, "third")
 
-	dropped := logs.withMessage(t, "recording dropped: the save queue is full")
+	dropped := logs.withMessage(t, droppedMessage)
 	require.Len(t, dropped, 1)
 	assert.Equal(t, "WARN", dropped[0]["level"])
 	assert.Equal(t, sourceWyoming, dropped[0]["source"])
-	assert.InDelta(t, len(one), dropped[0]["bytes"], 0)
+	assert.InDelta(t, chargeOf(one, "third"), dropped[0]["bytes"], 0)
+	assert.Equal(t, testRequestID, dropped[0]["request_id"])
 	runStore(t, store)
 	waitForTranscripts(t, store, "second", "first")
 }
@@ -134,12 +152,101 @@ func TestRecord_DropsWhenTheQueueIsFull(t *testing.T) {
 func TestRecord_QueueAtExactlyTheLimitTakesTheRecording(t *testing.T) {
 	store, logs := openLogged(t, t.TempDir(), steppingNow())
 	one := wav(t, halfSecond)
-	store.maxQueued = int64(len(one))
+	store.maxQueued = chargeOf(one, "fits")
 
 	recordWithin(t, store, one, sourceOpenAI, "fits")
 
-	assert.Empty(t, logs.withMessage(t, "recording dropped: the save queue is full"))
+	assert.Empty(t, logs.withMessage(t, droppedMessage))
 	assert.Equal(t, 1, queuedCount(store))
+}
+
+func TestRecord_ChargesTheTranscriptAndOverhead(t *testing.T) {
+	tiny := wav(t, 1)
+	require.Len(t, tiny, 46)
+	transcript := strings.Repeat("t", maxTranscriptBytes)
+	charge := chargeOf(tiny, transcript)
+
+	atLimit, atLimitLogs := openLogged(t, t.TempDir(), steppingNow())
+	atLimit.maxQueued = charge
+	recordWithin(t, atLimit, tiny, sourceOpenAI, transcript)
+	assert.Equal(t, 1, queuedCount(atLimit))
+	assert.Empty(t, atLimitLogs.withMessage(t, droppedMessage))
+
+	oneUnder, oneUnderLogs := openLogged(t, t.TempDir(), steppingNow())
+	oneUnder.maxQueued = charge - 1
+	recordWithin(t, oneUnder, tiny, sourceOpenAI, transcript)
+	assert.Zero(t, queuedCount(oneUnder))
+	dropped := oneUnderLogs.withMessage(t, droppedMessage)
+	require.Len(t, dropped, 1)
+	assert.InDelta(t, charge, dropped[0]["bytes"], 0)
+}
+
+func TestRecord_DefaultQueueHoldsTheLongestUpload(t *testing.T) {
+	store, logs := openLogged(t, t.TempDir(), steppingNow())
+	require.Equal(t, int64(maxQueuedBytes), store.maxQueued)
+	pcmLen := longestUploadSeconds * audio.RecordingRate * pcmBytes
+	header, err := audio.WAVHeader(audio.RecordingRate, pcmBytes, 1, pcmLen)
+	require.NoError(t, err)
+	longest := slices.Concat(header, make([]byte, pcmLen))
+	require.Len(t, longest, 38_400_044)
+
+	recordWithin(t, store, longest, sourceOpenAI, strings.Repeat("t", maxTranscriptBytes))
+
+	assert.Equal(t, 1, queuedCount(store))
+	assert.Empty(t, logs.withMessage(t, droppedMessage))
+}
+
+func TestRecord_TakesTheTimeWhenCalled(t *testing.T) {
+	store, c := openStore(t, t.TempDir())
+	release := holdStore(t, store)
+	recorded := c.Now()
+
+	recordWithin(t, store, wav(t, halfSecond), sourceOpenAI, "queued")
+	c.advance(time.Hour)
+	release()
+	runStore(t, store)
+
+	waitForTranscripts(t, store, "queued")
+	list, _, err := store.List("", 1)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, recorded, list[0].At, "the time Record was called, not when the worker saved")
+	assert.True(t, strings.HasPrefix(list[0].ID, recorded.Format(idTime)), "id %s", list[0].ID)
+}
+
+func TestRun_CollectsBetweenSaves(t *testing.T) {
+	dir := t.TempDir()
+	store, c := openStore(t, dir)
+	stale := save(t, store, "stale")
+	c.advance(Retention + time.Hour)
+	ticks := make(chan time.Time, 1)
+	store.ticks = func() (<-chan time.Time, func()) { return ticks, func() {} }
+	// write runs on the worker under the store's mutex, which the List in
+	// waitForTranscripts takes after it, so these need no lock of their own.
+	write := store.write
+	audioWrites, staleAtLastSave := 0, false
+	store.write = func(name string, data []byte) error {
+		if strings.HasSuffix(name, opusSuffix) {
+			audioWrites++
+			switch audioWrites {
+			case 1:
+				ticks <- c.Now()
+			case 3:
+				_, err := os.Stat(filepath.Join(dir, stale.ID+jsonSuffix))
+				staleAtLastSave = err == nil
+			}
+		}
+		return write(name, data)
+	}
+	for _, transcript := range []string{"a", "b", "c"} {
+		c.advance(time.Second)
+		recordWithin(t, store, wav(t, halfSecond), sourceOpenAI, transcript)
+	}
+
+	runStore(t, store)
+
+	waitForTranscripts(t, store, "c", "b", "a")
+	assert.False(t, staleAtLastSave, "the collection due after the first save ran before the third")
 }
 
 func TestRun_SavesInOrder(t *testing.T) {
@@ -215,6 +322,7 @@ func TestRun_SaveFailureIsLoggedAtWarn(t *testing.T) {
 	warning := logs.withMessage(t, "could not save recording")[0]
 	assert.Equal(t, "WARN", warning["level"])
 	assert.Equal(t, sourceWyoming, warning["source"])
+	assert.Equal(t, testRequestID, warning["request_id"])
 	assert.Contains(t, warning["error"], "shorter than a WAV header")
 	assert.Empty(t, names(t, dir))
 }
@@ -271,7 +379,7 @@ func TestStore_ConcurrentRecordKeepAndCollectStayUnderTheCap(t *testing.T) {
 	for w := range writers {
 		wg.Go(func() {
 			for i := range rounds {
-				store.Record(wav(t, halfSecond), sourceOpenAI, "concurrent")
+				store.Record(wav(t, halfSecond), sourceOpenAI, "concurrent", testRequestID)
 				if (w+i)%3 == 0 {
 					assert.NoError(t, store.SetKeep(seed.ID, true))
 					keepNewest(t, store)
