@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mniehe/llama-swap-voice/internal/pipeline"
+	"github.com/mniehe/llama-swap-voice/internal/recordings"
 )
 
 const (
@@ -25,15 +26,23 @@ type Server struct {
 	log            *slog.Logger
 	shuttingDown   atomic.Bool
 	controlTimeout time.Duration
+	// recordings is nil when recordings are off, and then its routes are not
+	// registered.
+	recordings *recordings.Store
 }
 
-func New(p *pipeline.Pipeline, log *slog.Logger) *Server {
-	return &Server{
+func New(p *pipeline.Pipeline, log *slog.Logger, opts ...Option) *Server {
+	s := &Server{
 		pipeline:       p,
 		catalogue:      p.Catalogue(),
 		log:            log,
 		controlTimeout: controlRequestTimeout,
 	}
+	for _, apply := range opts {
+		apply(s)
+	}
+
+	return s
 }
 
 type route struct {
@@ -55,8 +64,11 @@ func (s *Server) routes() []route {
 		{http.MethodGet, "/audio/voices", s.handleVoices},
 	}
 
-	routes := make([]route, 0, len(probes)+len(routePrefixes)*len(api))
+	pages := s.recordingRoutes()
+
+	routes := make([]route, 0, len(probes)+len(pages)+len(routePrefixes)*len(api))
 	routes = append(routes, probes...)
+	routes = append(routes, pages...)
 	for _, prefix := range routePrefixes {
 		for _, rt := range api {
 			rt.path = prefix + rt.path

@@ -24,8 +24,10 @@ import (
 	"github.com/mniehe/llama-swap-voice/internal/audio"
 )
 
+// Retention is how long a recording nobody kept stays in the store.
+const Retention = 7 * 24 * time.Hour
+
 const (
-	retention       = 7 * 24 * time.Hour
 	maxStoreBytes   = 1 << 30
 	collectInterval = time.Hour
 
@@ -379,7 +381,7 @@ func (s *Store) Collect() error {
 		return err
 	}
 
-	cutoff := s.now().Add(-retention)
+	cutoff := s.now().Add(-Retention)
 	deleted := 0
 	for _, found := range entries {
 		if found.meta.Keep || !found.meta.At.Before(cutoff) {

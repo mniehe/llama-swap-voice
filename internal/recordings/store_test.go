@@ -298,7 +298,7 @@ func TestCollect_DeletesExpiredUnkeptAndKeepsKept(t *testing.T) {
 	c.advance(day)
 	recent := save(t, store, "recent")
 
-	c.advance(retention - day + time.Second)
+	c.advance(Retention - day + time.Second)
 	require.NoError(t, store.Collect())
 
 	assert.ElementsMatch(t, []string{kept.ID, recent.ID}, ids(t, store))
@@ -310,7 +310,7 @@ func TestCollect_KeepsARecordingAtExactlyTheRetention(t *testing.T) {
 	store, c := openStore(t, t.TempDir())
 	save(t, store, "edge")
 
-	c.advance(retention)
+	c.advance(Retention)
 	require.NoError(t, store.Collect())
 
 	list, err := store.List()
@@ -323,7 +323,7 @@ func TestOpen_CollectsOnce(t *testing.T) {
 	store, _ := openStore(t, dir)
 	save(t, store, "stale")
 
-	c := &clock{now: start.Add(retention + time.Hour)}
+	c := &clock{now: start.Add(Retention + time.Hour)}
 	reopened, err := Open(dir, c.Now, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
@@ -444,7 +444,7 @@ func TestRun_CollectsEveryInterval(t *testing.T) {
 		<-done
 	}()
 
-	c.advance(retention + time.Hour)
+	c.advance(Retention + time.Hour)
 	ticks <- c.Now()
 
 	assert.Eventually(t, func() bool {
