@@ -98,6 +98,16 @@ func (c *libopus) configure() error {
 	return nil
 }
 
+// configuredBitrate reads back the target bitrate libopus is encoding at.
+func (c *libopus) configuredBitrate() (int, error) {
+	var bitrate C.opus_int32
+	if status := C.lsv_opus_get(c.encoder, C.OPUS_GET_BITRATE_REQUEST, &bitrate); status != C.OPUS_OK {
+		return 0, opusError("read bitrate", status)
+	}
+
+	return int(bitrate), nil
+}
+
 // encode returns a packet that stays valid until the next call.
 func (c *libopus) encode(frame []int16) ([]byte, error) {
 	for i, sample := range frame {
