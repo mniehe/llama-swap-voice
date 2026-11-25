@@ -1238,15 +1238,20 @@ func TestServe_RecordingsOn_SavesWyomingTranscriptionAsWyoming(t *testing.T) {
 	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
 }
 
-// statusAs is the status of a GET of url sent with Host set to host.
+// statusAs is the status of a GET of url sent with Host set to host. Each
+// request has a connection of its own: a pooled client can dial a spare
+// connection that never sends a request, and Shutdown waits 5 s for one.
 func statusAs(t *testing.T, url, host string) int {
 	t.Helper()
 
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
 	require.NoError(t, err)
 	req.Host = host
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, resp.Body)
+	assert.NoError(t, err)
 	assert.NoError(t, resp.Body.Close())
 
 	return resp.StatusCode
