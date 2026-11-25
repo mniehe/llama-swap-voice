@@ -6,11 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
-	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -30,8 +29,15 @@ const (
 	// bytes.
 	maxKeepFormBytes = 1 << 10
 	contentTypeHTML  = "text/html; charset=utf-8"
-	shownTime        = "2006-01-02 15:04:05"
-	hoursPerDay      = 24
+	// minPlaybackBytesPerSecond is the slowest a client may fetch a
+	// recording: 32 kbps Opus plays at 4 KiB/s, so this leaves a margin of
+	// four.
+	minPlaybackBytesPerSecond = 16 << 10
+	// maxPlaybackSeconds keeps the playback deadline from overflowing
+	// time.Duration for an absurd file size.
+	maxPlaybackSeconds = int64(math.MaxInt64 / time.Second)
+	shownTime          = "2006-01-02 15:04:05"
+	hoursPerDay        = 24
 )
 
 //go:embed recordings.html
@@ -172,6 +178,9 @@ func newRecordingRow(rec *recordings.Recording) recordingRow {
 	}
 }
 
+// handleRecordingAudio serves the file with its own deadline, long enough to
+// send the whole file at minPlaybackBytesPerSecond, because a browser reads
+// audio about as fast as it plays it. It takes no ASR or TTS slot.
 func (s *Server) handleRecordingAudio(w http.ResponseWriter, r *http.Request) {
 	file, err := s.recordings.Audio(r.PathValue(recordingIDKey))
 	if err != nil {
@@ -180,17 +189,26 @@ func (s *Server) handleRecordingAudio(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	w.Header().Set("Content-Type", contentTypeOgg)
-	if info, statErr := file.Stat(); statErr == nil {
-		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
-	}
-	w.WriteHeader(http.StatusOK)
-	if r.Method == http.MethodHead {
+	info, err := file.Stat()
+	if err != nil {
+		s.recordingFailure(w, r, fmt.Errorf("stat recording: %w", err))
 		return
 	}
-	if _, err := io.Copy(w, file); err != nil {
-		s.logWriteFailure(err)
-	}
+
+	deadline := time.Now().Add(s.playbackTimeout(info.Size()))
+	s.setDeadlines(w, deadline, deadline)
+
+	w.Header().Set("Content-Type", contentTypeOgg)
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeContent(w, r, "", info.ModTime(), file)
+}
+
+// playbackTimeout is the time to send size bytes at
+// minPlaybackBytesPerSecond, and never less than the control timeout.
+func (s *Server) playbackTimeout(size int64) time.Duration {
+	seconds := min(max(size, 0)/minPlaybackBytesPerSecond+1, maxPlaybackSeconds)
+
+	return max(s.controlTimeout, time.Duration(seconds)*time.Second)
 }
 
 func (s *Server) handleRecordingKeep(w http.ResponseWriter, r *http.Request) {

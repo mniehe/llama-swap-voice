@@ -1,7 +1,9 @@
 package openai
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -519,4 +522,96 @@ func TestRecordingKeep_DuplicateValueIsBadRequest(t *testing.T) {
 		assert.Contains(t, errorMessage(t, resp), "keep", "form %q", form)
 	}
 	assert.False(t, onlyRecording(t, store).Keep)
+}
+
+const (
+	// longRecordingBytes outlasts any loopback socket buffer, so a slow
+	// reader holds the handler's writes for as long as it takes.
+	longRecordingBytes = 16 << 20
+	slowReadChunk      = 64 << 10
+	slowReadPause      = 8 * time.Millisecond
+	shortControl       = 300 * time.Millisecond
+)
+
+// plantLongRecording writes one recording whose audio is size bytes of a
+// repeating pattern and returns its id and audio.
+func plantLongRecording(t *testing.T, dir string, size int) (id string, audio []byte) {
+	t.Helper()
+
+	ids := plantRecordings(t, dir, 1)
+	audio = make([]byte, size)
+	for i := range audio {
+		audio[i] = byte(i % 251)
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ids[0]+".opus"), audio, 0o600))
+
+	return ids[0], audio
+}
+
+// readSlowly reads body a chunk at a time with a pause between chunks, as a
+// browser playing the audio would.
+func readSlowly(body io.Reader) ([]byte, error) {
+	var got []byte
+	chunk := make([]byte, slowReadChunk)
+	for {
+		n, err := body.Read(chunk)
+		got = append(got, chunk[:n]...)
+		if errors.Is(err, io.EOF) {
+			return got, nil
+		}
+		if err != nil {
+			return got, err
+		}
+		time.Sleep(slowReadPause)
+	}
+}
+
+func TestRecordingAudio_OutlivesTheControlDeadline(t *testing.T) {
+	dir := t.TempDir()
+	id, want := plantLongRecording(t, dir, longRecordingBytes)
+	h, _ := newRecordingHarnessIn(t, dir, recordedText)
+	h.service.controlTimeout = shortControl
+	h.server.Config.Handler = h.service.Handler()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, h.server.URL+recordingsPath+"/"+id+"/audio", http.NoBody)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer closeQuietly(t, resp.Body)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	began := time.Now()
+	got, err := readSlowly(resp.Body)
+
+	require.NoError(t, err, "after %d of %d bytes", len(got), len(want))
+	assert.Greater(t, time.Since(began), shortControl, "the read outlasted the control deadline")
+	assert.Equal(t, len(want), len(got))
+	assert.True(t, bytes.Equal(want, got), "the audio arrived intact")
+}
+
+func TestRecordingAudio_ServesRangesAndIsNotCached(t *testing.T) {
+	dir := t.TempDir()
+	id, audio := plantLongRecording(t, dir, slowReadChunk)
+	h, _ := newRecordingHarnessIn(t, dir, recordedText)
+	path := recordingsPath + "/" + id + "/audio"
+
+	whole := h.requestAs(http.MethodGet, path, "127.0.0.1", "", nil)
+	assert.Equal(t, http.StatusOK, whole.StatusCode)
+	assert.Equal(t, "no-store", whole.Header.Get("Cache-Control"))
+	assert.Equal(t, "audio/ogg", whole.Header.Get("Content-Type"))
+	assert.Equal(t, "bytes", whole.Header.Get("Accept-Ranges"))
+
+	part := h.requestAs(http.MethodGet, path, "127.0.0.1", "", map[string]string{"Range": "bytes=10-19"})
+	assert.Equal(t, http.StatusPartialContent, part.StatusCode)
+	assert.Equal(t, fmt.Sprintf("bytes 10-19/%d", len(audio)), part.Header.Get("Content-Range"))
+	assert.Equal(t, "no-store", part.Header.Get("Cache-Control"))
+	assert.Equal(t, audio[10:20], readBody(t, part))
+
+	head := h.requestAs(http.MethodHead, path, "127.0.0.1", "", nil)
+	assert.Equal(t, http.StatusOK, head.StatusCode)
+	assert.Equal(t, strconv.Itoa(len(audio)), head.Header.Get("Content-Length"))
+	assert.Empty(t, readBody(t, head))
+
+	beyond := h.requestAs(http.MethodGet, path, "127.0.0.1", "", map[string]string{"Range": fmt.Sprintf("bytes=%d-", len(audio)+1)})
+	assert.Equal(t, http.StatusRequestedRangeNotSatisfiable, beyond.StatusCode)
 }
