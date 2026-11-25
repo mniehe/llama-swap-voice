@@ -115,12 +115,15 @@ a 400. The page sends `Content-Security-Policy: frame-ancestors 'none'`, so
 no other site can frame it.
 
 `GET /recordings/{id}/audio` returns the recording as `audio/ogg`: Ogg Opus,
-16 kHz mono, 32 kbps, with `Cache-Control: no-store`. It serves byte ranges
-(206, or 416 for a range past the end), `HEAD` and conditional requests
-(304, or 412 for an `If-Match` or `If-Unmodified-Since` that fails). A 412,
-416 or 500 is a JSON error with `Cache-Control: no-store`; a 416 also carries
-`Content-Range: bytes */{size}`. The transfer may take as long as sending the
-file at 16 KiB/s takes, and at least 10 seconds.
+16 kHz mono, 32 kbps. It serves byte ranges (206, or 416 for a range past
+the end or a malformed `Range`), `HEAD` and conditional requests (304, or 412
+for an `If-Match` or `If-Unmodified-Since` that fails). Every reply to a
+`GET` or `HEAD` of this path carries `Cache-Control: no-store`, errors
+included: the 403 for a `Host` that is not allowed, the 404, and every other
+status. A 412, 416 or 500 is a JSON error. A 416 for a range past the end also carries
+`Content-Range: bytes */{size}`; a 416 for a malformed `Range` carries no
+`Content-Range`. The transfer may take as long as sending the file at
+16 KiB/s takes, and at least 10 seconds.
 
 `POST /recordings/{id}/keep` takes a form with one field, `keep`, set to
 `true` or `false` and given once. On success it answers 303 with
@@ -136,8 +139,11 @@ an id with no recording.
 The service deletes a recording that is not kept 7 days after it was made,
 checking once at start and then every hour. All recordings together may take
 at most 1 GiB. A new recording first displaces the oldest ones that are not
-kept. When kept recordings alone fill the 1 GiB, the service saves nothing
-new, logs a warning, and still returns the transcript.
+kept. Kept recordings count toward the 1 GiB, and so do the bytes no
+deletion can reclaim: recordings left on disk because their metadata or
+files cannot be read, and files the service failed to delete. When those
+leave no room for a new recording, the service saves nothing new, logs a
+warning, and still returns the transcript.
 
 The service saves a recording in the background after it has returned the
 transcript, one at a time in the order they arrived. A recording is dated
@@ -158,7 +164,7 @@ change, so a later failure cuts the transfer.
 | 400 | A malformed body; an empty or too long `input`; an unknown voice or format; a `speed` out of range; a missing `file`; an upload that the service cannot decode or that is longer than 20 minutes; a malformed recordings page query |
 | 403 | A recordings request whose `Host` is not allowed; a keep post from another site |
 | 404, 405 | An unknown path; a wrong method; an unknown or malformed recording id |
-| 412, 416 | A recording's audio fetched with a precondition that fails, or a range past its end |
+| 412, 416 | A recording's audio fetched with a precondition that fails, or a range past its end or malformed |
 | 429 and other upstream errors | Passed on from llama-swap or the model server, with its message and `Retry-After` |
 | 500 | A fault inside the service. The cause is in its log. |
 | 502 | llama-swap failed, sent no audio, or sent a transcript over 1 MiB |
