@@ -405,8 +405,8 @@ refuses.
 
 | Page | Contents |
 |---|---|
-| [Module options](docs/options.md) | Every option, the Wyoming options included; what the module refuses and what it adds to llama-swap; when the models unload; concurrency; the sandbox and the GPU; the environment variables |
-| [The HTTP API](docs/api.md) | Endpoints, audio formats, errors and status codes, limits and shutdown; the Wyoming listener's events, limits and errors |
+| [Module options](docs/options.md) | Every option, the Wyoming options included; keeping transcription recordings; what the module refuses and what it adds to llama-swap; when the models unload; concurrency; the sandbox and the GPU; the environment variables |
+| [The HTTP API](docs/api.md) | Endpoints, audio formats, errors and status codes, limits and shutdown; the recordings page; the Wyoming listener's events, limits and errors |
 | [The Qwen TTS server](docs/qwen-tts-server.md) | The Python server of the `qwentts` backend: startup and exit, behaviour under llama-swap, the configuration file, endpoints and errors |
 
 ## Running without Nix

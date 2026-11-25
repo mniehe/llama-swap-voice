@@ -230,6 +230,52 @@ compares the options only: an override that gives both listeners one address
 passes evaluation and fails at start, and an override that separates two equal
 options does not clear the evaluation error.
 
+## Recordings
+
+This option keeps the audio of transcriptions, so that you can listen to
+them and review the transcripts. It is off by default.
+
+| Option | Type | Default | Effect |
+|---|---|---|---|
+| `recordings.enable` | boolean | `false` | Keeps the audio and transcript of every successful transcription, from the HTTP API and from the Wyoming listener, in `<stateDir>/recordings`. Serves the [recordings page](api.md#recordings) at `/recordings` on the HTTP port. |
+
+**Turning this on stores household speech.** Each recording stays on disk
+for 7 days. A recording that you mark kept on the page stays until you
+release it. The page has no authentication: anyone who can reach the HTTP
+port can listen to every recording and change its keep mark. Keep `host` on
+loopback, or put a reverse proxy that checks who is asking in front of the
+port.
+
+The service saves a recording after the transcription succeeds and before it
+answers. A failed transcription saves nothing. A save that fails, for example
+because the disk is full, is logged as a warning, and the client still gets
+its transcript.
+
+Each recording is two files with the same name: `<id>.opus`, the audio that
+was sent to the ASR model as Ogg Opus (16 kHz mono, 32 kbps, about 14 MB an
+hour), and `<id>.json`:
+
+```json
+{"at":"2026-11-25T15:30:00Z","durationMs":2140,"source":"wyoming","transcript":"Turn on the kitchen lights.","keep":false}
+```
+
+`source` is `openai` for the HTTP API and `wyoming` for the Wyoming
+listener. The id is the UTC time of the recording and a random suffix, such
+as `20261125T153000Z-1a2b3c4d`.
+
+The service deletes recordings that are not kept and are older than 7 days,
+once when it starts and then every hour. The two files of all recordings
+together may take at most 1 GiB. Before a save that would pass that cap, the
+service deletes the oldest recordings that are not kept until the new one
+fits. Kept recordings count toward the cap. When kept recordings alone leave
+no room, the service saves nothing and logs a warning. The retention, the
+cap and the interval are fixed.
+
+With `recordings.enable` on, the module creates `<stateDir>/recordings`
+with mode `0700`, owned by `user` and `group`, and makes that directory,
+and only that directory, writable for the service. Turning the option off
+again leaves the directory and its recordings on disk; delete them by hand.
+
 ## Packages, accounts, paths and model files
 
 | Option | Type | Default | Effect |
@@ -237,7 +283,7 @@ options does not clear the evaluation error.
 | `package` | package | this flake's package | The build of the service to run. |
 | `user` | string | `"llama-swap-voice"` | The user the service runs as. The module creates it only under the default name. |
 | `group` | string | `"llama-swap-voice"` | The group the service runs as. The module creates it only under the default name. Under `qwentts`, llama-swap's user joins it, so do not share it with other services. |
-| `stateDir` | string | `"/var/lib/llama-swap-voice"` | A directory for this module alone. The voices directory is `<stateDir>/voices`. Use an absolute path with no `%` and no slash at the end. |
+| `stateDir` | string | `"/var/lib/llama-swap-voice"` | A directory for this module alone. The voices directory is `<stateDir>/voices`, and the [recordings](#recordings) directory is `<stateDir>/recordings`. Use an absolute path with no `%` and no slash at the end. |
 | `extraEnvironment` | attribute set of strings | `{}` | Extra [environment variables](#environment-variables) for the service, by full name. They override the variables the module writes. Evaluation checks only the [variables the module reads back](#variables-the-module-reads-back). The service checks every other override, the Wyoming variables included, when it starts, and refuses to start on a bad value. |
 | `voiceNames` | list of strings, read-only | the declared names | The names of the declared voices, sorted. Other modules can read it. |
 | `llamaSwap.group.name` | string | `"voice"` | The name of the group. |
@@ -425,7 +471,8 @@ speech request again.
 ## The sandbox and the GPU
 
 The service's unit can write only to its private `/tmp`, where large uploads
-go. It cannot read home directories.
+go, and, with `recordings.enable` on, to `<stateDir>/recordings`. It cannot
+read home directories.
 
 The llama-swap unit from nixpkgs runs as a dynamic user with a read-only
 file system and no access to `/home`. The module changes that unit only when
@@ -452,7 +499,8 @@ module writes them for you, so you need this table only when you run the
 service by hand or use `extraEnvironment`. Each name starts with
 `LLAMA_SWAP_VOICE_`; the table and the rest of this page leave the prefix
 out. Only `VOICES_DEFAULT` is required. The service checks the `WYOMING_`
-variables only when `WYOMING_ENABLED` is `true`.
+variables only when `WYOMING_ENABLED` is `true`, and `RECORDINGS_DIR` only
+when `RECORDINGS_ENABLE` is `true`.
 
 | Variable (`LLAMA_SWAP_VOICE_…`) | Module option | Default | Effect |
 |---|---|---|---|
@@ -483,6 +531,8 @@ variables only when `WYOMING_ENABLED` is `true`.
 | `WYOMING_SPEED` | `wyoming.speed` | `1.0` | The speech speed for every Wyoming synthesis, 0.25 to 4. |
 | `WYOMING_STREAMING` | `wyoming.streaming` | `sentences` | How the service speaks a [streamed synthesis](api.md#streamed-synthesis): `sentences` speaks each sentence as it completes and advertises streaming in `info`; `whole` speaks the whole text after `synthesize-stop` and advertises no streaming. |
 | `WYOMING_STREAMINGMAXCHARS` | `wyoming.streamingMaxChars` | `300` | 1 to `TTS_MAXINPUTCHARS`. In `sentences` mode, the most characters of the sentences that one `synthesize-chunk` completes to join into one request. A longer sentence is spoken whole. The text of a stream not yet spoken plus an arriving chunk may not exceed `TTS_MAXINPUTCHARS`. |
+| `RECORDINGS_ENABLE` | `recordings.enable` | `false` | `true` keeps the audio and transcript of every successful transcription in `RECORDINGS_DIR` and serves the [recordings page](api.md#recordings). This stores household speech for 7 days, and kept recordings until they are released. |
+| `RECORDINGS_DIR` | `stateDir` | none | The directory of recordings, an absolute path. Required when `RECORDINGS_ENABLE` is `true`. The service creates it with mode `0700` if it is missing, and refuses to start if it cannot create it or write to it. The module sets it to `<stateDir>/recordings`. |
 
 Set a variable that has no option through `extraEnvironment`:
 
@@ -491,5 +541,6 @@ services.llama-swap-voice.extraEnvironment.LLAMA_SWAP_VOICE_LOG_LEVEL = "debug";
 ```
 
 The module writes the two model names only when `llamaSwap.enable` is on,
-and the `WYOMING_` variables only when `wyoming.enable` is on. If
+the `WYOMING_` variables only when `wyoming.enable` is on, and the
+`RECORDINGS_` variables only when `recordings.enable` is on. If
 a value is wrong at startup, the service lists every problem and exits.

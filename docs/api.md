@@ -11,8 +11,9 @@ lists the variable behind each one.
 
 ## Endpoints
 
-The service listens on `127.0.0.1:8920` by default. Every path also works
-without the `/v1` prefix.
+The service listens on `127.0.0.1:8920` by default. Every `/v1` path also
+works without the `/v1` prefix. The three `/recordings` paths exist only
+with `recordings.enable` on, and have no `/v1` form.
 
 | Endpoint | Purpose | Status codes |
 |---|---|---|
@@ -23,6 +24,9 @@ without the `/v1` prefix.
 | `GET /health` | Health check | 200 |
 | `GET /internal/liveness` | Liveness probe | 200 |
 | `GET /internal/readiness` | Readiness probe | 200; 503 in plain text during shutdown |
+| `GET /recordings` | The [recordings](#recordings) page, in HTML | 200, 500 |
+| `GET /recordings/{id}/audio` | One recording, as Ogg Opus | 200, 404, 500 |
+| `POST /recordings/{id}/keep` | Mark a recording kept, or release it | 303, 400, 404, 500 |
 
 An unknown path gets a 404 and a wrong method gets a 405.
 
@@ -79,6 +83,37 @@ FLAC because its FLAC decoder was removed: a review found defects in it on
 malformed files. Convert such a file to WAV, Opus or MP3 first. Hermes does
 this itself when it sees the 400.
 
+## Recordings
+
+With `recordings.enable` on, the service keeps the audio and transcript of
+every successful transcription. [Recordings](options.md#recordings) in the
+module options describes what it stores, where, and for how long. Without
+the option, these paths answer 404 like any unknown path. They have no
+authentication; the recordings hold household speech, so limit who can reach
+the port.
+
+`GET /recordings` returns an HTML page that needs no JavaScript. It lists the
+recordings newest first, each with its UTC time, its length, its source
+(`openai` or `wyoming`) and its transcript. Each row has an audio player and
+a button that marks the recording kept or releases it.
+
+`GET /recordings/{id}/audio` returns the recording as `audio/ogg`: Ogg Opus,
+16 kHz mono, 32 kbps. The service does not serve byte ranges.
+
+`POST /recordings/{id}/keep` takes a form with one field, `keep`, set to
+`true` or `false`. On success it answers 303 with `Location: /recordings`.
+Any other value, a missing field or a form over 1 KiB gets a 400.
+
+An id that does not have the form of a recording id, such as
+`20261125T153000Z-1a2b3c4d`, gets a 404 without touching the disk, as does
+an id with no recording.
+
+The service deletes a recording that is not kept 7 days after it was made,
+checking once at start and then every hour. All recordings together may take
+at most 1 GiB. A new recording first displaces the oldest ones that are not
+kept. When kept recordings alone fill the 1 GiB, the service saves nothing
+new, logs a warning, and still returns the transcript.
+
 ## Errors
 
 An error is JSON of the form `{"error":{"message":"…"}}`. This includes
@@ -88,7 +123,7 @@ change, so a later failure cuts the transfer.
 | Status | Cause |
 |---|---|
 | 400 | A malformed body; an empty or too long `input`; an unknown voice or format; a `speed` out of range; a missing `file`; an upload that the service cannot decode or that is longer than 20 minutes |
-| 404, 405 | An unknown path; a wrong method |
+| 404, 405 | An unknown path; a wrong method; an unknown or malformed recording id |
 | 429 and other upstream errors | Passed on from llama-swap or the model server, with its message and `Retry-After` |
 | 500 | A fault inside the service. The cause is in its log. |
 | 502 | llama-swap failed, sent no audio, or sent a transcript over 1 MiB |
@@ -115,6 +150,9 @@ no redirect from llama-swap.
 | Clip size | 10 MiB | fixed |
 | Time for a speech request or a transcription | 2 minutes | `request.timeout` |
 | Time for any other request | 10 seconds | fixed |
+| Recordings keep form | 1 KiB | fixed |
+| Recordings kept when not marked | 7 days | fixed |
+| All recordings together | 1 GiB | fixed |
 
 ## Shutdown
 
