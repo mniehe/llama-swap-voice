@@ -151,19 +151,26 @@ before it is sent and carries `Cache-Control: no-store` and
 |---|---|
 | `keep` | `true` keeps the recording; absent releases it. |
 | `transcriptionError` | `true` flags the transcript as wrong; absent clears the flag. |
-| `correctText` | What was said, at most 16 KiB of UTF-8. Empty, with the flag, means the recogniser wrote text when nobody spoke. |
+| `correctText` | What was said, at most 16 KiB of UTF-8 once each line break is one LF. Empty, with the flag, means the recogniser wrote text when nobody spoke. |
 | `profile` | The id of a speaker profile, once for each speaker. The recording's speakers become exactly these. |
 
 A ticked checkbox is sent as `true` and an unticked one not at all, as a
 browser does. A `profile` given twice counts once. A flagged recording is always kept, whatever `keep` says, so
 the 7-day expiry never deletes a test case. Without the flag, the service
-stores no correct text, whatever `correctText` says. The original transcript
+stores no correct text, whatever `correctText` says, and does not check it.
+The service stores each line break of the correct text, CRLF or a lone CR,
+as one LF, and measures the 16 KiB after that. The original transcript
 is never changed. On success the post answers 303 with
-`Location: /recordings/{id}`. A checkbox with a value other than `true`, a
-field other than `profile` given twice, a correct text over 16 KiB or not
-valid UTF-8, a `profile` that names no profile, or a form over 51,776 bytes
-gets a 400. That bound fits the correct text at its limit, percent-encoded,
-and all 64 profiles. The service ignores fields it does not know.
+`Location: /recordings/{id}`. A `keep` or `transcriptionError` with a value
+other than `true`; a `keep`, `transcriptionError` or `correctText` given
+twice; with the flag on, a correct text over 16 KiB or not valid UTF-8; a
+`profile` that names no profile; or a form over 100,928 bytes gets a 400.
+That bound fits all 64 profiles and the correct text at its limit even when
+every byte of it is a line break that the browser sends as `%0D%0A`. The
+service ignores fields it does not know, however often they are given.
+
+The form saves the whole review at once. Two saves of one recording, for
+example from two browser tabs, do not merge: the last save wins.
 
 `POST /recordings/{id}/keep` takes a form with one field, `keep`, set to
 `true` or `false` and given once. On success it answers 303 with
@@ -186,7 +193,9 @@ once, except the delete form, which posts none:
 
 On success each answers 303 with `Location: /recordings/profiles`. The
 service trims spaces from a name. A name that is then empty, over 64 bytes,
-not valid UTF-8 or holds a control character, a missing or repeated `name`,
+not valid UTF-8 or holds a character that is not graphic (a control or
+format character, such as a zero-width space or a direction override, or a
+line or paragraph separator), a missing or repeated `name`,
 a 65th profile, or a form over 1 KiB gets a 400. A name another profile has,
 ignoring case, gets a 409. A `{profile}` that is not 16 hex digits or names
 no profile gets a 404. The service gives each profile its id; the pages show
@@ -194,7 +203,12 @@ only its name.
 
 A post to any of these forms that a browser marks as coming from another
 site (`Sec-Fetch-Site`, or an `Origin` that does not match the host) gets a
-403.
+403. A post to any of them whose `Content-Type` is not
+`application/x-www-form-urlencoded` (parameters such as `charset` allowed)
+gets a 415 and changes nothing, an empty body included; a browser sends
+every one of these forms with that type. A review, a keep change, a new
+profile or a rename that would make its file larger and take all
+recordings past the 1 GiB cap gets a 507 and changes nothing; see below.
 
 An id that does not have the form of a recording id, such as
 `20261125T153000Z-1a2b3c4d`, gets a 404 without touching the disk, as does
@@ -206,9 +220,12 @@ at most 1 GiB. A new recording first displaces the oldest ones that are not
 kept. Kept recordings count toward the 1 GiB, and so do the bytes no
 deletion can reclaim: recordings left on disk because their metadata or
 files cannot be read, files the service failed to delete, and the speaker
-profiles file. Neither a review nor a profile change is refused for the cap;
-the bytes they add count at the next save. When those leave no room for a new recording, the service saves nothing new, logs a
-warning, and still returns the transcript.
+profiles file. When those leave no room for a new recording, the service saves nothing new, logs a
+warning, and still returns the transcript. An edit never displaces a
+recording: a review, a keep change, a new profile or a rename that makes its
+file larger is refused with a 507 when the store would then pass 1 GiB. An
+edit that does not make its file larger, and deleting a profile, are always
+allowed.
 
 The service saves a recording in the background after it has returned the
 transcript, one at a time in the order they arrived. A recording is dated
@@ -230,12 +247,14 @@ change, so a later failure cuts the transfer.
 | 403 | A recordings request whose `Host` is not allowed; a recordings form post from another site |
 | 404, 405 | An unknown path; a wrong method; an unknown or malformed recording id or speaker profile id |
 | 409 | Releasing a recording flagged with a transcription error; a speaker profile name another profile has |
+| 415 | A recordings form post whose `Content-Type` is not `application/x-www-form-urlencoded` |
 | 412, 416 | A recording's audio fetched with a precondition that fails, or a range past its end or malformed |
 | 429 and other upstream errors | Passed on from llama-swap or the model server, with its message and `Retry-After` |
 | 500 | A fault inside the service. The cause is in its log. |
 | 502 | llama-swap failed, sent no audio, or sent a transcript over 1 MiB |
 | 503 | The service is at a concurrency limit. The readiness probe also answers 503 during shutdown. |
 | 504 | The request took longer than `request.timeout`, the wait at the [speech gate](options.md#concurrency) included |
+| 507 | A recordings edit that would grow its file past the 1 GiB cap on all recordings |
 
 ### Retries
 
@@ -258,7 +277,7 @@ no redirect from llama-swap.
 | Time for a speech request or a transcription | 2 minutes | `request.timeout` |
 | Time for any other request | 10 seconds | fixed |
 | Recordings keep form | 1 KiB | fixed |
-| Recording review form | 51,776 bytes | fixed |
+| Recording review form | 100,928 bytes | fixed |
 | Correct text of a recording | 16 KiB | fixed |
 | Speaker profiles | 64 | fixed |
 | Speaker profile name, after trimming spaces | 64 bytes | fixed |

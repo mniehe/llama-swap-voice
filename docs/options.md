@@ -284,8 +284,11 @@ The id is that time to the second and a random suffix, such as
 
 `transcriptionError`, `correctText` and `profiles` hold the review you save
 on the recording's page. `transcriptionError` is `true` when the transcript
-is wrong; such a recording always has `keep` set. `correctText` is what was
-said, at most 16 KiB, and is empty when the flag is off. With the flag on,
+is wrong; such a recording always has `keep` set, and the service treats a
+`.json` with `transcriptionError` `true` as kept even when its `keep` says
+`false`, so it never expires or evicts one. `correctText` is what was
+said, at most 16 KiB with each line break stored as one LF, and is empty
+when the flag is off. With the flag on,
 an empty `correctText` means the recogniser wrote text when nobody spoke.
 `profiles` holds the ids of the recording's speakers. `transcript` always
 holds what the recogniser returned; a review never changes it. A `.json`
@@ -304,12 +307,18 @@ speakers by id, so a rename shows on every recording at once. Deleting a
 profile rewrites only `profiles.json`: a recording that named it no longer
 shows it, and drops its id the next time the service writes that
 recording's `.json`. At start the service refuses to run when
-`profiles.json` does not decode, is over 32 KiB, or breaks a rule the
+`profiles.json` is not a regular file (a symlink, a directory or a FIFO,
+which it never opens), is over 32 KiB, is not valid UTF-8, or is not one
+JSON object whose only key is a `profiles` list: a missing or `null` list,
+another key, a profile with a key besides `id` and `name`, or anything after
+the object refuses it. It also refuses a file that breaks a rule the
 profiles page enforces: more than 64 profiles, an id that is not 16
 lowercase hex digits, or a name that is empty, over 64 bytes, has spaces
-around it or a control character, or that another profile has, ignoring
-case. Mend or delete the file to start it again; deleting it removes every
-profile from every recording. `profiles.json` counts toward the cap.
+around it, holds a character that is not graphic (a control or format
+character, or a line or paragraph separator), or that another profile has,
+ignoring case. `{"profiles":[]}` is valid. Mend or delete the file to start
+it again; deleting it removes every profile from every recording.
+`profiles.json` counts toward the cap.
 
 Rolling back to a release without the review loses it: an older release
 reads these files, but when it rewrites one, for a change of its keep mark,
@@ -323,9 +332,12 @@ together may take at most 1 GiB. Before a save that would pass that cap, the
 service deletes the oldest recordings that are not kept until the new one
 fits. Kept recordings count toward the cap, and so do the recordings left
 for you below, any file the service failed to delete, and `profiles.json`.
-A review or a profile change is never refused for the cap; the bytes it
-adds count at the next save. When those alone
-leave no room, the service saves nothing and logs a warning. A deletion that
+When those alone
+leave no room, the service saves nothing and logs a warning. An edit never
+deletes a recording to make room: a review, a keep change, a new profile or
+a rename that makes its file larger is refused when the store would then
+pass the cap, and the page answers 507. An edit that does not make its file
+larger, and deleting a profile, are always allowed. A deletion that
 fails is logged as a warning and the service goes on with the others. The
 retention, the cap and the interval are fixed.
 
