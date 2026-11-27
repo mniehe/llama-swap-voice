@@ -1022,3 +1022,309 @@ func TestRecordingsPage_LinksRowsAndMarksFlaggedOnesWithoutRelease(t *testing.T)
 	assert.Contains(t, page, `action="/recordings/`+plain+`/keep"`, "a kept row can be released")
 	assert.NotContains(t, page, `action="/recordings/`+flagged+`/keep"`, "a flagged row cannot be released")
 }
+
+const (
+	profilesPath     = "/recordings/profiles"
+	unknownProfileID = "0123456789abcdef"
+	scriptName       = `<i>Anna</i>`
+	escapedName      = `&lt;i&gt;Anna&lt;/i&gt;`
+	// profileLimit and profileNameLimit are the store's profile bounds,
+	// written out so a changed constant fails here.
+	profileLimit     = 64
+	profileNameLimit = 64
+)
+
+func addProfile(t *testing.T, store *recordings.Store, name string) recordings.Profile {
+	t.Helper()
+
+	profile, err := store.AddProfile(name)
+	require.NoError(t, err)
+
+	return profile
+}
+
+func profileNamesOf(store *recordings.Store) []string {
+	profiles := store.Profiles()
+	names := make([]string, 0, len(profiles))
+	for _, profile := range profiles {
+		names = append(names, profile.Name)
+	}
+
+	return names
+}
+
+// postProfiles posts form to path without following the redirect.
+func postProfiles(t *testing.T, h *harness, path, form string) *http.Response {
+	t.Helper()
+
+	return h.requestAs(http.MethodPost, path, "127.0.0.1", form, nil)
+}
+
+func TestProfilesPage_ListsEachProfileWithItsForms(t *testing.T) {
+	h, store, _ := newRecordingHarness(t, recordedText)
+	anna := addProfile(t, store, scriptName)
+	ben := addProfile(t, store, "Ben")
+
+	resp := h.get(profilesPath)
+
+	require.Equal(t, http.StatusOK, resp.StatusCode, "the profiles page is not taken for a recording")
+	assert.Equal(t, contentTypeHTML, resp.Header.Get("Content-Type"))
+	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	assert.Equal(t, "frame-ancestors 'none'", resp.Header.Get("Content-Security-Policy"))
+	page := string(readBody(t, resp))
+	assert.Contains(t, page, `<form method="post" action="/recordings/profiles">`)
+	assert.NotContains(t, page, "<i>")
+	for _, profile := range []recordings.Profile{anna, ben} {
+		assert.Contains(t, page, `action="/recordings/profiles/`+profile.ID+`/rename"`)
+		assert.Contains(t, page, `action="/recordings/profiles/`+profile.ID+`/delete"`)
+	}
+	assert.Contains(t, page, `value="`+escapedName+`"`)
+	assert.Contains(t, page, `value="Ben"`)
+}
+
+func TestProfileRoutes_AddRenameAndDeleteRedirectToTheProfilesPage(t *testing.T) {
+	h, store, _ := newRecordingHarness(t, recordedText)
+
+	added := postProfiles(t, h, profilesPath, "name="+url.QueryEscape("  Anna "))
+	assert.Equal(t, http.StatusSeeOther, added.StatusCode)
+	assert.Equal(t, profilesPath, added.Header.Get("Location"))
+	require.Equal(t, []string{"Anna"}, profileNamesOf(store))
+	id := store.Profiles()[0].ID
+
+	renamed := postProfiles(t, h, profilesPath+"/"+id+"/rename", "name=Annabel")
+	assert.Equal(t, http.StatusSeeOther, renamed.StatusCode)
+	assert.Equal(t, profilesPath, renamed.Header.Get("Location"))
+	assert.Equal(t, []string{"Annabel"}, profileNamesOf(store))
+
+	deleted := postProfiles(t, h, profilesPath+"/"+id+"/delete", "")
+	assert.Equal(t, http.StatusSeeOther, deleted.StatusCode)
+	assert.Equal(t, profilesPath, deleted.Header.Get("Location"))
+	assert.Empty(t, profileNamesOf(store))
+}
+
+// profileFormOf returns a profile form padded with a second field to
+// exactly size bytes.
+func profileFormOf(t *testing.T, size int) string {
+	t.Helper()
+
+	form := "name=Anna&pad="
+	require.LessOrEqual(t, len(form), size)
+
+	return form + strings.Repeat("p", size-len(form))
+}
+
+func TestProfileRoutes_FormAtTheLimitIsAccepted(t *testing.T) {
+	h, store, _ := newRecordingHarness(t, recordedText)
+
+	resp := postProfiles(t, h, profilesPath, profileFormOf(t, maxProfileFormBytes))
+
+	assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	assert.Equal(t, []string{"Anna"}, profileNamesOf(store))
+}
+
+func TestProfileRoutes_BadNamesAreBadRequest(t *testing.T) {
+	h, store, _ := newRecordingHarness(t, recordedText)
+	ben := addProfile(t, store, "Ben")
+
+	for name, form := range map[string]string{
+		"form one byte over": profileFormOf(t, maxProfileFormBytes+1),
+		"name over":          "name=" + strings.Repeat("a", profileNameLimit+1),
+		"name empty":         "name=",
+		"name spaces":        "name=+++",
+		"name control":       "name=An%0Ana",
+		"name not UTF-8":     "name=%FF",
+		"name missing":       "",
+		"name twice":         "name=a&name=b",
+	} {
+		for _, path := range []string{profilesPath, profilesPath + "/" + ben.ID + "/rename"} {
+			resp := postProfiles(t, h, path, form)
+
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "%s to %s", name, path)
+			assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"), "%s to %s", name, path)
+			assert.NotEmpty(t, errorMessage(t, resp), "%s to %s", name, path)
+		}
+	}
+	assert.Equal(t, []string{"Ben"}, profileNamesOf(store))
+}
+
+func TestProfileRoutes_NameAtTheLimitIsAccepted(t *testing.T) {
+	h, store, _ := newRecordingHarness(t, recordedText)
+	name := strings.Repeat("a", profileNameLimit)
+
+	resp := postProfiles(t, h, profilesPath, "name="+name)
+
+	assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	assert.Equal(t, []string{name}, profileNamesOf(store))
+}
+
+func TestProfileRoutes_OneProfileOverTheLimitIsBadRequest(t *testing.T) {
+	h, store, _ := newRecordingHarness(t, recordedText)
+	for i := range profileLimit {
+		addProfile(t, store, fmt.Sprintf("person %d", i))
+	}
+
+	resp := postProfiles(t, h, profilesPath, "name=Anna")
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Contains(t, errorMessage(t, resp), "64")
+	assert.Len(t, store.Profiles(), profileLimit)
+}
+
+func TestProfileRoutes_DuplicateNameIsConflict(t *testing.T) {
+	h, store, _ := newRecordingHarness(t, recordedText)
+	addProfile(t, store, "Anna")
+	ben := addProfile(t, store, "Ben")
+
+	for _, path := range []string{profilesPath, profilesPath + "/" + ben.ID + "/rename"} {
+		resp := postProfiles(t, h, path, "name=anna")
+
+		assert.Equal(t, http.StatusConflict, resp.StatusCode, path)
+		assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"), path)
+		assert.NotEmpty(t, errorMessage(t, resp), path)
+	}
+	assert.Equal(t, []string{"Anna", "Ben"}, profileNamesOf(store))
+}
+
+func TestProfileRoutes_UnknownOrMalformedProfileIsNotFound(t *testing.T) {
+	h, store, _ := newRecordingHarness(t, recordedText)
+	addProfile(t, store, "Anna")
+
+	for _, id := range []string{unknownProfileID, "x", "..%2Fx", strings.Repeat("A", 16)} {
+		for _, action := range []string{"rename", "delete"} {
+			resp := postProfiles(t, h, profilesPath+"/"+id+"/"+action, "name=Ben")
+
+			assert.Equal(t, http.StatusNotFound, resp.StatusCode, "%s %q", action, id)
+			assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"), "%s %q", action, id)
+			assert.NotEmpty(t, errorMessage(t, resp), "%s %q", action, id)
+		}
+	}
+	assert.Equal(t, []string{"Anna"}, profileNamesOf(store))
+}
+
+func TestProfileRoutes_ForeignHostAndCrossSiteAreForbidden(t *testing.T) {
+	dir := t.TempDir()
+	h, store := newRecordingHarnessAllowing(t, dir, recordedText, []string{"voice.example"})
+	anna := addProfile(t, store, "Anna")
+	posts := map[string]string{
+		profilesPath:                             "name=Ben",
+		profilesPath + "/" + anna.ID + "/rename": "name=Ben",
+		profilesPath + "/" + anna.ID + "/delete": "",
+	}
+
+	page := h.requestAs(http.MethodGet, profilesPath, "evil.example", "", nil)
+	assert.Equal(t, http.StatusForbidden, page.StatusCode, "the page as a foreign host")
+	assert.Equal(t, contentTypeJSON, page.Header.Get("Content-Type"))
+	for path, form := range posts {
+		foreign := h.requestAs(http.MethodPost, path, "evil.example", form, nil)
+		assert.Equal(t, http.StatusForbidden, foreign.StatusCode, "%s as a foreign host", path)
+		assert.NotEmpty(t, errorMessage(t, foreign))
+
+		crossSite := h.requestAs(http.MethodPost, path, "127.0.0.1", form, map[string]string{"Sec-Fetch-Site": "cross-site"})
+		assert.Equal(t, http.StatusForbidden, crossSite.StatusCode, "%s from another site", path)
+		assert.NotEmpty(t, errorMessage(t, crossSite))
+	}
+	assert.Equal(t, []string{"Anna"}, profileNamesOf(store))
+
+	allowed := h.requestAs(http.MethodGet, profilesPath, "voice.example", "", nil)
+	assert.Equal(t, http.StatusOK, allowed.StatusCode)
+}
+
+func TestProfileRoutes_WrongMethodIsNotAllowed(t *testing.T) {
+	h, _, _ := newRecordingHarness(t, recordedText)
+
+	resp := h.requestAs(http.MethodDelete, profilesPath, "127.0.0.1", "", nil)
+
+	assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
+	assert.Equal(t, "GET, HEAD, POST", resp.Header.Get("Allow"))
+}
+
+func TestRecordingPage_OffersEachProfileWithItsState(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+	anna := addProfile(t, store, scriptName)
+	ben := addProfile(t, store, "Ben")
+	require.NoError(t, store.Annotate(ids[0], recordings.Annotation{Profiles: []string{anna.ID}}))
+
+	page := fetchRecordingPage(t, h, ids[0])
+
+	assert.Contains(t, page, `<input type="checkbox" name="profile" value="`+anna.ID+`" checked> `+escapedName)
+	assert.Contains(t, page, `<input type="checkbox" name="profile" value="`+ben.ID+`"> Ben`)
+	assert.Contains(t, page, `<a href="/recordings/profiles">`)
+}
+
+func TestRecordingForm_SavesProfiles(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+	anna := addProfile(t, store, "Anna")
+	ben := addProfile(t, store, "Ben")
+
+	both := postRecording(t, h, ids[0], "profile="+ben.ID+"&profile="+anna.ID)
+	require.Equal(t, http.StatusSeeOther, both.StatusCode)
+	got, err := store.Recording(ids[0])
+	require.NoError(t, err)
+	assert.Equal(t, []recordings.Profile{ben, anna}, got.Profiles)
+
+	none := postRecording(t, h, ids[0], "keep=true")
+	require.Equal(t, http.StatusSeeOther, none.StatusCode)
+	got, err = store.Recording(ids[0])
+	require.NoError(t, err)
+	assert.Empty(t, got.Profiles)
+}
+
+func TestRecordingForm_UnknownProfileIsBadRequest(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+	anna := addProfile(t, store, "Anna")
+
+	for _, form := range []string{"profile=" + unknownProfileID, "profile=" + anna.ID + "&profile=" + unknownProfileID, "profile="} {
+		resp := postRecording(t, h, ids[0], "keep=true&"+form)
+
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, form)
+		assert.Contains(t, errorMessage(t, resp), "profile", form)
+	}
+	got, err := store.Recording(ids[0])
+	require.NoError(t, err)
+	assert.False(t, got.Keep)
+	assert.Empty(t, got.Profiles)
+}
+
+func TestRecordingForm_EveryProfileFitsTheBound(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+	form := url.Values{
+		"keep":               {"true"},
+		"transcriptionError": {"true"},
+		"correctText":        {strings.Repeat("é", correctTextBytes/2)},
+	}
+	for i := range profileLimit {
+		form.Add("profile", addProfile(t, store, fmt.Sprintf("person %d", i)).ID)
+	}
+	body := form.Encode()
+	require.LessOrEqual(t, len(body), maxRecordingFormBytes)
+
+	resp := postRecording(t, h, ids[0], body)
+
+	assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	got, err := store.Recording(ids[0])
+	require.NoError(t, err)
+	assert.Len(t, got.Profiles, profileLimit)
+}
+
+func TestRecordingsPage_ShowsSpeakerNames(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 2)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+	anna := addProfile(t, store, scriptName)
+	ben := addProfile(t, store, "Ben")
+	require.NoError(t, store.Annotate(ids[1], recordings.Annotation{Profiles: []string{anna.ID, ben.ID}}))
+
+	page := string(readBody(t, h.get(recordingsPath)))
+
+	assert.Contains(t, page, `<td class="speakers">`+escapedName+`, Ben</td>`)
+	assert.Equal(t, 1, strings.Count(page, "Ben</td>"), "only the assigned row names the speakers")
+	assert.Contains(t, page, `<a href="/recordings/profiles">`)
+}

@@ -31,8 +31,14 @@ textarea { width: 100%; }
 <label><input type="checkbox" name="transcriptionError" value="true"{{if .TranscriptionError}} checked{{end}}> Transcription error. A recording with a transcription error is always kept.</label>
 <label>Correct text: what was said, empty when nobody spoke. It is saved only with a transcription error.
 <textarea name="correctText" rows="4" cols="80">{{.CorrectText}}</textarea></label>
-<p><button type="submit">Save</button></p>
 </fieldset>
+<fieldset>
+<legend>Speakers</legend>
+{{range .Profiles}}<label><input type="checkbox" name="profile" value="{{.ID}}"{{if .Checked}} checked{{end}}> {{.Name}}</label>
+{{else}}<p>No speaker profiles yet.</p>
+{{end}}<p><a href="/recordings/profiles">Manage speaker profiles</a></p>
+</fieldset>
+<p><button type="submit">Save</button></p>
 </form>
 </body>
 </html>

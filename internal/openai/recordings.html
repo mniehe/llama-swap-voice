@@ -16,11 +16,11 @@ tr.flagged { background: #fbeeee; }
 </head>
 <body>
 <h1>Recordings</h1>
-<p>Showing {{len .Rows}} of {{.Total}} recordings. A recording that is not kept is deleted after {{retentionDays}} days.</p>
+<p>Showing {{len .Rows}} of {{.Total}} recordings. A recording that is not kept is deleted after {{retentionDays}} days. Open a recording to review it. <a href="/recordings/profiles">Speaker profiles</a></p>
 {{if .Rows}}
 <table>
 <thead>
-<tr><th>Recorded (UTC)</th><th>Length</th><th>Source</th><th>Transcript</th><th>Audio</th><th>Keep</th></tr>
+<tr><th>Recorded (UTC)</th><th>Length</th><th>Source</th><th>Speakers</th><th>Transcript</th><th>Audio</th><th>Keep</th></tr>
 </thead>
 <tbody>
 {{range .Rows}}
@@ -28,6 +28,7 @@ tr.flagged { background: #fbeeee; }
 <td><a href="/recordings/{{.ID}}"><time datetime="{{.At}}">{{.Shown}}</time></a></td>
 <td>{{.Length}}</td>
 <td>{{.Source}}</td>
+<td class="speakers">{{.Speakers}}</td>
 <td class="transcript">{{if .TranscriptionError}}<span class="flag">Transcription error</span><br>{{end}}{{.Transcript}}</td>
 <td><audio controls preload="none" src="/recordings/{{.ID}}/audio"></audio></td>
 <td>

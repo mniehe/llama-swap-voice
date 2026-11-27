@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Speaker profiles</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 50rem; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid #ccc; padding: 0.4rem; text-align: left; vertical-align: middle; }
+form { display: inline; }
+</style>
+</head>
+<body>
+<p><a href="/recordings">All recordings</a></p>
+<h1>Speaker profiles</h1>
+<p>A profile is a person whom you can assign recordings to on each recording's page. Renaming a profile renames it on every recording. Deleting a profile removes it from its recordings and leaves the recordings. There can be at most {{.MaxProfiles}} profiles.</p>
+{{if .Profiles}}
+<table>
+<thead>
+<tr><th>Name</th><th>Delete</th></tr>
+</thead>
+<tbody>
+{{range .Profiles}}
+<tr>
+<td><form method="post" action="/recordings/profiles/{{.ID}}/rename"><input type="text" name="name" value="{{.Name}}" required maxlength="64"> <button type="submit">Rename</button></form></td>
+<td><form method="post" action="/recordings/profiles/{{.ID}}/delete"><button type="submit">Delete</button></form></td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p>No profiles yet.</p>
+{{end}}
+<h2>Add a profile</h2>
+<form method="post" action="/recordings/profiles">
+<input type="text" name="name" required maxlength="64"> <button type="submit">Add</button>
+</form>
+</body>
+</html>

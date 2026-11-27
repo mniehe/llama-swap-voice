@@ -33,8 +33,9 @@ const (
 	collectInterval = time.Hour
 	// maxMetadataBytes bounds a metadata read. JSON escapes a byte to at
 	// most six, so a transcript at the upstream's 1 MiB bound takes 6 MiB
-	// and a correct text at MaxCorrectTextBytes 96 KiB; the other fields
-	// take well under a KiB, which leaves most of the last MiB spare.
+	// and a correct text at MaxCorrectTextBytes 96 KiB. MaxProfiles ids of
+	// ProfileIDLength hex digits, quoted and separated, take 1.2 KiB, and the
+	// other fields well under a KiB, which leaves most of the last MiB spare.
 	maxMetadataBytes = 7 << 20
 	// maxIDAttempts bounds the redraws of an id already in the store, which
 	// a 32-bit random suffix makes all but impossible.
@@ -76,7 +77,8 @@ var (
 	idPattern = regexp.MustCompile(`^\d{8}T\d{6}Z-[0-9a-f]{8}$`)
 	// tempPattern matches only the names os.CreateTemp gives the probe and
 	// writeAtomic's files, so Collect never deletes a file it did not make.
-	tempPattern = regexp.MustCompile(`^(probe-\d+|\d{8}T\d{6}Z-[0-9a-f]{8}\.(opus|json)\.\d+)\.tmp$`)
+	// It never matches profiles.json itself.
+	tempPattern = regexp.MustCompile(`^(probe-\d+|\d{8}T\d{6}Z-[0-9a-f]{8}\.(opus|json)\.\d+|profiles\.json\.\d+)\.tmp$`)
 )
 
 // Recording describes one saved transcription. List fills Transcript with
@@ -92,6 +94,8 @@ type Recording struct {
 	// CorrectText is what the speaker said when TranscriptionError is set.
 	// List leaves it empty; Recording fills it.
 	CorrectText string
+	// Profiles are the speakers the recording is assigned to.
+	Profiles []Profile
 }
 
 // Annotation is an operator's edit of a recording. The transcript itself is
@@ -100,6 +104,8 @@ type Annotation struct {
 	Keep               bool
 	TranscriptionError bool
 	CorrectText        string
+	// Profiles holds the ids of the speakers.
+	Profiles []string
 }
 
 // metadata is the JSON file saved beside each recording. At marshals as
@@ -113,6 +119,7 @@ type metadata struct {
 	Keep               bool      `json:"keep"`
 	TranscriptionError bool      `json:"transcriptionError"`
 	CorrectText        string    `json:"correctText"`
+	Profiles           []string  `json:"profiles"`
 }
 
 // storedMetadata is metadata as read back. Its pointers tell a missing or
@@ -127,6 +134,7 @@ type storedMetadata struct {
 	Keep               *bool      `json:"keep"`
 	TranscriptionError bool       `json:"transcriptionError"`
 	CorrectText        string     `json:"correctText"`
+	Profiles           []string   `json:"profiles"`
 }
 
 // indexed is what the store remembers of a complete recording, everything
@@ -145,9 +153,9 @@ func (e *indexed) bytes() int64 {
 	return e.opusBytes + e.jsonBytes
 }
 
-// Store owns a directory of recordings. One mutex serialises saves, the keep
-// toggle and collection, so none of them sees another half done, and guards
-// the index of what is on disk.
+// Store owns a directory of recordings. One mutex serialises saves, edits,
+// profile changes and collection, so none of them sees another half done,
+// and guards the index of what is on disk and the profiles.
 type Store struct {
 	dir      string
 	now      func() time.Time
@@ -173,6 +181,10 @@ type Store struct {
 	// last sweep could not delete. Skipped and stray bytes count against the
 	// cap, and no eviction can reclaim them.
 	stray map[string]int64
+	// profiles is the content of profiles.json, and profilesBytes its size,
+	// which counts against the cap like the stray bytes.
+	profiles      []Profile
+	profilesBytes int64
 
 	// queueMu guards the recordings waiting for the worker; Record takes
 	// only it, never mu, so it does not wait on the disk.
@@ -209,6 +221,10 @@ func Open(dir string, now func() time.Time, log *slog.Logger) (*Store, error) {
 	}
 
 	if err := probeWrite(dir); err != nil {
+		return nil, err
+	}
+
+	if err := s.loadProfiles(); err != nil {
 		return nil, err
 	}
 
@@ -384,7 +400,7 @@ func (s *Store) saveAt(at time.Time, wav []byte, source, transcript string) erro
 		durationMs: int64(len(pcm)/pcmBytes) * time.Second.Milliseconds() / audio.RecordingRate,
 		source:     source,
 	}
-	meta, err := json.Marshal(metadata{At: at, DurationMs: rec.durationMs, Source: source, Transcript: transcript})
+	meta, err := json.Marshal(metadata{At: at, DurationMs: rec.durationMs, Source: source, Transcript: transcript, Profiles: []string{}})
 	if err != nil {
 		return fmt.Errorf("encode recording metadata: %w", err)
 	}
@@ -516,10 +532,10 @@ func (s *Store) makeRoom(size int64) error {
 	return errors.Join(errs...)
 }
 
-// unevictable is the size of the skipped pairs and stray files. The caller
-// holds mu.
+// unevictable is the size of the skipped pairs, the stray files and
+// profiles.json. The caller holds mu.
 func (s *Store) unevictable() int64 {
-	var total int64
+	total := s.profilesBytes
 	for _, size := range s.skipped {
 		total += size
 	}
@@ -605,14 +621,14 @@ func (s *Store) recording(rec *indexed) (Recording, error) {
 		return Recording{}, err
 	}
 
-	got := recordingOf(rec, &meta)
+	got := s.recordingOf(rec, &meta)
 	got.Transcript = preview(meta.Transcript)
 	return got, nil
 }
 
 // recordingOf describes rec without its transcript or correct text, which
-// each caller fills as it needs.
-func recordingOf(rec *indexed, meta *metadata) Recording {
+// each caller fills as it needs. The caller holds mu.
+func (s *Store) recordingOf(rec *indexed, meta *metadata) Recording {
 	return Recording{
 		ID:                 rec.id,
 		At:                 rec.at,
@@ -620,6 +636,7 @@ func recordingOf(rec *indexed, meta *metadata) Recording {
 		Source:             rec.source,
 		Keep:               rec.keep,
 		TranscriptionError: meta.TranscriptionError,
+		Profiles:           s.resolve(meta.Profiles),
 	}
 }
 
@@ -727,7 +744,7 @@ func (s *Store) Recording(id string) (Recording, error) {
 		return Recording{}, err
 	}
 
-	got := recordingOf(rec, &meta)
+	got := s.recordingOf(rec, &meta)
 	got.Transcript = meta.Transcript
 	got.CorrectText = meta.CorrectText
 	return got, nil
@@ -736,7 +753,8 @@ func (s *Store) Recording(id string) (Recording, error) {
 // Annotate saves edit on the recording id and leaves its transcript as it
 // is. A transcription error keeps the recording whatever edit.Keep says, and
 // without one the correct text is dropped. A correct text over
-// MaxCorrectTextBytes or not valid UTF-8 is ErrInvalid.
+// MaxCorrectTextBytes or not valid UTF-8, or a profile id that names no
+// profile, is ErrInvalid.
 func (s *Store) Annotate(id string, edit Annotation) error {
 	if !ValidID(id) {
 		return ErrNotFound
@@ -758,7 +776,13 @@ func (s *Store) Annotate(id string, edit Annotation) error {
 		return err
 	}
 
+	profiles, err := s.assignable(edit.Profiles)
+	if err != nil {
+		return err
+	}
+
 	meta.Keep = edit.Keep || edit.TranscriptionError
+	meta.Profiles = profiles
 	meta.TranscriptionError = edit.TranscriptionError
 	meta.CorrectText = edit.CorrectText
 	return s.rewrite(rec, &meta)
@@ -792,8 +816,10 @@ func (s *Store) indexedMetadata(id string) (*indexed, metadata, error) {
 	return rec, meta, nil
 }
 
-// rewrite replaces the metadata file of rec with meta. The caller holds mu.
+// rewrite replaces the metadata file of rec with meta, without the ids of
+// profiles deleted since. The caller holds mu.
 func (s *Store) rewrite(rec *indexed, meta *metadata) error {
+	meta.Profiles = s.known(meta.Profiles)
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return fmt.Errorf("encode recording metadata: %w", err)
@@ -980,5 +1006,6 @@ func (s *Store) readMetadata(id string) (metadata, error) {
 		Keep:               *stored.Keep,
 		TranscriptionError: stored.TranscriptionError,
 		CorrectText:        stored.CorrectText,
+		Profiles:           stored.Profiles,
 	}, nil
 }
