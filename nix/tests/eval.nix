@@ -358,6 +358,110 @@
       holds "network is loopback only unless ipAddressAllow adds addresses"
       (service.IPAddressDeny == "any" && service.IPAddressAllow == ["localhost" "192.0.2.10"])
       "IPAddressDeny ${show service.IPAddressDeny}, IPAddressAllow ${show service.IPAddressAllow}")
+
+    (let
+      evaluated = (evaluate (base // {stateDir = "/srv/lsv";})).config;
+      env = lib.filterAttrs (name: _: lib.hasPrefix "${prefix}RECORDINGS_" name) evaluated.systemd.services.llama-swap-voice.environment;
+      service = evaluated.systemd.services.llama-swap-voice.serviceConfig;
+      rules = evaluated.systemd.tmpfiles.settings.llama-swap-voice;
+    in
+      holds "recordings are off by default: no variables, no directory, nothing writable"
+      (env == {} && !(rules ? "/srv/lsv/recordings") && !(service ? ReadWritePaths))
+      "RECORDINGS variables ${show env}; tmpfiles rules ${show (lib.attrNames rules)}; ReadWritePaths ${show (service.ReadWritePaths or null)}")
+
+    (let
+      evaluated =
+        (evaluate (base
+          // {
+            stateDir = "/srv/lsv";
+            user = "voice";
+            group = "voice";
+            recordings.enable = true;
+          })).config;
+      env = evaluated.systemd.services.llama-swap-voice.environment;
+      service = evaluated.systemd.services.llama-swap-voice.serviceConfig;
+      rule = evaluated.systemd.tmpfiles.settings.llama-swap-voice."/srv/lsv/recordings" or {};
+    in
+      holds "recordings.enable sets both variables, a private d rule and the one writable path"
+      (env."${prefix}RECORDINGS_ENABLE" or null
+        == "true"
+        && env."${prefix}RECORDINGS_DIR" or null == "/srv/lsv/recordings"
+        && lib.attrNames rule == ["d"]
+        && lib.getAttrs ["user" "group" "mode"] rule.d
+        == {
+          user = "voice";
+          group = "voice";
+          mode = "0700";
+        }
+        && service.ReadWritePaths == ["/srv/lsv/recordings"]
+        && service.ProtectSystem == "strict")
+      "RECORDINGS_ENABLE ${show (env."${prefix}RECORDINGS_ENABLE" or null)}; RECORDINGS_DIR ${show (env."${prefix}RECORDINGS_DIR" or null)}; rule ${show rule}; ReadWritePaths ${show (service.ReadWritePaths or null)}")
+
+    (evaluates "recordings.enable evaluates to a system" (base // {recordings.enable = true;}))
+
+    (let
+      env = serviceEnv (base
+        // {
+          recordings = {
+            enable = true;
+            allowedHosts = ["voice.example" "proxy.example:8443"];
+          };
+        });
+    in
+      holds "recordings.allowedHosts sets RECORDINGS_ALLOWEDHOSTS as a comma-separated list"
+      (env."${prefix}RECORDINGS_ALLOWEDHOSTS" or null == "voice.example,proxy.example:8443")
+      "RECORDINGS_ALLOWEDHOSTS ${show (env."${prefix}RECORDINGS_ALLOWEDHOSTS" or null)}")
+
+    (let
+      env = serviceEnv (base // {recordings.allowedHosts = ["voice.example"];});
+    in
+      holds "recordings.allowedHosts writes nothing while recordings are off"
+      (!(env ? "${prefix}RECORDINGS_ALLOWEDHOSTS"))
+      "RECORDINGS_ALLOWEDHOSTS ${show (env."${prefix}RECORDINGS_ALLOWEDHOSTS" or null)}")
+
+    (refusesElement "a recordings.allowedHosts entry with a comma is refused" ["recordings" "allowedHosts"] "a.example,b.example")
+    (refusesElement "a recordings.allowedHosts entry with a space is refused" ["recordings" "allowedHosts"] "voice example")
+    (refusesElement "a recordings.allowedHosts entry with a scheme is refused" ["recordings" "allowedHosts"] "https://voice.example")
+    (acceptsElement "a recordings.allowedHosts entry with a port is accepted" ["recordings" "allowedHosts"] "voice.example:8443")
+
+    (failsWith "RECORDINGS_ENABLE in extraEnvironment fails naming recordings.enable"
+      (base // {extraEnvironment."${prefix}RECORDINGS_ENABLE" = "true";})
+      ["${opt}.extraEnvironment.${prefix}RECORDINGS_ENABLE" "${opt}.recordings.enable"])
+    (failsWith "RECORDINGS_ENABLE = \"1\" in extraEnvironment turns recordings on and fails"
+      (base // {extraEnvironment."${prefix}RECORDINGS_ENABLE" = "1";})
+      ["${opt}.extraEnvironment.${prefix}RECORDINGS_ENABLE" "${opt}.recordings.enable"])
+    (failsWith "RECORDINGS_ENABLE = \"false\" in extraEnvironment fails while recordings are on"
+      (base
+        // {
+          recordings.enable = true;
+          extraEnvironment."${prefix}RECORDINGS_ENABLE" = "false";
+        })
+      ["${opt}.extraEnvironment.${prefix}RECORDINGS_ENABLE" "${opt}.recordings.enable"])
+    (failsWith "RECORDINGS_DIR in extraEnvironment fails naming stateDir while recordings are on"
+      (base
+        // {
+          recordings.enable = true;
+          extraEnvironment."${prefix}RECORDINGS_DIR" = "/srv/elsewhere";
+        })
+      ["${opt}.extraEnvironment.${prefix}RECORDINGS_DIR" "${opt}.stateDir"])
+    (evaluates "RECORDINGS_ENABLE = \"false\" in extraEnvironment is accepted while recordings are off"
+      (base // {extraEnvironment."${prefix}RECORDINGS_ENABLE" = "false";}))
+    (evaluates "RECORDINGS_ENABLE = \"0\" and inert RECORDINGS_DIR and RECORDINGS_ALLOWEDHOSTS are accepted while recordings are off"
+      (base
+        // {
+          extraEnvironment = {
+            "${prefix}RECORDINGS_ENABLE" = "0";
+            "${prefix}RECORDINGS_DIR" = "/srv/elsewhere";
+            "${prefix}RECORDINGS_ALLOWEDHOSTS" = "voice.example";
+          };
+        }))
+    (failsWith "RECORDINGS_ALLOWEDHOSTS in extraEnvironment fails naming recordings.allowedHosts"
+      (base
+        // {
+          recordings.enable = true;
+          extraEnvironment."${prefix}RECORDINGS_ALLOWEDHOSTS" = "voice.example";
+        })
+      ["${opt}.extraEnvironment.${prefix}RECORDINGS_ALLOWEDHOSTS" "${opt}.recordings.allowedHosts"])
   ];
 
   # A consumer's own llama-swap configuration, in the legacy group layout.
@@ -1022,7 +1126,63 @@
       holds "wyoming.openFirewall without wyoming.enable opens no port" (ports == []) "allowedTCPPorts is ${show ports}")
   ];
 
-  allCases = cases ++ swapCases ++ wyomingCases;
+  # Go's strconv.ParseBool spellings, written out here so that a changed
+  # list in the module fails a case.
+  falseSpellings = ["" "0" "f" "F" "false" "FALSE" "False"];
+  trueSpellings = ["1" "t" "T" "TRUE" "true" "True"];
+
+  recordingsSpellingCases =
+    map (value:
+      evaluates "RECORDINGS_ENABLE = ${show value} in extraEnvironment is accepted while recordings are off"
+      (base // {extraEnvironment."${prefix}RECORDINGS_ENABLE" = value;}))
+    falseSpellings
+    ++ map (value:
+      failsWith "RECORDINGS_ENABLE = ${show value} in extraEnvironment turns recordings on and fails"
+      (base // {extraEnvironment."${prefix}RECORDINGS_ENABLE" = value;})
+      ["${opt}.extraEnvironment.${prefix}RECORDINGS_ENABLE" "${opt}.recordings.enable"])
+    trueSpellings
+    ++ [
+      (failsWith "a mixed-case RECORDINGS_ENABLE in extraEnvironment is refused, naming the canonical key"
+        (base // {extraEnvironment."${prefix}Recordings_Enable" = "true";})
+        ["${opt}.extraEnvironment.${prefix}Recordings_Enable" "${prefix}RECORDINGS_ENABLE"])
+      (failsWith "a lower-case RECORDINGS_ENABLE set to false is refused too"
+        (base // {extraEnvironment."${prefix}recordings_enable" = "false";})
+        ["${opt}.extraEnvironment.${prefix}recordings_enable" "${prefix}RECORDINGS_ENABLE"])
+      (failsWith "RECORDINGS_DIR spelt with a dot is refused, naming the canonical key"
+        (base // {extraEnvironment."${prefix}RECORDINGS.DIR" = "/srv/elsewhere";})
+        ["${opt}.extraEnvironment.${prefix}RECORDINGS.DIR" "${prefix}RECORDINGS_DIR"])
+      (failsWith "a mixed-case RECORDINGS_ALLOWEDHOSTS is refused while recordings are on"
+        (base
+          // {
+            recordings.enable = true;
+            extraEnvironment."${prefix}Recordings_AllowedHosts" = "voice.example";
+          })
+        ["${opt}.extraEnvironment.${prefix}Recordings_AllowedHosts" "${prefix}RECORDINGS_ALLOWEDHOSTS"])
+      (evaluates "a key whose prefix is not the service's exact prefix is not a recordings variable"
+        (base // {extraEnvironment."llama_swap_voice_RECORDINGS_ENABLE" = "true";}))
+      # systemd splits Environment="name=value" at the first "=", so this
+      # key sets RECORDINGS_DIR to "/srv/elsewhere=unexpected".
+      (failsWith "an extraEnvironment key with \"=\" is refused as no variable name"
+        (base
+          // {
+            recordings.enable = true;
+            extraEnvironment."${prefix}RECORDINGS_DIR=/srv/elsewhere" = "unexpected";
+          })
+        ["${opt}.extraEnvironment.${prefix}RECORDINGS_DIR=/srv/elsewhere" "[A-Za-z_][A-Za-z0-9_]*"])
+      # lib.toLower folds ASCII only, while Go's strings.ToLower folds
+      # U+0130 to "i", so the service reads this key as RECORDINGS_ENABLE.
+      (failsWith "an extraEnvironment key with a non-ASCII letter is refused as no variable name"
+        (base // {extraEnvironment."${prefix}RECORD${dottedCapitalI}NGS_ENABLE" = "true";})
+        ["${opt}.extraEnvironment.${prefix}RECORD${dottedCapitalI}NGS_ENABLE" "[A-Za-z_][A-Za-z0-9_]*"])
+      (evaluates "a lower-case key with a leading underscore and digits is a variable name"
+        (base // {extraEnvironment."_extra_setting_2" = "x";}))
+    ];
+
+  # U+0130, Latin capital letter I with dot above. Nix strings have no \u
+  # escape, so JSON decodes it.
+  dottedCapitalI = builtins.fromJSON ''"İ"'';
+
+  allCases = cases ++ recordingsSpellingCases ++ swapCases ++ wyomingCases;
 
   report = lib.concatMapStrings (c:
     if c.ok

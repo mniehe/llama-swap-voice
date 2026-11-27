@@ -6,11 +6,13 @@ import (
 	"math"
 	"net"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/mniehe/llama-swap-voice/internal/audio"
 	"github.com/mniehe/llama-swap-voice/internal/observability"
@@ -28,6 +30,7 @@ const (
 	minTTSConcurrency = 1
 	minStreamingChars = 1
 	languageSeparator = ","
+	hostSeparator     = ","
 )
 
 var (
@@ -48,6 +51,7 @@ type ServiceConfig struct {
 	Logger         LoggerConfig         `koanf:"log"`
 	ShutdownTiming ShutdownTimingConfig `koanf:"shutdown"`
 	Wyoming        WyomingConfig        `koanf:"wyoming"`
+	Recordings     RecordingsConfig     `koanf:"recordings"`
 }
 
 type UpstreamConfig struct {
@@ -93,6 +97,16 @@ type WyomingConfig struct {
 	Speed             float64      `koanf:"speed"`
 	Streaming         wyoming.Mode `koanf:"streaming"`
 	StreamingMaxChars int          `koanf:"streamingmaxchars"`
+}
+
+// RecordingsConfig turns on keeping the audio of each successful
+// transcription in Dir, an absolute path created at startup when missing.
+// AllowedHosts is a comma-separated list of the hosts, each bare or with a
+// port, that the recordings routes answer besides loopback and Host.
+type RecordingsConfig struct {
+	Enable       bool   `koanf:"enable"`
+	Dir          string `koanf:"dir"`
+	AllowedHosts string `koanf:"allowedhosts"`
 }
 
 type ShutdownTimingConfig struct {
@@ -155,6 +169,7 @@ func (c *ServiceConfig) Validate() error {
 		c.validateLogger(),
 		c.validateShutdown(),
 		c.validateWyoming(),
+		c.validateRecordings(),
 	}
 
 	return errors.Join(errs...)
@@ -302,6 +317,93 @@ func (c *ServiceConfig) validateWyoming() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func (c *ServiceConfig) validateRecordings() error {
+	if !c.Recordings.Enable {
+		return nil
+	}
+
+	var errs []error
+	if !filepath.IsAbs(c.Recordings.Dir) {
+		errs = append(errs, fmt.Errorf("recordings.dir must be an absolute path when recordings.enable is true, got %q", c.Recordings.Dir))
+	}
+
+	for _, entry := range splitHosts(c.Recordings.AllowedHosts) {
+		if err := validateAllowedHost(entry); err != nil {
+			errs = append(errs, fmt.Errorf("recordings.allowedhosts entry %q %w", entry, err))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+// validateAllowedHost accepts a bare host, an IPv6 address in brackets, or
+// either with a port: what a Host header carries, and nothing a URL adds.
+func validateAllowedHost(entry string) error {
+	switch {
+	case entry == "":
+		return errors.New("is empty; remove the extra comma")
+	case strings.ContainsFunc(entry, unicode.IsSpace):
+		return errors.New("contains a space")
+	case strings.Contains(entry, "://"):
+		return errors.New("has a scheme; give the host alone")
+	case strings.ContainsAny(entry, "/?#@"):
+		return errors.New("has a path, query or user; give the host alone")
+	}
+
+	host, port, err := net.SplitHostPort(entry)
+	if err != nil {
+		return validateBareHost(entry)
+	}
+
+	if host == "" {
+		return errors.New("has a port but no host")
+	}
+
+	if number, convErr := strconv.Atoi(port); convErr != nil || number < minPort || number > maxPort {
+		return fmt.Errorf("has a port that is not between %d and %d", minPort, maxPort)
+	}
+
+	return nil
+}
+
+func validateBareHost(entry string) error {
+	inner, bracketed := strings.CutPrefix(entry, "[")
+	if bracketed {
+		address, closed := strings.CutSuffix(inner, "]")
+		if !closed || net.ParseIP(address) == nil {
+			return errors.New("is not an IPv6 address in brackets")
+		}
+		return nil
+	}
+
+	if strings.Contains(entry, ":") {
+		return errors.New("is not host or host:port; write an IPv6 address in brackets")
+	}
+
+	return nil
+}
+
+// splitHosts splits a comma-separated list and trims each entry. An empty
+// list has no entries.
+func splitHosts(list string) []string {
+	if strings.TrimSpace(list) == "" {
+		return nil
+	}
+
+	hosts := strings.Split(list, hostSeparator)
+	for i, host := range hosts {
+		hosts[i] = strings.TrimSpace(host)
+	}
+
+	return hosts
+}
+
+// recordingHosts are the hosts the recordings routes answer besides
+// loopback: the listen host and the operator's list.
+func (c *ServiceConfig) recordingHosts() []string {
+	return append([]string{c.Host}, splitHosts(c.Recordings.AllowedHosts)...)
 }
 
 // splitLanguages splits a comma-separated list and trims each entry, so an

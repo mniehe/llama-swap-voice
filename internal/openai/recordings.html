@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recordings</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid #ccc; padding: 0.4rem; text-align: left; vertical-align: middle; }
+td.transcript { max-width: 40rem; }
+tr.kept { background: #eef6ee; }
+</style>
+</head>
+<body>
+<h1>Recordings</h1>
+<p>Showing {{len .Rows}} of {{.Total}} recordings. A recording that is not kept is deleted after {{retentionDays}} days.</p>
+{{if .Rows}}
+<table>
+<thead>
+<tr><th>Recorded (UTC)</th><th>Length</th><th>Source</th><th>Transcript</th><th>Audio</th><th>Keep</th></tr>
+</thead>
+<tbody>
+{{range .Rows}}
+<tr{{if .Keep}} class="kept"{{end}}>
+<td><time datetime="{{.At}}">{{.Shown}}</time></td>
+<td>{{.Length}}</td>
+<td>{{.Source}}</td>
+<td class="transcript">{{.Transcript}}</td>
+<td><audio controls preload="none" src="/recordings/{{.ID}}/audio"></audio></td>
+<td>
+<form method="post" action="/recordings/{{.ID}}/keep">
+{{if .Keep}}<input type="hidden" name="keep" value="false"><button type="submit">Kept: release</button>{{else}}<input type="hidden" name="keep" value="true"><button type="submit">Keep</button>{{end}}
+</form>
+</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{if .Older}}<p><a href="/recordings?before={{.Older}}">Older</a></p>{{end}}
+{{else if .Total}}
+<p>No recordings on this page.</p>
+{{else}}
+<p>No recordings yet.</p>
+{{end}}
+</body>
+</html>

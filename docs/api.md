@@ -11,8 +11,9 @@ lists the variable behind each one.
 
 ## Endpoints
 
-The service listens on `127.0.0.1:8920` by default. Every path also works
-without the `/v1` prefix.
+The service listens on `127.0.0.1:8920` by default. Every `/v1` path also
+works without the `/v1` prefix. The three `/recordings` paths exist only
+with `recordings.enable` on, and have no `/v1` form.
 
 | Endpoint | Purpose | Status codes |
 |---|---|---|
@@ -23,6 +24,9 @@ without the `/v1` prefix.
 | `GET /health` | Health check | 200 |
 | `GET /internal/liveness` | Liveness probe | 200 |
 | `GET /internal/readiness` | Readiness probe | 200; 503 in plain text during shutdown |
+| `GET /recordings` | The [recordings](#recordings) page, in HTML | 200, 400, 403, 500 |
+| `GET /recordings/{id}/audio` | One recording, as Ogg Opus | 200, 206, 304, 403, 404, 412, 416, 500 |
+| `POST /recordings/{id}/keep` | Mark a recording kept, or release it | 303, 400, 403, 404, 500 |
 
 An unknown path gets a 404 and a wrong method gets a 405.
 
@@ -79,6 +83,80 @@ FLAC because its FLAC decoder was removed: a review found defects in it on
 malformed files. Convert such a file to WAV, Opus or MP3 first. Hermes does
 this itself when it sees the 400.
 
+## Recordings
+
+With `recordings.enable` on, the service keeps the audio and transcript of
+every successful transcription. [Recordings](options.md#recordings) in the
+module options describes what it stores, where, and for how long. Without
+the option, these paths answer 404 like any unknown path. They have no
+authentication; the recordings hold household speech, so limit who can reach
+the port.
+
+The three paths answer only a request whose `Host` header names an allowed
+host: `127.0.0.1`, `[::1]` or `localhost` on any port, the listen address
+`host`, or an entry of `recordings.allowedHosts`. Any other `Host` gets a
+403, which stops a DNS-rebinding page in a browser on your network from
+reading the recordings. The service never reads `X-Forwarded-Host`, so a
+reverse proxy must pass the public `Host` through unchanged, and that host
+must be in `recordings.allowedHosts`.
+
+`GET /recordings` returns an HTML page that needs no JavaScript. It lists the
+newest 100 recordings, newest first, each with its UTC time, its length, its
+source (`openai` or `wyoming`) and the first 2 KiB of its transcript, cut
+at a character and marked with an ellipsis when longer, and says how many of
+all the recordings it shows. Each row has an audio player and a button that
+marks the recording kept or releases it. When older recordings exist, an
+"Older" link leads to `GET /recordings?before={id}`, the next 100 recordings
+older than `{id}`. When the recording `{id}` has been deleted since, the
+page starts at the end of the second in its id, so a recording made in that
+second may show on both pages. A `before` that is not one recording id with
+a real date and time, or a query with a malformed escape such as `%zz`, gets
+a 400. The page sends `Content-Security-Policy: frame-ancestors 'none'`, so
+no other site can frame it.
+
+`GET /recordings/{id}/audio` returns the recording as `audio/ogg`: Ogg Opus,
+16 kHz mono, 32 kbps. It serves byte ranges (206, or 416 for a range past
+the end or a `Range` it cannot parse), `HEAD` and conditional requests (304,
+or 412 for an `If-Match` or `If-Unmodified-Since` that fails). It ignores a
+`Range` that names no range (`bytes=`), more than 200 ranges, or ranges that
+together exceed the file, and answers 200 with the whole file. Every reply to
+a `GET` or `HEAD` of this path carries `Cache-Control: no-store`, errors
+included: the 403 for a `Host` that is not allowed, the 404, and every other
+status, except a 503 for shutdown, which the service answers before it
+routes the request. A reply to another method, the 405, does not carry it.
+A 412, 416 or 500 is a JSON error. A 416 for a range past the end also
+carries `Content-Range: bytes */{size}`; a 416 for a `Range` it cannot parse
+carries no `Content-Range`. The transfer may take as long as sending the
+file at 16 KiB/s takes, and at least 10 seconds.
+
+`POST /recordings/{id}/keep` takes a form with one field, `keep`, set to
+`true` or `false` and given once. On success it answers 303 with
+`Location: /recordings`. Any other value, a missing or repeated field, or a
+form over 1 KiB gets a 400. A post that a browser marks as coming from
+another site (`Sec-Fetch-Site`, or an `Origin` that does not match the host)
+gets a 403.
+
+An id that does not have the form of a recording id, such as
+`20261125T153000Z-1a2b3c4d`, gets a 404 without touching the disk, as does
+an id with no recording.
+
+The service deletes a recording that is not kept 7 days after it was made,
+checking once at start and then every hour. All recordings together may take
+at most 1 GiB. A new recording first displaces the oldest ones that are not
+kept. Kept recordings count toward the 1 GiB, and so do the bytes no
+deletion can reclaim: recordings left on disk because their metadata or
+files cannot be read, and files the service failed to delete. When those
+leave no room for a new recording, the service saves nothing new, logs a
+warning, and still returns the transcript.
+
+The service saves a recording in the background after it has returned the
+transcript, one at a time in the order they arrived. A recording is dated
+when its transcription finished, not when it is saved. Up to 64 MiB may wait
+to be saved, counting each recording's audio, its transcript and 512 bytes
+more. A recording that would pass that is dropped with a warning that names
+the request. See [shutdown](#shutdown) for what happens to waiting recordings
+when the service stops.
+
 ## Errors
 
 An error is JSON of the form `{"error":{"message":"…"}}`. This includes
@@ -87,8 +165,10 @@ change, so a later failure cuts the transfer.
 
 | Status | Cause |
 |---|---|
-| 400 | A malformed body; an empty or too long `input`; an unknown voice or format; a `speed` out of range; a missing `file`; an upload that the service cannot decode or that is longer than 20 minutes |
-| 404, 405 | An unknown path; a wrong method |
+| 400 | A malformed body; an empty or too long `input`; an unknown voice or format; a `speed` out of range; a missing `file`; an upload that the service cannot decode or that is longer than 20 minutes; a malformed recordings page query |
+| 403 | A recordings request whose `Host` is not allowed; a keep post from another site |
+| 404, 405 | An unknown path; a wrong method; an unknown or malformed recording id |
+| 412, 416 | A recording's audio fetched with a precondition that fails, or a range past its end or malformed |
 | 429 and other upstream errors | Passed on from llama-swap or the model server, with its message and `Retry-After` |
 | 500 | A fault inside the service. The cause is in its log. |
 | 502 | llama-swap failed, sent no audio, or sent a transcript over 1 MiB |
@@ -115,6 +195,13 @@ no redirect from llama-swap.
 | Clip size | 10 MiB | fixed |
 | Time for a speech request or a transcription | 2 minutes | `request.timeout` |
 | Time for any other request | 10 seconds | fixed |
+| Recordings keep form | 1 KiB | fixed |
+| Recordings on one page | 100 | fixed |
+| Slowest fetch of a recording's audio | 16 KiB/s | fixed |
+| Recordings waiting to be saved: audio, transcript and 512 bytes each | 64 MiB | fixed |
+| Transcript shown on the recordings page | 2 KiB a recording | fixed |
+| Recordings kept when not marked | 7 days | fixed |
+| All recordings together | 1 GiB | fixed |
 
 ## Shutdown
 
@@ -131,6 +218,11 @@ in three steps:
 
 [Limits and timeouts](options.md#limits-and-timeouts) lists the option for
 each step.
+
+With `recordings.enable` on, the service then saves the recordings still
+waiting, until `SHUTDOWN_TOTAL` plus `SHUTDOWN_HARD` after step 2 began. It
+drops any left at that time with one warning that gives their count, and
+does not wait for a save that is still writing.
 
 ## Wyoming
 

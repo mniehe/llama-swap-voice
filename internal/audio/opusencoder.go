@@ -19,21 +19,42 @@ const (
 	opusRateOffset      = 12
 )
 
-// opusEncoder writes Ogg Opus. libopus encodes at 24 kHz, but the Ogg Opus
-// timeline always counts 48 kHz samples, so pre-skip and granule positions
-// are scaled up.
+// RecordingRate is the rate of the speech recogniser's input, so a recording
+// keeps exactly what was transcribed without resampling.
+const RecordingRate = targetRate
+
+// opusEncoder writes Ogg Opus. libopus encodes at the input rate, but the
+// Ogg Opus timeline always counts 48 kHz samples, so pre-skip and granule
+// positions are scaled up.
 type opusEncoder struct {
 	codec   *libopus
 	ogg     *oggWriter
 	frames  *framer
+	rate    uint32
+	scale   uint64
 	preSkip uint16
 	bytes   uint64
 	packets uint64
 	closed  bool
 }
 
-func newOpusEncoder(w io.Writer) (*opusEncoder, error) {
-	codec, err := newLibopus()
+// NewRecordingEncoder returns a writer that takes s16le 16 kHz mono samples
+// and writes them to w as Ogg Opus at 32 kbps. Close writes the end of the
+// stream and releases the encoder; it must be called even after a failed
+// Write.
+func NewRecordingEncoder(w io.Writer) (io.WriteCloser, error) {
+	encoder, err := newOpusEncoder(w, RecordingRate, recordingBitrate)
+	if err != nil {
+		return nil, err
+	}
+
+	return encoder, nil
+}
+
+// newOpusEncoder takes rate, one of Opus's native rates that divides 48 kHz,
+// and bitrate from this package's constants.
+func newOpusEncoder(w io.Writer, rate, bitrate uint32) (*opusEncoder, error) {
+	codec, err := newLibopus(rate, bitrate)
 	if err != nil {
 		return nil, err
 	}
@@ -50,13 +71,14 @@ func newOpusEncoder(w io.Writer) (*opusEncoder, error) {
 		return nil, err
 	}
 
-	preSkip := codec.lookahead * opusGranuleScale
+	scale := opusRate / rate
+	preSkip := codec.lookahead * int(scale)
 	if preSkip < 0 || preSkip > math.MaxUint16 {
 		return nil, fmt.Errorf("libopus lookahead of %d samples does not fit an Opus pre-skip", codec.lookahead)
 	}
 
-	e := &opusEncoder{codec: codec, ogg: ogg, preSkip: uint16(preSkip)}
-	e.frames = newFramer(opusFrameSamples, e.encode)
+	e := &opusEncoder{codec: codec, ogg: ogg, rate: rate, scale: uint64(scale), preSkip: uint16(preSkip)}
+	e.frames = newFramer(int(rate/opusFramesPerSecond), e.encode)
 
 	if err := e.writeHeaders(); err != nil {
 		return nil, err
@@ -72,7 +94,7 @@ func (e *opusEncoder) writeHeaders() error {
 	head[opusVersionByte] = opusHeadVersion
 	head[opusChannelsByte] = outputChannels
 	binary.LittleEndian.PutUint16(head[opusPreSkipOffset:], e.preSkip)
-	binary.LittleEndian.PutUint32(head[opusRateOffset:], outputRate)
+	binary.LittleEndian.PutUint32(head[opusRateOffset:], e.rate)
 	head[opusMappingByte] = opusMappingRTP
 
 	tags := []byte(opusTagsMagic)
@@ -114,7 +136,7 @@ func (e *opusEncoder) Close() error {
 	}
 
 	samples := e.bytes / outputSampleBytes
-	return e.ogg.finish(uint64(e.preSkip) + samples*opusGranuleScale)
+	return e.ogg.finish(uint64(e.preSkip) + samples*e.scale)
 }
 
 func (e *opusEncoder) encode(frame []int16) error {

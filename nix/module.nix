@@ -11,6 +11,7 @@ flakeSelf: {
 
   envPrefix = "LLAMA_SWAP_VOICE_";
   voicesDir = "${cfg.stateDir}/voices";
+  recordingsDir = "${cfg.stateDir}/recordings";
   clipExtensions = ["wav" "mp3"];
 
   defaultName = "llama-swap-voice";
@@ -328,7 +329,78 @@ flakeSelf: {
       WYOMING_SPEED = builtins.toJSON cfg.wyoming.speed;
       WYOMING_STREAMING = cfg.wyoming.streaming;
       WYOMING_STREAMINGMAXCHARS = cfg.wyoming.streamingMaxChars;
+    }
+    // lib.optionalAttrs cfg.recordings.enable {
+      RECORDINGS_ENABLE = "true";
+      RECORDINGS_DIR = recordingsDir;
+      RECORDINGS_ALLOWEDHOSTS = lib.concatStringsSep "," cfg.recordings.allowedHosts;
     };
+
+  # The recordings directory, its tmpfiles rule and its sandbox exception
+  # follow the options, so an override of these variables would split the
+  # service from them. While recordings are off the service reads none of
+  # them, so an override is inert there unless it turns recordings on.
+  recordingsVariables = {
+    RECORDINGS_ENABLE = "${opt}.recordings.enable";
+    RECORDINGS_DIR = "${opt}.recordings.enable and ${opt}.stateDir";
+    RECORDINGS_ALLOWEDHOSTS = "${opt}.recordings.allowedHosts";
+  };
+
+  # What the service reads as false for a boolean variable: Go's
+  # strconv.ParseBool false spellings, and the empty string.
+  falseSpellings = ["" "0" "f" "F" "false" "FALSE" "False"];
+
+  recordingsOverrideInert = name: value:
+    !cfg.recordings.enable && (name != "RECORDINGS_ENABLE" || lib.elem value falseSpellings);
+
+  # The key the service reads a variable as: internal/config/config.go keeps
+  # names with the exact prefix, lower-cases the rest and reads "_" as ".".
+  serviceKey = suffix: builtins.replaceStrings ["_"] ["."] (lib.toLower suffix);
+
+  # Each extraEnvironment entry the service reads as a recordings variable,
+  # whatever its spelling, with the variable's canonical name.
+  recordingsOverrides = lib.concatLists (lib.mapAttrsToList (key: value: let
+    suffix = lib.removePrefix envPrefix key;
+    names = lib.filter (name: serviceKey name == serviceKey suffix) (lib.attrNames recordingsVariables);
+  in
+    lib.optional (lib.hasPrefix envPrefix key && names != []) {
+      inherit key value suffix;
+      name = lib.head names;
+    })
+  cfg.extraEnvironment);
+
+  recordingsAssertions = map (override: let
+    inherit (override) key name value;
+  in
+    if override.suffix != name
+    then {
+      assertion = false;
+      message = "${opt}.extraEnvironment.${key} is read by the service as ${envPrefix}${name}; spell it ${envPrefix}${name}, so that the module can check it.";
+    }
+    else {
+      assertion = recordingsOverrideInert name value;
+      message = "${opt}.extraEnvironment.${key} is \"${toString value}\"; use ${recordingsVariables.${name}} instead, because the recordings directory and the sandbox follow the options, not the variable. Only an override that leaves recordings off is accepted while ${opt}.recordings.enable is false.";
+    })
+  recordingsOverrides;
+
+  # nixpkgs writes each entry as Environment="name=value" without checking
+  # the name, and systemd splits it at the first "=". A key with "=" or a
+  # non-ASCII letter would set a variable that the checks above, which
+  # compare names, never see.
+  environmentName = "[A-Za-z_][A-Za-z0-9_]*";
+
+  environmentNameAssertions =
+    map (key: {
+      assertion = builtins.match environmentName key != null;
+      message = "${opt}.extraEnvironment.${key} is not an environment variable name; a key must match ${environmentName}.";
+    })
+    (lib.attrNames cfg.extraEnvironment);
+
+  # What a Host header carries, joined with commas into one variable: the
+  # service checks the rest when it starts.
+  allowedHost =
+    types.strMatching "[^,/[:space:]]+"
+    // {description = "host or host:port without a comma, a slash or a space";};
 
   # Every character Go's unicode.IsSpace accepts. Nix strings have no \u
   # escape, so JSON decodes each code point.
@@ -622,6 +694,35 @@ in {
       };
     };
 
+    recordings.enable = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Keep the audio of every successful transcription, from the HTTP API
+        and the Wyoming listener, as Ogg Opus with its transcript in
+        <stateDir>/recordings (RECORDINGS_ENABLE, RECORDINGS_DIR), and serve
+        a page at /recordings on the HTTP port to play them and mark them
+        kept. This stores household speech: a recording stays for 7 days,
+        and a kept one until it is released. The page has no
+        authentication, so limit who reaches the HTTP port.
+      '';
+    };
+
+    recordings.allowedHosts = mkOption {
+      type = types.listOf allowedHost;
+      default = [];
+      example = ["voice.example.org" "voice.example.org:8443"];
+      description = ''
+        Hosts the recordings routes answer besides loopback (127.0.0.1,
+        [::1], localhost) and host (RECORDINGS_ALLOWEDHOSTS). Any other Host
+        header gets a 403, which stops DNS rebinding. An entry without a port
+        matches the host on every port; host:port matches that port only.
+        A reverse proxy must pass the public Host through unchanged, and that
+        host must be listed here; the service never reads X-Forwarded-Host.
+        Written only when recordings.enable is on.
+      '';
+    };
+
     voices = mkOption {
       type = types.attrsOf voiceModule;
       default = {};
@@ -661,7 +762,9 @@ in {
       example = {LLAMA_SWAP_VOICE_LOG_LEVEL = "debug";};
       description = ''
         Extra environment variables for the service, by full name. They win
-        over the variables the module generates. Evaluation checks only the
+        over the variables the module generates. Evaluation refuses a key
+        that is not an environment variable name, one that does not match
+        [A-Za-z_][A-Za-z0-9_]*. Of the values, it checks only the
         variables the module reads back after this merge: the shutdown
         durations, TTS_MAXINPUTCHARS, UPSTREAM_TTSCONCURRENCY,
         REQUEST_MAXCONCURRENT and WYOMING_STREAMINGMAXCHARS. It fails when
@@ -669,7 +772,12 @@ in {
         checks every other override, the Wyoming variables included, when it
         starts, and refuses to start on a bad value. The check that the
         Wyoming host and port differ from the HTTP ones compares the
-        options, not overrides.
+        options, not overrides. Set RECORDINGS_ENABLE, RECORDINGS_DIR and
+        RECORDINGS_ALLOWEDHOSTS through recordings.enable, stateDir and
+        recordings.allowedHosts. While recordings.enable is true, evaluation
+        refuses them here. While it is false, it accepts them only when
+        RECORDINGS_ENABLE is unset, empty or false (0, f, F, false, FALSE,
+        False), because the service then reads none of them.
       '';
     };
   };
@@ -687,7 +795,9 @@ in {
         }
       ]
       ++ lib.concatLists (lib.mapAttrsToList voiceAssertions cfg.voices)
+      ++ environmentNameAssertions
       ++ checkedAssertions
+      ++ recordingsAssertions
       ++ lib.optionals cfg.wyoming.enable wyomingAssertions;
 
     networking.firewall.allowedTCPPorts = lib.mkIf (cfg.wyoming.enable && cfg.wyoming.openFirewall) [cfg.wyoming.port];
@@ -713,6 +823,12 @@ in {
           mode = "0750";
         };
       }
+      // lib.optionalAttrs cfg.recordings.enable {
+        ${tmpfilesEscape recordingsDir}.d = {
+          inherit (cfg) user group;
+          mode = "0700";
+        };
+      }
       // lib.mapAttrs' (name: voice: lib.nameValuePair (tmpfilesEscape (linkName name voice)) {L.argument = tmpfilesEscape voice.clip;}) cfg.voices;
 
     systemd.services.llama-swap-voice = {
@@ -733,9 +849,11 @@ in {
         UMask = "0077";
 
         # ProtectSystem=strict leaves every path, stateDir included,
-        # read-only; the only writable place is the private /tmp, where
-        # multipart uploads larger than the in-memory limit spool.
+        # read-only. The writable places are the private /tmp, where
+        # multipart uploads larger than the in-memory limit spool, and,
+        # with recordings.enable, the recordings directory alone.
         ProtectSystem = "strict";
+        ReadWritePaths = lib.mkIf cfg.recordings.enable [recordingsDir];
         ProtectHome = true;
         PrivateTmp = true;
         PrivateDevices = true;

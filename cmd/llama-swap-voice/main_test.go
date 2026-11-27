@@ -2,25 +2,28 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/mniehe/llama-swap-voice/internal/openai"
-	"github.com/mniehe/llama-swap-voice/internal/pipeline"
 	"github.com/mniehe/llama-swap-voice/internal/upstream"
 	"github.com/mniehe/llama-swap-voice/internal/wyoming"
 )
@@ -114,14 +117,28 @@ func serviceFor(t *testing.T, cfg *ServiceConfig, respond http.HandlerFunc, http
 	fake := httptest.NewServer(respond)
 	t.Cleanup(fake.Close)
 
-	client, err := upstream.New(fake.URL, "tts", "asr", httpClient)
+	return serviceAt(t, cfg, fake.URL, httpClient)
+}
+
+// serviceAt builds the services against an upstream at upstreamURL that
+// httpClient reaches.
+func serviceAt(t *testing.T, cfg *ServiceConfig, upstreamURL string, httpClient *http.Client) *services {
+	t.Helper()
+
+	client, err := upstream.New(upstreamURL, "tts", "asr", httpClient)
 	require.NoError(t, err)
 
-	serverCfg := cfg.serverConfig(map[string]string{"alice": filepath.Join(cfg.Voices.Dir, "alice.mp3")})
-	pipe, err := pipeline.New(&serverCfg, client, slog.New(slog.DiscardHandler))
+	service, err := newServices(cfg, map[string]string{"alice": filepath.Join(cfg.Voices.Dir, "alice.mp3")}, client, slog.New(slog.DiscardHandler))
 	require.NoError(t, err)
 
-	return &services{api: openai.New(pipe, slog.New(slog.DiscardHandler)), pipeline: pipe}
+	return service
+}
+
+// unpooledClient gives each request a connection of its own: a pooled
+// client can dial a spare connection that never sends a request, and
+// Shutdown waits 5 s for it to go idle.
+func unpooledClient() *http.Client {
+	return &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 }
 
 func get(ctx context.Context, url string) (int, error) {
@@ -130,7 +147,7 @@ func get(ctx context.Context, url string) (int, error) {
 		return 0, err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := unpooledClient().Do(req)
 	if err != nil {
 		return 0, err
 	}
@@ -432,12 +449,16 @@ func postSpeech(ctx context.Context, base string) (string, error) {
 }
 
 func postSpeechBody(ctx context.Context, base, body string) (string, error) {
+	return postSpeechVia(ctx, unpooledClient(), base, body)
+}
+
+func postSpeechVia(ctx context.Context, client *http.Client, base, body string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1/audio/speech", strings.NewReader(body))
 	if err != nil {
 		return "", err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -1071,4 +1092,554 @@ func nextListener(t *testing.T, bound <-chan net.Listener) net.Listener {
 		require.FailNow(t, "serveWith did not bind")
 		return nil
 	}
+}
+
+const (
+	recordedTranscript = "turn on the porch light"
+	eventTranscribe    = "transcribe"
+	eventTranscript    = "transcript"
+	homeAssistantAudio = `{"rate":16000,"width":2,"channels":1}`
+)
+
+// serveASR answers every upstream call with recordedTranscript as an OpenAI
+// transcription.
+func serveASR(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := io.WriteString(w, `{"text":"`+recordedTranscript+`"}`); err != nil {
+		panic(err)
+	}
+}
+
+func recordingsOn(t *testing.T, cfg *ServiceConfig) string {
+	t.Helper()
+
+	dir := filepath.Join(t.TempDir(), "recordings")
+	cfg.Recordings = RecordingsConfig{Enable: true, Dir: dir}
+
+	return dir
+}
+
+// savedPair returns the two file names of the one recording saved in dir,
+// or nil until its metadata is in place. The store writes the audio first and
+// renames each file into place from a temporary name, so a final .json beside
+// its .opus is a whole recording.
+func savedPair(t *testing.T, dir string) []string {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+
+	present := map[string]bool{}
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".tmp") {
+			present[entry.Name()] = true
+		}
+	}
+
+	for name := range present {
+		id, ok := strings.CutSuffix(name, ".json")
+		if ok && present[id+".opus"] {
+			return []string{id + ".json", id + ".opus"}
+		}
+	}
+
+	return nil
+}
+
+// waitForSaved waits until the background worker has saved one recording
+// in dir and returns its two file names, the .json first.
+func waitForSaved(t *testing.T, dir string) []string {
+	t.Helper()
+
+	var files []string
+	require.Eventually(t, func() bool {
+		files = savedPair(t, dir)
+		return files != nil
+	}, probeTimeout, 10*time.Millisecond, "the recording was not saved")
+
+	return files
+}
+
+func readSaved(t *testing.T, dir, name string) map[string]any {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join(dir, name))
+	require.NoError(t, err)
+	var meta map[string]any
+	require.NoError(t, json.Unmarshal(data, &meta))
+
+	return meta
+}
+
+func postTranscription(t *testing.T, base string) string {
+	t.Helper()
+
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	part, err := form.CreateFormFile("file", "clip.wav")
+	require.NoError(t, err)
+	_, err = part.Write([]byte(wavHeader + strings.Repeat("\x01\x02", halfSecondSamples)))
+	require.NoError(t, err)
+	require.NoError(t, form.Close())
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, base+"/v1/audio/transcriptions", &body)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	resp, err := unpooledClient().Do(req)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, resp.Body.Close()) }()
+	data, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body %s", data)
+
+	return string(data)
+}
+
+func (c *wyomingClient) sendChunk(data string, payload []byte) {
+	c.t.Helper()
+
+	require.NoError(c.t, c.conn.SetWriteDeadline(time.Now().Add(probeTimeout)))
+	require.NoError(c.t, wyoming.WriteEvent(c.conn, &wyoming.Event{Type: eventAudioChunk, Data: []byte(data), Payload: payload}))
+}
+
+func TestServe_RecordingsOff_WritesNothing(t *testing.T) {
+	cfg := validConfig(t)
+	dir := filepath.Join(t.TempDir(), "recordings")
+	cfg.Recordings = RecordingsConfig{Enable: false, Dir: dir}
+	s := startServe(t, &cfg, serviceFor(t, &cfg, serveASR, &http.Client{}))
+	waitReady(t, s.base)
+
+	assert.Contains(t, postTranscription(t, s.base), recordedTranscript)
+
+	assert.NoDirExists(t, dir)
+	status, err := get(t.Context(), s.base+"/recordings")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusNotFound, status)
+	s.cancel()
+	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+}
+
+func TestServe_RecordingsOn_SavesHTTPTranscription(t *testing.T) {
+	cfg := validConfig(t)
+	dir := recordingsOn(t, &cfg)
+	s := startServe(t, &cfg, serviceFor(t, &cfg, serveASR, &http.Client{}))
+	waitReady(t, s.base)
+
+	postTranscription(t, s.base)
+
+	files := waitForSaved(t, dir)
+	id := strings.TrimSuffix(files[0], ".json")
+	assert.Equal(t, []string{id + ".json", id + ".opus"}, files)
+	meta := readSaved(t, dir, files[0])
+	assert.Equal(t, "openai", meta["source"])
+	assert.Equal(t, recordedTranscript, meta["transcript"])
+	assert.Equal(t, false, meta["keep"])
+	assert.InDelta(t, 500, meta["durationMs"], 1)
+	atText, ok := meta["at"].(string)
+	require.True(t, ok, "at is %T", meta["at"])
+	at, err := time.Parse(time.RFC3339, atText)
+	require.NoError(t, err)
+	assert.WithinDuration(t, time.Now(), at, time.Minute)
+
+	status, err := get(t.Context(), s.base+"/recordings")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, status)
+	s.cancel()
+	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+}
+
+func TestServe_RecordingsOn_SavesWyomingTranscriptionAsWyoming(t *testing.T) {
+	cfg := wyomingEnabled(t)
+	dir := recordingsOn(t, &cfg)
+	s := startServe(t, &cfg, serviceFor(t, &cfg, serveASR, &http.Client{}))
+	c := dialWyoming(t, s)
+
+	c.send(eventTranscribe, `{"language":"en"}`)
+	c.send(eventAudioStart, homeAssistantAudio)
+	c.sendChunk(homeAssistantAudio, []byte(strings.Repeat("\x01\x02", halfSecondSamples)))
+	c.send(eventAudioStop, "")
+	transcript := c.readType(eventTranscript)
+
+	assert.Contains(t, string(transcript.Data), recordedTranscript)
+	files := waitForSaved(t, dir)
+	meta := readSaved(t, dir, files[0])
+	assert.Equal(t, "wyoming", meta["source"])
+	assert.Equal(t, recordedTranscript, meta["transcript"])
+	s.cancel()
+	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+}
+
+// statusAs is the status of a GET of url sent with Host set to host.
+func statusAs(t *testing.T, url, host string) int {
+	t.Helper()
+
+	client := unpooledClient()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
+	require.NoError(t, err)
+	req.Host = host
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, resp.Body)
+	assert.NoError(t, err)
+	assert.NoError(t, resp.Body.Close())
+
+	return resp.StatusCode
+}
+
+func TestServe_RecordingsOn_AnswersOnlyAllowedHosts(t *testing.T) {
+	cfg := validConfig(t)
+	recordingsOn(t, &cfg)
+	cfg.Recordings.AllowedHosts = "voice.example"
+	// The listener still binds loopback; only the allow-list sees this host.
+	cfg.Host = "listen.example"
+	s := startServe(t, &cfg, serviceFor(t, &cfg, serveASR, &http.Client{}))
+	waitReady(t, s.base)
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(s.base, "http://"))
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusOK, statusAs(t, s.base+"/recordings", net.JoinHostPort("listen.example", port)), "the listen host")
+	assert.Equal(t, http.StatusOK, statusAs(t, s.base+"/recordings", "voice.example"))
+	assert.Equal(t, http.StatusOK, statusAs(t, s.base+"/recordings", "voice.example:443"))
+	assert.Equal(t, http.StatusOK, statusAs(t, s.base+"/recordings", strings.TrimPrefix(s.base, "http://")))
+	assert.Equal(t, http.StatusForbidden, statusAs(t, s.base+"/recordings", "evil.example"))
+	s.cancel()
+	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+}
+
+func TestNewServices_RecordingsDirUnwritable_FailsWrapped(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to a read-only directory")
+	}
+	parent := t.TempDir()
+	require.NoError(t, os.Chmod(parent, 0o500))
+	t.Cleanup(func() { assert.NoError(t, os.Chmod(parent, 0o700)) })
+	cfg := validConfig(t)
+	cfg.Recordings = RecordingsConfig{Enable: true, Dir: filepath.Join(parent, "recordings")}
+	client, err := upstream.New("http://127.0.0.1:1", "tts", "asr", &http.Client{})
+	require.NoError(t, err)
+
+	_, err = newServices(&cfg, map[string]string{}, client, slog.New(slog.DiscardHandler))
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "recordings")
+	assert.ErrorIs(t, err, os.ErrPermission)
+}
+
+func TestNewServices_RecordingsOn_CreatesPrivateDir(t *testing.T) {
+	cfg := validConfig(t)
+	dir := recordingsOn(t, &cfg)
+	client, err := upstream.New("http://127.0.0.1:1", "tts", "asr", &http.Client{})
+	require.NoError(t, err)
+
+	service, err := newServices(&cfg, map[string]string{}, client, slog.New(slog.DiscardHandler))
+
+	require.NoError(t, err)
+	require.NotNil(t, service.recordings)
+	require.NotNil(t, service.runRecordings)
+	info, err := os.Stat(dir)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+}
+
+// stopWaitCheck is how long a test watches a stop that must not return
+// yet.
+const stopWaitCheck = 200 * time.Millisecond
+
+// syncBuffer is a log destination that tests read while the service writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+func TestServe_StartsTheRecordingsRunAndWaitsForIt(t *testing.T) {
+	cfg := validConfig(t)
+	service := serviceFor(t, &cfg, serveASR, &http.Client{})
+	started, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	service.runRecordings = func(ctx, _ context.Context) {
+		close(started)
+		<-ctx.Done()
+		<-release
+		close(returned)
+	}
+	s := startServe(t, &cfg, service)
+	waitReady(t, s.base)
+
+	select {
+	case <-started:
+	case <-time.After(probeTimeout):
+		require.FailNow(t, "serve did not start the recordings run")
+	}
+
+	s.cancel()
+	select {
+	case err := <-s.done:
+		require.FailNow(t, "serve returned while the recordings run was still running", "error %v", err)
+	case <-time.After(stopWaitCheck):
+	}
+	close(release)
+	require.NoError(t, requireServeReturns(t, s.done, probeTimeout))
+	select {
+	case <-returned:
+	default:
+		require.FailNow(t, "serve returned before the recordings run did")
+	}
+}
+
+// synctestDeadline is how far ahead the startRecordings tests set the
+// shutdown deadline; time in a synctest bubble moves only when every
+// goroutine in it is blocked, so its length costs nothing.
+const synctestDeadline = time.Minute
+
+func TestStartRecordings_StopWaitsForTheRun(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release, returned := make(chan struct{}), make(chan struct{})
+		stop := startRecordings(func(ctx, _ context.Context) {
+			<-ctx.Done()
+			<-release
+			close(returned)
+		}, slog.New(slog.DiscardHandler))
+
+		stopped := make(chan struct{})
+		go func() {
+			defer close(stopped)
+			stop(time.Now().Add(synctestDeadline))
+		}()
+
+		synctest.Wait()
+		select {
+		case <-stopped:
+			require.FailNow(t, "stop returned while the run was still running")
+		default:
+		}
+		close(release)
+		synctest.Wait()
+		select {
+		case <-stopped:
+		default:
+			require.FailNow(t, "stop did not return after the run did")
+		}
+		select {
+		case <-returned:
+		default:
+			require.FailNow(t, "stop returned before the run did")
+		}
+	})
+}
+
+func TestStartRecordings_DrainEndsAtTheDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		drained := make(chan time.Time, 1)
+		stop := startRecordings(func(ctx, drain context.Context) {
+			<-ctx.Done()
+			<-drain.Done()
+			drained <- time.Now()
+		}, slog.New(slog.DiscardHandler))
+		deadline := time.Now().Add(synctestDeadline)
+
+		stop(deadline)
+
+		assert.Equal(t, deadline, <-drained, "the drain ends at the deadline, not before")
+	})
+}
+
+func TestStartRecordings_StopGivesUpAtTheDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		logs := &syncBuffer{}
+		block := make(chan struct{})
+		defer close(block)
+		stop := startRecordings(func(context.Context, context.Context) { <-block }, slog.New(slog.NewJSONHandler(logs, nil)))
+
+		began := time.Now()
+		stop(began.Add(synctestDeadline))
+
+		assert.Equal(t, synctestDeadline, time.Since(began), "stop returns at the deadline")
+		assert.Contains(t, logs.String(), "recordings still saving at the shutdown deadline")
+	})
+}
+
+const (
+	// drainGrace, drainTotal and drainHard are the shutdown timing of the
+	// drain test. Each differs from the others, so a budget counted from
+	// the signal or from the end of shutdown ends at another instant.
+	drainGrace = 200 * time.Millisecond
+	drainTotal = time.Second
+	drainHard  = 300 * time.Millisecond
+	// bubbleUpstream and bubbleService name the two servers a drain test
+	// reaches through pipeListeners; nothing resolves them.
+	bubbleUpstream = "http://upstream.invalid"
+	bubbleService  = "http://service.invalid"
+)
+
+// pipeListener is a net.Listener whose connections are in-memory pipes. A
+// synctest bubble's clock stops while a goroutine waits on a real socket,
+// and keeps moving while one waits on a pipe.
+type pipeListener struct {
+	conns  chan net.Conn
+	closed chan struct{}
+	close  func()
+}
+
+func newPipeListener() *pipeListener {
+	closed := make(chan struct{})
+	return &pipeListener{conns: make(chan net.Conn), closed: closed, close: sync.OnceFunc(func() { close(closed) })}
+}
+
+func (l *pipeListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.conns:
+		return conn, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *pipeListener) Close() error {
+	l.close()
+	return nil
+}
+
+func (*pipeListener) Addr() net.Addr {
+	return pipeAddr{}
+}
+
+// DialContext hands one end of a new pipe to Accept and returns the other.
+func (l *pipeListener) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	server, client := net.Pipe()
+	select {
+	case l.conns <- server:
+		return client, nil
+	case <-l.closed:
+		return nil, errors.Join(net.ErrClosed, server.Close(), client.Close())
+	case <-ctx.Done():
+		return nil, errors.Join(ctx.Err(), server.Close(), client.Close())
+	}
+}
+
+// client reaches the listener with a connection per request, so no idle
+// connection outlives the bubble.
+func (l *pipeListener) client() *http.Client {
+	return &http.Client{Transport: &http.Transport{DialContext: l.DialContext, DisableKeepAlives: true}}
+}
+
+type pipeAddr struct{}
+
+func (pipeAddr) Network() string { return "pipe" }
+func (pipeAddr) String() string  { return "pipe" }
+
+// receiveWithin returns the value ch delivers, and fails the test when none
+// arrives within d of bubble time.
+func receiveWithin[T any](t *testing.T, ch <-chan T, d time.Duration, what string) T {
+	t.Helper()
+
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(d):
+		require.FailNow(t, what, "nothing within %s", d)
+		var zero T
+		return zero
+	}
+}
+
+func TestServe_RecordingsDrainDeadlineRunsFromShutdownStart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := validConfig(t)
+		cfg.ShutdownTiming = ShutdownTimingConfig{Grace: drainGrace, Total: drainTotal, Hard: drainHard}
+
+		paused := make(chan struct{})
+		upstreamListener := newPipeListener()
+		fake := &http.Server{
+			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// net/http cancels r's context on a closed connection only
+				// once the request body has been read.
+				_, err := io.Copy(io.Discard, r.Body)
+				assert.NoError(t, err)
+				_, err = io.WriteString(w, slowAudio)
+				assert.NoError(t, err)
+				assert.NoError(t, http.NewResponseController(w).Flush())
+				close(paused)
+				<-r.Context().Done()
+			}),
+			ReadHeaderTimeout: probeTimeout,
+		}
+		upstreamDone := make(chan error, 1)
+		go func() { upstreamDone <- fake.Serve(upstreamListener) }()
+		// Cleanups run in reverse order, so the fake upstream stops after the
+		// service, and a failed assertion still leaves no goroutine blocked.
+		t.Cleanup(func() {
+			assert.NoError(t, fake.Close())
+			assert.ErrorIs(t, receiveWithin(t, upstreamDone, probeTimeout, "the fake upstream never stopped"), http.ErrServerClosed)
+		})
+
+		service := serviceAt(t, &cfg, bubbleUpstream, upstreamListener.client())
+		drainEnded := make(chan time.Time, 1)
+		service.runRecordings = func(ctx, drain context.Context) {
+			<-ctx.Done()
+			<-drain.Done()
+			drainEnded <- time.Now()
+		}
+
+		listener := newPipeListener()
+		budget := drainGrace + drainTotal + drainHard
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		served := make(chan struct{})
+		go func() {
+			defer close(served)
+			done <- serveOn(ctx, &cfg, service, &listeners{http: listener}, slog.New(slog.DiscardHandler))
+		}()
+		t.Cleanup(func() {
+			cancel()
+			receiveWithin(t, served, budget+probeTimeout, "serve did not return")
+		})
+
+		// t.Context ends before the cleanups run, which ends this request.
+		requestEnded := make(chan time.Time, 1)
+		requested := make(chan struct{})
+		go func() {
+			defer close(requested)
+			_, err := postSpeechVia(t.Context(), listener.client(), bubbleService, `{"input":"hi","response_format":"mp3"}`)
+			assert.Error(t, err, "a cancelled stream must not end cleanly")
+			requestEnded <- time.Now()
+		}()
+		t.Cleanup(func() { receiveWithin(t, requested, probeTimeout, "the speech request never ended") })
+		receiveWithin(t, paused, probeTimeout, "the upstream reply never started")
+
+		signalled := time.Now()
+		cancel()
+
+		require.NoError(t, receiveWithin(t, done, budget+probeTimeout, "serve did not return"))
+		// Without a request that holds shutdown for all of Total, a budget
+		// counted from the end of shutdown would end at the same instant.
+		requestEnd := receiveWithin(t, requestEnded, probeTimeout, "the speech request never ended")
+		assert.Equal(t, drainGrace+drainTotal, requestEnd.Sub(signalled), "the stuck request holds shutdown until Total has passed")
+		drainEnd := receiveWithin(t, drainEnded, probeTimeout, "the recordings drain never ended")
+		assert.Equal(t, budget, drainEnd.Sub(signalled), "the drain ends Total and Hard after shutdown starts, which is Grace after the signal")
+	})
+}
+
+func TestStartRecordings_RecordingsOffIsNoOp(t *testing.T) {
+	startRecordings(nil, slog.New(slog.DiscardHandler))(time.Now())
+}
+
+func TestRecordingsDeadline_IsTheShutdownBudgetFromItsStart(t *testing.T) {
+	timing := ShutdownTimingConfig{Total: 15 * time.Second, Grace: time.Hour, Hard: 3 * time.Second}
+	began := time.Date(2026, time.November, 25, 15, 30, 0, 0, time.UTC)
+
+	assert.Equal(t, began.Add(18*time.Second), recordingsDeadline(began, &timing))
+	assert.WithinDuration(t, time.Now().Add(18*time.Second), recordingsDeadline(time.Time{}, &timing), time.Second, "an unset start is now")
 }

@@ -31,6 +31,16 @@ type Config struct {
 	MaxConcurrentTTS int
 	TTSConcurrency   int
 	ASRPrefixRegex   string
+	// Recorder keeps the audio of each successful transcription; nil keeps
+	// nothing.
+	Recorder Recorder
+}
+
+// Recorder keeps wav, the 16 kHz mono WAV sent upstream, with the source
+// entrypoint, the transcript returned to the client and the request's id for
+// its log lines. Record must not wait on the disk, and takes ownership of wav.
+type Recorder interface {
+	Record(wav []byte, source, transcript, requestID string)
 }
 
 type Pipeline struct {
@@ -139,11 +149,16 @@ func WithRequestID(ctx context.Context, id string) context.Context {
 }
 
 func requestID(ctx context.Context) slog.Attr {
+	return slog.String("request_id", requestIDOf(ctx))
+}
+
+// requestIDOf returns the id WithRequestID tagged ctx with, or "".
+func requestIDOf(ctx context.Context) string {
 	if id, ok := ctx.Value(requestIDKey{}).(string); ok {
-		return slog.String("request_id", id)
+		return id
 	}
 
-	return slog.String("request_id", "")
+	return ""
 }
 
 func compilePrefix(pattern string) (*regexp.Regexp, error) {

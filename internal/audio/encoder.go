@@ -35,7 +35,7 @@ func NewEncoder(format Format, w io.Writer) (io.WriteCloser, error) {
 	case MP3:
 		return newMP3Encoder(w), nil
 	case Opus:
-		encoder, err := newOpusEncoder(w)
+		encoder, err := newOpusEncoder(w, outputRate, opusBitrate)
 		if err != nil {
 			return nil, err
 		}

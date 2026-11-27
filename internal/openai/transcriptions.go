@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+
+	"github.com/mniehe/llama-swap-voice/internal/pipeline"
 )
 
 const (
@@ -54,7 +56,7 @@ func (s *Server) handleTranscription(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	text, err := s.pipeline.Transcribe(r.Context(), file)
+	text, err := s.pipeline.Transcribe(r.Context(), file, pipeline.SourceOpenAI)
 	if err != nil {
 		s.failure(w, r, err)
 		return

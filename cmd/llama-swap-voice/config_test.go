@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -136,6 +137,9 @@ func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 		"WYOMING_SPEED":             "1.25",
 		"WYOMING_STREAMING":         "whole",
 		"WYOMING_STREAMINGMAXCHARS": "120",
+		"RECORDINGS_ENABLE":         "true",
+		"RECORDINGS_DIR":            "/var/lib/llama-swap-voice/recordings",
+		"RECORDINGS_ALLOWEDHOSTS":   "voice.example,proxy.example:8443",
 	}
 	for key, value := range env {
 		t.Setenv(envPrefix+key, value)
@@ -155,6 +159,7 @@ func TestLoadConfig_Environment_MapsToServiceConfig(t *testing.T) {
 		Logger:         LoggerConfig{Level: "debug", Format: "console"},
 		ShutdownTiming: ShutdownTimingConfig{Total: 20 * time.Second, Grace: 5 * time.Second, Hard: time.Second},
 		Wyoming:        WyomingConfig{Enabled: true, Host: "::1", Port: 10301, Languages: "en,de", Speed: 1.25, Streaming: wyoming.ModeWhole, StreamingMaxChars: 120},
+		Recordings:     RecordingsConfig{Enable: true, Dir: "/var/lib/llama-swap-voice/recordings", AllowedHosts: "voice.example,proxy.example:8443"},
 	}, cfg)
 }
 
@@ -189,6 +194,7 @@ func TestLoadConfig_NoEnvironment_ReturnsDefaults(t *testing.T) {
 		Streaming:         wyoming.ModeSentences,
 		StreamingMaxChars: 300,
 	}, cfg.Wyoming)
+	assert.Equal(t, RecordingsConfig{Enable: false, Dir: ""}, cfg.Recordings)
 }
 
 func TestLoadConfig_UnknownTTSBackend_FailsStartup(t *testing.T) {
@@ -344,4 +350,117 @@ func TestServiceConfig_WyomingConfig_CopiesSettings(t *testing.T) {
 		StreamingMaxChars: 42,
 		Version:           "9.9.9",
 	}, got)
+}
+
+func TestServiceConfig_Validate_RecordingsRejectsMissingOrRelativeDir(t *testing.T) {
+	for name, dir := range map[string]string{"empty": "", "relative": "recordings", "dot relative": "./var/recordings"} {
+		t.Run(name, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.Recordings = RecordingsConfig{Enable: true, Dir: dir}
+
+			err := cfg.Validate()
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "recordings.dir must be an absolute path")
+		})
+	}
+}
+
+func TestServiceConfig_Validate_RecordingsAcceptsAbsoluteDir(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Recordings = RecordingsConfig{Enable: true, Dir: "/var/lib/llama-swap-voice/recordings"}
+
+	require.NoError(t, cfg.Validate())
+}
+
+func TestServiceConfig_Validate_RecordingsDisabledIsNotChecked(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Recordings = RecordingsConfig{Enable: false, Dir: "relative"}
+
+	require.NoError(t, cfg.Validate())
+}
+
+func TestServiceConfig_Validate_RecordingsAllowedHostsAccepted(t *testing.T) {
+	for _, hosts := range []string{"", "voice.example", "voice.example:8443", "[::1]", "[::1]:8920", "10.0.0.5", "a.example, b.example:443"} {
+		t.Run(hosts, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.Recordings = RecordingsConfig{Enable: true, Dir: "/var/lib/llama-swap-voice/recordings", AllowedHosts: hosts}
+
+			require.NoError(t, cfg.Validate())
+		})
+	}
+}
+
+func TestServiceConfig_Validate_RecordingsAllowedHostsRejected(t *testing.T) {
+	for _, hosts := range []string{
+		"https://voice.example",
+		"voice.example/recordings",
+		"voice example",
+		"a.example,,b.example",
+		"a.example,",
+		"voice.example:",
+		":8443",
+		"voice.example:http",
+		"voice.example:0",
+		"voice.example:70000",
+		"::1",
+		"user@voice.example",
+		"voice.example?x",
+	} {
+		t.Run(hosts, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.Recordings = RecordingsConfig{Enable: true, Dir: "/var/lib/llama-swap-voice/recordings", AllowedHosts: hosts}
+
+			err := cfg.Validate()
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "recordings.allowedhosts")
+		})
+	}
+}
+
+func TestServiceConfig_Validate_RecordingsAllowedHostBounds(t *testing.T) {
+	for _, entry := range []string{"voice.example:1", "voice.example:65535", "[::1]:1"} {
+		t.Run(entry, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.Recordings = RecordingsConfig{Enable: true, Dir: "/var/lib/llama-swap-voice/recordings", AllowedHosts: entry}
+
+			require.NoError(t, cfg.Validate())
+		})
+	}
+
+	for entry, reason := range map[string]string{
+		"[voice.example]":     "is not an IPv6 address in brackets",
+		"[::1":                "is not an IPv6 address in brackets",
+		"voice.example:65536": "has a port that is not between 1 and 65535",
+		"voice.example:0":     "has a port that is not between 1 and 65535",
+	} {
+		t.Run(entry, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.Recordings = RecordingsConfig{Enable: true, Dir: "/var/lib/llama-swap-voice/recordings", AllowedHosts: entry}
+
+			err := cfg.Validate()
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), fmt.Sprintf("recordings.allowedhosts entry %q %s", entry, reason))
+		})
+	}
+}
+
+func TestServiceConfig_Validate_RecordingsAllowedHostsUncheckedWhenOff(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Recordings = RecordingsConfig{Enable: false, AllowedHosts: "https://voice.example"}
+
+	require.NoError(t, cfg.Validate())
+}
+
+func TestServiceConfig_RecordingHosts_ListenHostAndEntries(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Host = "0.0.0.0"
+	cfg.Recordings.AllowedHosts = " a.example , b.example:443 "
+
+	assert.Equal(t, []string{"0.0.0.0", "a.example", "b.example:443"}, cfg.recordingHosts())
+
+	cfg.Recordings.AllowedHosts = ""
+	assert.Equal(t, []string{"0.0.0.0"}, cfg.recordingHosts())
 }
