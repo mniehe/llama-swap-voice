@@ -281,6 +281,41 @@ in
           meta = json.loads(qwentts.succeed(f"cat {RECORDINGS}/{recording_id}.json"))
           assert meta["keep"] is True, meta
 
+          status = qwentts.succeed(
+              "curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' --data-urlencode 'name=Anna' "
+              "http://127.0.0.1:8920/recordings/profiles"
+          ).strip()
+          assert status == "303 http://127.0.0.1:8920/recordings/profiles", status
+          profiles = json.loads(qwentts.succeed(f"cat {RECORDINGS}/profiles.json"))["profiles"]
+          assert [p["name"] for p in profiles] == ["Anna"], profiles
+          profile_id = profiles[0]["id"]
+
+          # The review form: unticked keep, ticked error, one speaker. A
+          # flagged recording stays kept, and its transcript is never edited.
+          status = qwentts.succeed(
+              f"curl -sS -o /dev/null -w '%{{http_code}} %{{redirect_url}}' -d transcriptionError=true "
+              f"--data-urlencode 'correctText=turn off the lights' -d profile={profile_id} "
+              f"http://127.0.0.1:8920/recordings/{recording_id}"
+          ).strip()
+          assert status == f"303 http://127.0.0.1:8920/recordings/{recording_id}", status
+          meta = json.loads(qwentts.succeed(f"cat {RECORDINGS}/{recording_id}.json"))
+          assert meta["transcriptionError"] is True, meta
+          assert meta["correctText"] == "turn off the lights", meta
+          assert meta["profiles"] == [profile_id], meta
+          assert meta["keep"] is True, meta
+          assert meta["transcript"] == transcript, meta
+
+          page = qwentts.succeed(f"curl -sSf http://127.0.0.1:8920/recordings/{recording_id}")
+          assert "turn off the lights" in page, page
+          page = qwentts.succeed("curl -sSf http://127.0.0.1:8920/recordings")
+          assert "Anna" in page, page
+
+          status = qwentts.succeed(
+              f"curl -sS -o /dev/null -w '%{{http_code}}' -d keep=false "
+              f"http://127.0.0.1:8920/recordings/{recording_id}/keep"
+          ).strip()
+          assert status == "409", f"releasing a flagged recording got {status}"
+
       with subtest("recordings are off by default: no directory and no page"):
           llamacpp.fail(f"test -e {RECORDINGS}")
           status = llamacpp.succeed("curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8920/recordings").strip()

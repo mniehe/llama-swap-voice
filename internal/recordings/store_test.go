@@ -96,11 +96,14 @@ func names(t *testing.T, dir string) []string {
 }
 
 type fileFields struct {
-	At         string `json:"at"`
-	DurationMs int64  `json:"durationMs"`
-	Source     string `json:"source"`
-	Transcript string `json:"transcript"`
-	Keep       bool   `json:"keep"`
+	At                 string   `json:"at"`
+	DurationMs         int64    `json:"durationMs"`
+	Source             string   `json:"source"`
+	Transcript         string   `json:"transcript"`
+	Keep               bool     `json:"keep"`
+	TranscriptionError bool     `json:"transcriptionError"`
+	CorrectText        string   `json:"correctText"`
+	Profiles           []string `json:"profiles"`
 }
 
 func readMetadata(t *testing.T, path string) fileFields {
@@ -193,6 +196,7 @@ func TestSave_WritesOpusAndMetadata(t *testing.T) {
 		Source:     sourceWyoming,
 		Transcript: "turn on the lights",
 		Keep:       false,
+		Profiles:   []string{},
 	}, readMetadata(t, filepath.Join(dir, id+jsonSuffix)))
 
 	opus, err := os.ReadFile(filepath.Join(dir, id+opusSuffix))

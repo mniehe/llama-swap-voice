@@ -243,7 +243,9 @@ them and review the transcripts. It is off by default.
 **Turning this on stores household speech.** Each recording stays on disk
 for 7 days. A recording that you mark kept on the page stays until you
 release it. The page has no authentication: anyone who can reach the HTTP
-port can listen to every recording and change its keep mark. Keep `host` on
+port can listen to every recording, change its keep mark and its review, and
+edit the speaker profiles.
+Keep `host` on
 loopback, or put a reverse proxy that checks who is asking in front of the
 port.
 
@@ -271,7 +273,7 @@ was sent to the ASR model as Ogg Opus (16 kHz mono, 32 kbps, about 14 MB an
 hour), and `<id>.json`:
 
 ```json
-{"at":"2026-11-25T15:30:00.123456789Z","durationMs":2140,"source":"wyoming","transcript":"Turn on the kitchen lights.","keep":false}
+{"at":"2026-11-25T15:30:00.123456789Z","durationMs":2140,"source":"wyoming","transcript":"Turn of the kitten lights.","keep":true,"transcriptionError":true,"correctText":"Turn off the kitchen lights.","profiles":["3f9a1c0b7d2e4a65"]}
 ```
 
 `source` is `openai` for the HTTP API and `wyoming` for the Wyoming
@@ -280,22 +282,72 @@ transcription finished and the recording was queued, not when it was saved.
 The id is that time to the second and a random suffix, such as
 `20261125T153000Z-1a2b3c4d`.
 
+`transcriptionError`, `correctText` and `profiles` hold the review you save
+on the recording's page. `transcriptionError` is `true` when the transcript
+is wrong; such a recording always has `keep` set, and the service treats a
+`.json` with `transcriptionError` `true` as kept even when its `keep` says
+`false`, so it never expires or evicts one. `correctText` is what was
+said, at most 16 KiB with each line break stored as one LF, and is empty
+when the flag is off. With the flag on,
+an empty `correctText` means the recogniser wrote text when nobody spoke.
+`profiles` holds the ids of the recording's speakers. `transcript` always
+holds what the recogniser returned; a review never changes it. A `.json`
+written before these fields existed lacks them and reads as not flagged,
+with no correct text and no speakers.
+
+The speaker profiles live in one more file in the directory,
+`profiles.json`, which the service writes when you first add a profile:
+
+```json
+{"profiles":[{"id":"3f9a1c0b7d2e4a65","name":"Anna"}]}
+```
+
+The service picks each id, 16 random hex digits. A recording names its
+speakers by id, so a rename shows on every recording at once. Deleting a
+profile rewrites only `profiles.json`: a recording that named it no longer
+shows it, and drops its id the next time the service writes that
+recording's `.json`. At start the service refuses to run when
+`profiles.json` is not a regular file (a symlink, a directory or a FIFO,
+which it never opens), is over 32 KiB, is not valid UTF-8, or is not one
+JSON object whose only key is a `profiles` list: a missing or `null` list,
+another key, a profile with a key besides `id` and `name`, or anything after
+the object refuses it. It also refuses a file that breaks a rule the
+profiles page enforces: more than 64 profiles, an id that is not 16
+lowercase hex digits, or a name that is empty, over 64 bytes, has spaces
+around it, holds a character that is not graphic (a control or format
+character, or a line or paragraph separator), or that another profile has,
+ignoring case. `{"profiles":[]}` is valid. Mend or delete the file to start
+it again; deleting it removes every profile from every recording.
+`profiles.json` counts toward the cap.
+
+Rolling back to a release without the review loses it: an older release
+reads these files, but when it rewrites one, for a change of its keep mark,
+it drops the review fields. A recording that was flagged then keeps only its
+`keep`. An older release leaves `profiles.json` alone and does not count it
+toward the cap.
+
 The service deletes recordings that are not kept and are older than 7 days,
 once when it starts and then every hour. The two files of all recordings
 together may take at most 1 GiB. Before a save that would pass that cap, the
 service deletes the oldest recordings that are not kept until the new one
 fits. Kept recordings count toward the cap, and so do the recordings left
-for you below and any file the service failed to delete. When those alone
-leave no room, the service saves nothing and logs a warning. A deletion that
+for you below, any file the service failed to delete, and `profiles.json`.
+When those alone
+leave no room, the service saves nothing and logs a warning. An edit never
+deletes a recording to make room: a review, a keep change, a new profile or
+a rename that makes its file larger is refused when the store would then
+pass the cap, and the page answers 507. An edit that does not make its file
+larger, and deleting a profile, are always allowed. A deletion that
 fails is logged as a warning and the service goes on with the others. The
 retention, the cap and the interval are fixed.
 
 The recordings directory must belong to the service alone. At start and
 every hour the service deletes, besides expired recordings, the files that
 an interrupted save or delete leaves: a `.opus` or `.json` file without its
-partner, and its own temporary files, `probe-<digits>.tmp` and
-`<id>.opus.<digits>.tmp` or `<id>.json.<digits>.tmp`. It leaves other files
-alone.
+partner, and its own temporary files, `probe-<digits>.tmp`,
+`<id>.opus.<digits>.tmp`, `<id>.json.<digits>.tmp` and
+`profiles.json.<digits>.tmp`. It never deletes `profiles.json` and leaves
+other files alone.
 
 At start the service logs one warning for each recording whose `.json` does
 not decode, has no `keep` of `true` or `false` or no recording time, is over

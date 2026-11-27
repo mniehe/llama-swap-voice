@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recording {{.ID}}</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 50rem; }
+dt { font-weight: bold; margin-top: 0.6rem; }
+dd { margin-left: 0; }
+.transcript { white-space: pre-wrap; }
+fieldset { margin-top: 1rem; }
+label { display: block; margin: 0.4rem 0; }
+textarea { width: 100%; }
+</style>
+</head>
+<body>
+<p><a href="/recordings">All recordings</a></p>
+<h1>Recording</h1>
+<dl>
+<dt>Recorded (UTC)</dt><dd><time datetime="{{.At}}">{{.Shown}}</time></dd>
+<dt>Length</dt><dd>{{.Length}}</dd>
+<dt>Source</dt><dd>{{.Source}}</dd>
+<dt>Audio</dt><dd><audio controls preload="none" src="/recordings/{{.ID}}/audio"></audio></dd>
+<dt>Transcript</dt><dd class="transcript">{{.Transcript}}</dd>
+</dl>
+<form method="post" action="/recordings/{{.ID}}">
+<fieldset>
+<legend>Review</legend>
+<label><input type="checkbox" name="keep" value="true"{{if .Keep}} checked{{end}}> Keep. A recording that is not kept is deleted after {{retentionDays}} days.</label>
+<label><input type="checkbox" name="transcriptionError" value="true"{{if .TranscriptionError}} checked{{end}}> Transcription error. A recording with a transcription error is always kept.</label>
+<label>Correct text: what was said, empty when nobody spoke. It is saved only with a transcription error.
+<textarea name="correctText" rows="4" cols="80">
+{{.CorrectText}}</textarea></label>
+</fieldset>
+<fieldset>
+<legend>Speakers</legend>
+{{range .Profiles}}<label><input type="checkbox" name="profile" value="{{.ID}}"{{if .Checked}} checked{{end}}> {{.Name}}</label>
+{{else}}<p>No speaker profiles yet.</p>
+{{end}}<p><a href="/recordings/profiles">Manage speaker profiles</a></p>
+</fieldset>
+<p><button type="submit">Save</button></p>
+</form>
+</body>
+</html>
