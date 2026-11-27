@@ -532,6 +532,27 @@ func (s *Store) makeRoom(size int64) error {
 	return errors.Join(errs...)
 }
 
+// checkGrowth returns ErrFull when replacing a file of oldSize bytes with
+// newSize bytes would grow it and take the store past its cap. It never
+// evicts: a rewrite is an edit, and an edit must not delete recordings. The
+// caller holds mu.
+func (s *Store) checkGrowth(oldSize, newSize int64) error {
+	if newSize <= oldSize {
+		return nil
+	}
+
+	total := s.unevictable()
+	for _, rec := range s.order {
+		total += rec.bytes()
+	}
+
+	if after := total - oldSize + newSize; after > s.maxBytes {
+		return fmt.Errorf("%w: the edit would take the store to %d bytes, over the %d-byte cap", ErrFull, after, s.maxBytes)
+	}
+
+	return nil
+}
+
 // unevictable is the size of the skipped pairs, the stray files and
 // profiles.json. The caller holds mu.
 func (s *Store) unevictable() int64 {
@@ -707,7 +728,8 @@ func (s *Store) Audio(id string) (*os.File, error) {
 
 // SetKeep marks the recording id as kept, which exempts it from expiry and
 // eviction, or clears the mark. Clearing the mark of a recording flagged with
-// a transcription error is ErrFlaggedKept.
+// a transcription error is ErrFlaggedKept, and a change that grows the
+// metadata past the cap is ErrFull.
 func (s *Store) SetKeep(id string, keep bool) error {
 	if !ValidID(id) {
 		return ErrNotFound
@@ -754,7 +776,8 @@ func (s *Store) Recording(id string) (Recording, error) {
 // is. A transcription error keeps the recording whatever edit.Keep says, and
 // without one the correct text is dropped. A correct text over
 // MaxCorrectTextBytes or not valid UTF-8, or a profile id that names no
-// profile, is ErrInvalid.
+// profile, is ErrInvalid. An edit that grows the metadata past the cap is
+// ErrFull; it never evicts a recording to make room.
 func (s *Store) Annotate(id string, edit Annotation) error {
 	if !ValidID(id) {
 		return ErrNotFound
@@ -817,12 +840,17 @@ func (s *Store) indexedMetadata(id string) (*indexed, metadata, error) {
 }
 
 // rewrite replaces the metadata file of rec with meta, without the ids of
-// profiles deleted since. The caller holds mu.
+// profiles deleted since. It is ErrFull when the file grows and the store
+// would pass its cap. The caller holds mu.
 func (s *Store) rewrite(rec *indexed, meta *metadata) error {
 	meta.Profiles = s.known(meta.Profiles)
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return fmt.Errorf("encode recording metadata: %w", err)
+	}
+
+	if err := s.checkGrowth(rec.jsonBytes, int64(len(data))); err != nil {
+		return err
 	}
 
 	if err := s.write(rec.id+jsonSuffix, data); err != nil {
@@ -972,7 +1000,8 @@ func (s *Store) unlink(name string, size int64) error {
 
 // readMetadata reads the metadata of id through maxMetadataBytes. A file
 // that cannot be read once open, is too long, does not decode, or lacks a
-// boolean keep or a time is errUnusable; one that cannot be opened is not.
+// boolean keep or a time is errUnusable; one that cannot be opened is not. A
+// file flagged with a transcription error reads as kept.
 func (s *Store) readMetadata(id string) (metadata, error) {
 	file, err := os.Open(filepath.Join(s.dir, id+jsonSuffix))
 	if err != nil {
@@ -999,11 +1028,13 @@ func (s *Store) readMetadata(id string) (metadata, error) {
 	}
 
 	return metadata{
-		At:                 *stored.At,
-		DurationMs:         stored.DurationMs,
-		Source:             stored.Source,
-		Transcript:         stored.Transcript,
-		Keep:               *stored.Keep,
+		At:         *stored.At,
+		DurationMs: stored.DurationMs,
+		Source:     stored.Source,
+		Transcript: stored.Transcript,
+		// A flagged recording is a test case and stays kept, whatever the
+		// file says, so neither expiry nor eviction can delete it.
+		Keep:               *stored.Keep || stored.TranscriptionError,
 		TranscriptionError: stored.TranscriptionError,
 		CorrectText:        stored.CorrectText,
 		Profiles:           stored.Profiles,

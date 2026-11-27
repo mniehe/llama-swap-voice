@@ -237,3 +237,105 @@ func TestRecording_ReturnsTheWholeTranscript(t *testing.T) {
 	assert.Equal(t, 500*time.Millisecond, got.Duration)
 	assert.Equal(t, sourceOpenAI, got.Source)
 }
+
+// annotationGrowth is how many bytes edit adds to a fresh recording's
+// metadata, measured on a store of its own.
+func annotationGrowth(t *testing.T, edit Annotation) int64 {
+	t.Helper()
+
+	dir := t.TempDir()
+	store, _ := openStore(t, dir)
+	rec := save(t, store, heardText)
+	before := recordingBytes(t, dir, rec)
+	require.NoError(t, store.Annotate(rec.ID, edit))
+
+	return recordingBytes(t, dir, rec) - before
+}
+
+func TestAnnotate_GrowthUpToTheCapIsSavedAndPastItIsFull(t *testing.T) {
+	edit := Annotation{TranscriptionError: true, CorrectText: spokenText}
+	growth := annotationGrowth(t, edit)
+	require.Positive(t, growth)
+
+	for name, slack := range map[string]int64{"at the cap": 0, "one byte under": -1} {
+		dir := t.TempDir()
+		store, _ := openStore(t, dir)
+		rec := save(t, store, heardText)
+		store.maxBytes = recordingBytes(t, dir, rec) + growth + slack
+		before := fileBytes(t, metadataPath(dir, rec.ID))
+
+		err := store.Annotate(rec.ID, edit)
+
+		if slack == 0 {
+			require.NoError(t, err, name)
+			assert.True(t, readMetadata(t, metadataPath(dir, rec.ID)).TranscriptionError, name)
+			continue
+		}
+		require.ErrorIs(t, err, ErrFull, name)
+		assert.Equal(t, before, fileBytes(t, metadataPath(dir, rec.ID)), name)
+		assert.Equal(t, []string{rec.ID}, ids(t, store), "%s: nothing is evicted", name)
+	}
+}
+
+func TestAnnotate_FullStoreNeverEvictsToMakeRoom(t *testing.T) {
+	dir := t.TempDir()
+	store, c := openStore(t, dir)
+	older := save(t, store, "older")
+	c.advance(time.Minute)
+	rec := save(t, store, heardText)
+	store.maxBytes = recordingBytes(t, dir, older) + recordingBytes(t, dir, rec)
+
+	err := store.Annotate(rec.ID, Annotation{TranscriptionError: true, CorrectText: spokenText})
+
+	require.ErrorIs(t, err, ErrFull)
+	assert.Equal(t, []string{rec.ID, older.ID}, ids(t, store))
+}
+
+func TestSetKeep_GrowthPastTheCapIsFull(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := openStore(t, dir)
+	rec := save(t, store, heardText)
+	require.NoError(t, store.SetKeep(rec.ID, true))
+	store.maxBytes = recordingBytes(t, dir, rec)
+	before := fileBytes(t, metadataPath(dir, rec.ID))
+
+	// false is one byte longer than true.
+	err := store.SetKeep(rec.ID, false)
+
+	require.ErrorIs(t, err, ErrFull)
+	assert.Equal(t, before, fileBytes(t, metadataPath(dir, rec.ID)))
+}
+
+func TestRewrite_ThatDoesNotGrowIsSavedWhenFull(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := openStore(t, dir)
+	rec := save(t, store, heardText)
+	require.NoError(t, store.Annotate(rec.ID, Annotation{TranscriptionError: true, CorrectText: spokenText}))
+	store.maxBytes = 0
+
+	require.NoError(t, store.SetKeep(rec.ID, true), "the same size")
+	require.NoError(t, store.Annotate(rec.ID, Annotation{Keep: true}), "smaller: the correct text goes")
+
+	meta := readMetadata(t, metadataPath(dir, rec.ID))
+	assert.False(t, meta.TranscriptionError)
+	assert.Empty(t, meta.CorrectText)
+}
+
+func TestOpen_FlaggedMetadataIsKeptWhateverItsKeepSays(t *testing.T) {
+	dir := t.TempDir()
+	plantPair(t, dir, plantedCorruptID, []byte(
+		`{"at":"2026-11-25T12:00:00Z","durationMs":500,"source":"openai","transcript":"old","keep":false,"transcriptionError":true,"correctText":"new","profiles":[]}`))
+	c := &clock{now: start.Add(Retention + day)}
+
+	store, _ := openLogged(t, dir, c.Now)
+
+	assert.Equal(t, []string{plantedCorruptID}, ids(t, store), "Open collects; the flagged recording stays")
+	got, err := store.Recording(plantedCorruptID)
+	require.NoError(t, err)
+	assert.True(t, got.Keep)
+	require.ErrorIs(t, store.SetKeep(plantedCorruptID, false), ErrFlaggedKept)
+
+	store.maxBytes = int64(len(fileBytes(t, metadataPath(dir, plantedCorruptID)))) + int64(len("audio"))
+	require.ErrorIs(t, store.Save(wav(t, halfSecond), sourceOpenAI, "new"), ErrFull, "the cap never evicts it")
+	assert.Equal(t, []string{plantedCorruptID}, ids(t, store))
+}

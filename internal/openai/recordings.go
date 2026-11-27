@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -45,17 +46,20 @@ const (
 	// maxKeepFormBytes bounds the keep form, whose one field fits in a few
 	// bytes.
 	maxKeepFormBytes = 1 << 10
-	// maxRecordingFormBytes bounds the recording form. Percent-encoding
-	// writes a byte as at most three, so the correct text at its bound takes
-	// three times MaxCorrectTextBytes. Each of the MaxProfiles speakers takes
-	// its field name and id, and a KiB covers the other field names and the
-	// two checkboxes.
-	maxRecordingFormBytes = 3*recordings.MaxCorrectTextBytes +
+	// maxRecordingFormBytes bounds the recording form. A browser sends each
+	// line break of a textarea as CRLF, percent-encoded as six bytes, and
+	// the handler stores it as one LF, so the correct text at its bound takes
+	// at most six times MaxCorrectTextBytes; any other byte takes at most
+	// three. Each of the MaxProfiles speakers takes its field name and id,
+	// and a KiB covers the other field names and the two checkboxes.
+	maxRecordingFormBytes = len("%0D%0A")*recordings.MaxCorrectTextBytes +
 		recordings.MaxProfiles*(len("&"+profileFieldName+"=")+recordings.ProfileIDLength) + 1<<10
 	// maxProfileFormBytes bounds a profile form: its one name, at the
 	// store's 64-byte bound and percent-encoded, takes 192 bytes.
 	maxProfileFormBytes = 1 << 10
 	contentTypeHTML     = "text/html; charset=utf-8"
+	// formMediaType is the one media type the recordings forms accept.
+	formMediaType = "application/x-www-form-urlencoded"
 	// minPlaybackBytesPerSecond is the slowest a client may fetch a
 	// recording: 32 kbps Opus plays at 4 KiB/s, so this leaves a margin of
 	// four.
@@ -127,8 +131,9 @@ type profileChoice struct {
 
 // profilesView is what the profiles page renders.
 type profilesView struct {
-	Profiles    []recordings.Profile
-	MaxProfiles int
+	Profiles     []recordings.Profile
+	MaxProfiles  int
+	MaxNameBytes int
 }
 
 // recordingsView is what the page template renders. Older is the id that
@@ -162,7 +167,7 @@ func (s *Server) recordingRoutes() []route {
 		s.writeError(w, http.StatusForbidden, errors.New("cross-origin request refused"))
 	}))
 	protect := func(next http.HandlerFunc) http.HandlerFunc {
-		return s.allowedHost(protection.Handler(next).ServeHTTP)
+		return s.allowedHost(protection.Handler(s.formOnly(next)).ServeHTTP)
 	}
 	recording := recordingsRoute + "/{" + recordingIDKey + "}"
 	profile := recordingsRoute + "/" + profilesSegment + "/{" + profileIDKey + "}"
@@ -191,6 +196,22 @@ func orProfiles(recording, profiles http.HandlerFunc) http.HandlerFunc {
 		}
 
 		recording(w, r)
+	}
+}
+
+// formOnly answers 415 unless the request's body is a URL-encoded form.
+// http.Request.ParseForm reads no body of another type and leaves the form
+// empty, which the recording form would save as a review with every field
+// cleared, so the type is checked before any handler reads the body.
+func (s *Server) formOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || mediaType != formMediaType {
+			s.writeError(w, http.StatusUnsupportedMediaType, fmt.Errorf("a recordings form must be sent as %s", formMediaType))
+			return
+		}
+
+		next(w, r)
 	}
 }
 
@@ -283,14 +304,18 @@ func (s *Server) handleRecording(w http.ResponseWriter, r *http.Request) {
 	s.writePage(w, recordingPage, &view)
 }
 
-// profileChoices offers every profile, ticking those in assigned.
+// profileChoices offers every profile, ticking those in assigned. It matches
+// by id alone: the two lists are read apart, and a rename between the reads
+// must not untick a speaker.
 func profileChoices(all, assigned []recordings.Profile) []profileChoice {
 	choices := make([]profileChoice, 0, len(all))
 	for _, profile := range all {
 		choices = append(choices, profileChoice{
-			ID:      profile.ID,
-			Name:    profile.Name,
-			Checked: slices.Contains(assigned, profile),
+			ID:   profile.ID,
+			Name: profile.Name,
+			Checked: slices.ContainsFunc(assigned, func(p recordings.Profile) bool {
+				return p.ID == profile.ID
+			}),
 		})
 	}
 
@@ -339,9 +364,15 @@ func annotationOf(form url.Values) (recordings.Annotation, error) {
 	return recordings.Annotation{
 		Keep:               keep,
 		TranscriptionError: flagged,
-		CorrectText:        text,
+		CorrectText:        lineFeeds(text),
 		Profiles:           form[profileFieldName],
 	}, nil
+}
+
+// lineFeeds turns each CRLF and lone CR in text into LF. A browser sends a
+// textarea's line breaks as CRLF, and the store keeps and bounds them as LF.
+func lineFeeds(text string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n")
 }
 
 func checkbox(form url.Values, name string) (bool, error) {
@@ -423,7 +454,7 @@ func speakerNames(profiles []recordings.Profile) string {
 // handleProfiles shows the profiles with the forms that add, rename and
 // delete them.
 func (s *Server) handleProfiles(w http.ResponseWriter, _ *http.Request) {
-	view := profilesView{Profiles: s.recordings.Profiles(), MaxProfiles: recordings.MaxProfiles}
+	view := profilesView{Profiles: s.recordings.Profiles(), MaxProfiles: recordings.MaxProfiles, MaxNameBytes: recordings.MaxProfileNameBytes}
 	s.writePage(w, profilesPage, &view)
 }
 
@@ -631,8 +662,8 @@ func (s *Server) handleRecordingKeep(w http.ResponseWriter, r *http.Request) {
 
 // recordingFailure answers err from the store: 404 for a recording or
 // profile it does not hold, 400 for a value it refuses, 409 for a change
-// that conflicts with what it holds, and 500 for anything else, which only
-// the log details.
+// that conflicts with what it holds, 507 for an edit that would pass the
+// store's cap, and 500 for anything else, which only the log details.
 func (s *Server) recordingFailure(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, recordings.ErrNotFound):
@@ -643,6 +674,9 @@ func (s *Server) recordingFailure(w http.ResponseWriter, r *http.Request, err er
 		return
 	case errors.Is(err, recordings.ErrFlaggedKept), errors.Is(err, recordings.ErrDuplicateName):
 		s.writeError(w, http.StatusConflict, err)
+		return
+	case errors.Is(err, recordings.ErrFull):
+		s.writeError(w, http.StatusInsufficientStorage, err)
 		return
 	}
 

@@ -532,7 +532,7 @@ func TestRecordingAudio_ForeignHostIsNotCached(t *testing.T) {
 
 // requestAs sends method to path with the Host header set to host and the
 // given extra headers, and returns the response without following a
-// redirect.
+// redirect. A POST is sent as a form, as a browser sends an empty form too.
 func (h *harness) requestAs(method, path, host, body string, headers map[string]string) *http.Response {
 	h.t.Helper()
 
@@ -540,7 +540,7 @@ func (h *harness) requestAs(method, path, host, body string, headers map[string]
 	req, err := http.NewRequestWithContext(h.t.Context(), method, h.server.URL+path, strings.NewReader(body))
 	require.NoError(h.t, err)
 	req.Host = host
-	if body != "" {
+	if method == http.MethodPost {
 		req.Header.Set("Content-Type", contentTypeForm)
 	}
 	for name, value := range headers {
@@ -861,14 +861,14 @@ func TestRecordingPage_ShowsTheWholeTranscriptAndTheFormState(t *testing.T) {
 	assert.Contains(t, plain, `<form method="post" action="/recordings/`+id+`">`)
 	assert.Contains(t, plain, `<input type="checkbox" name="keep" value="true">`)
 	assert.Contains(t, plain, `<input type="checkbox" name="transcriptionError" value="true">`)
-	assert.Contains(t, plain, `<textarea name="correctText" rows="4" cols="80"></textarea>`)
+	assert.Contains(t, plain, `<textarea name="correctText" rows="4" cols="80">`+"\n</textarea>")
 
 	require.NoError(t, store.Annotate(id, recordings.Annotation{TranscriptionError: true, CorrectText: scriptCorrection}))
 	flagged := fetchRecordingPage(t, h, id)
 
 	assert.Contains(t, flagged, `<input type="checkbox" name="keep" value="true" checked>`)
 	assert.Contains(t, flagged, `<input type="checkbox" name="transcriptionError" value="true" checked>`)
-	assert.Contains(t, flagged, `<textarea name="correctText" rows="4" cols="80">`+escapedScript+`</textarea>`)
+	assert.Contains(t, flagged, `<textarea name="correctText" rows="4" cols="80">`+"\n"+escapedScript+`</textarea>`)
 }
 
 // postRecording posts form to the page of the recording id without

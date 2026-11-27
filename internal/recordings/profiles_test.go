@@ -2,11 +2,13 @@ package recordings
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -332,4 +334,249 @@ func TestRenameProfile_ShowsOnEveryRecording(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, []string{"Annabel"}, profileNames(got.Profiles))
 	}
+}
+
+const (
+	// profilesFileLimit is the read bound of profiles.json, written out so a
+	// changed constant fails here.
+	profilesFileLimit = 32 << 10
+	oneProfile        = `{"profiles":[{"id":"0123456789abcdef","name":"Anna"}]}`
+	// openDeadline bounds how long a test waits for Open, which must never
+	// block on a file that is not regular.
+	openDeadline = 5 * time.Second
+)
+
+func openProfilesFile(t *testing.T, dir string) error {
+	t.Helper()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Open(dir, time.Now, slog.New(slog.DiscardHandler))
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(openDeadline):
+		require.FailNow(t, "Open blocked on profiles.json")
+		return nil
+	}
+}
+
+func TestAddProfile_FullStoreIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := openStore(t, dir)
+	store.maxBytes = 0
+
+	_, err := store.AddProfile("Anna")
+
+	require.ErrorIs(t, err, ErrFull)
+	assert.Empty(t, store.Profiles())
+	assert.NoFileExists(t, profilesPath(dir))
+}
+
+func TestRenameProfile_GrowthPastTheCapIsFull(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := openStore(t, dir)
+	anna := addProfile(t, store, "Anna")
+	store.maxBytes = int64(len(fileBytes(t, profilesPath(dir))))
+	before := fileBytes(t, profilesPath(dir))
+
+	require.ErrorIs(t, store.RenameProfile(anna.ID, "Annabel"), ErrFull)
+	assert.Equal(t, before, fileBytes(t, profilesPath(dir)))
+	assert.Equal(t, []string{"Anna"}, profileNames(store.Profiles()))
+
+	require.NoError(t, store.RenameProfile(anna.ID, "ANNA"), "a rename that does not grow the file")
+	assert.Equal(t, []string{"ANNA"}, profileNames(store.Profiles()))
+}
+
+func TestDeleteProfile_IsAllowedWhenFull(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := openStore(t, dir)
+	anna := addProfile(t, store, "Anna")
+	store.maxBytes = 0
+
+	require.NoError(t, store.DeleteProfile(anna.ID))
+
+	assert.Empty(t, store.Profiles())
+}
+
+func TestOpen_RefusesAProfilesFileThatIsNotAnObjectWithAList(t *testing.T) {
+	for name, content := range map[string]string{
+		"misspelt key":        `{"profile":[{"id":"0123456789abcdef","name":"Anna"}]}`,
+		"empty object":        `{}`,
+		"null":                `null`,
+		"null list":           `{"profiles":null}`,
+		"an unknown key":      `{"profiles":[],"extra":1}`,
+		"trailing data":       oneProfile + `x`,
+		"a second value":      oneProfile + `{}`,
+		"invalid UTF-8 name":  `{"profiles":[{"id":"0123456789abcdef","name":"Ann` + "\xff" + `a"}]}`,
+		"an unknown profile":  `{"profiles":[{"id":"0123456789abcdef","name":"Anna","x":1}]}`,
+		"a format character":  `{"profiles":[{"id":"0123456789abcdef","name":"Anna\u202e"}]}`,
+		"a zero-width space":  `{"profiles":[{"id":"0123456789abcdef","name":"` + "\u200b" + `"}]}`,
+		"spaces around name":  `{"profiles":[{"id":"0123456789abcdef","name":" Anna"}]}`,
+		"a list, not object":  `[]`,
+		"a string, not lists": `{"profiles":"Anna"}`,
+	} {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(profilesPath(dir), []byte(content), 0o600))
+
+		_, err := Open(dir, time.Now, slog.New(slog.DiscardHandler))
+
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), profilesFileName, name)
+		assert.Equal(t, content, string(fileBytes(t, profilesPath(dir))), name)
+	}
+}
+
+func TestOpen_LoadsAnEmptyListAndATrailingNewline(t *testing.T) {
+	for _, content := range []string{`{"profiles":[]}`, oneProfile + "\n"} {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(profilesPath(dir), []byte(content), 0o600))
+
+		require.NoError(t, openProfilesFile(t, dir), content)
+	}
+}
+
+func TestOpen_RefusesAProfilesPathThatIsNotARegularFile(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "elsewhere.json")
+	require.NoError(t, os.WriteFile(target, []byte(oneProfile), 0o600))
+
+	for name, plant := range map[string]func(path string) error{
+		"a FIFO":      func(path string) error { return syscall.Mkfifo(path, 0o600) },
+		"a directory": func(path string) error { return os.Mkdir(path, 0o700) },
+		"a symlink":   func(path string) error { return os.Symlink(target, path) },
+	} {
+		dir := t.TempDir()
+		require.NoError(t, plant(profilesPath(dir)), name)
+
+		err := openProfilesFile(t, dir)
+
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), "not a regular file", name)
+	}
+}
+
+func TestAddProfile_RefusesFormatCharacters(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := openStore(t, dir)
+
+	for _, name := range []string{"\u200b", "\u202e", "Anna\u202e", "An\u200bna", "Anna\u2028Ben"} {
+		_, err := store.AddProfile(name)
+
+		require.ErrorIs(t, err, ErrInvalid, "%q", name)
+	}
+	assert.Empty(t, store.Profiles())
+}
+
+// escapedNames are profileLimit distinct names of profileNameLimit bytes of
+// '<' and '&', which JSON escapes to six bytes each.
+func escapedNames() []string {
+	const bits = 6
+	found := make([]string, 0, profileLimit)
+	for i := range profileLimit {
+		name := strings.Repeat("<", profileNameLimit-bits)
+		for bit := range bits {
+			if i&(1<<bit) != 0 {
+				name += "&"
+				continue
+			}
+			name += "<"
+		}
+		found = append(found, name)
+	}
+
+	return found
+}
+
+func TestOpen_ReloadsTheMostProfilesWithTheLongestEscapedNames(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := openStore(t, dir)
+	for _, name := range escapedNames() {
+		addProfile(t, store, name)
+	}
+	require.Greater(t, len(fileBytes(t, profilesPath(dir))), 16<<10)
+
+	reopened, _ := openStore(t, dir)
+
+	assert.Equal(t, store.Profiles(), reopened.Profiles())
+	assert.Len(t, reopened.Profiles(), profileLimit)
+}
+
+func TestOpen_ProfilesFileAtTheBoundLoadsAndOneByteOverIsRefused(t *testing.T) {
+	for size, wantErr := range map[int]bool{profilesFileLimit: false, profilesFileLimit + 1: true} {
+		dir := t.TempDir()
+		padded := oneProfile + strings.Repeat(" ", size-len(oneProfile))
+		require.NoError(t, os.WriteFile(profilesPath(dir), []byte(padded), 0o600))
+
+		err := openProfilesFile(t, dir)
+
+		if wantErr {
+			require.Error(t, err, "%d bytes", size)
+			assert.Contains(t, err.Error(), "over", "%d bytes", size)
+			continue
+		}
+		require.NoError(t, err, "%d bytes", size)
+	}
+}
+
+func TestOpen_ReloadedProfilesCountTowardTheCap(t *testing.T) {
+	dir := t.TempDir()
+	first, _ := openStore(t, dir)
+	addProfile(t, first, strings.Repeat("p", profileNameLimit))
+	profileBytes := int64(len(fileBytes(t, profilesPath(dir))))
+	older := save(t, first, "older")
+	size := recordingBytes(t, dir, older)
+
+	store, c := openStore(t, dir)
+	// Room for the profiles and one recording: a second evicts the first
+	// only because the profiles read back count.
+	store.maxBytes = profileBytes + 2*size - 1
+	c.advance(time.Minute)
+	newer := save(t, store, "newer")
+
+	assert.Equal(t, []string{newer.ID}, ids(t, store))
+}
+
+func TestProfiles_AFailedWriteChangesNothing(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := openStore(t, dir)
+	anna := addProfile(t, store, "Anna")
+	before := fileBytes(t, profilesPath(dir))
+	written := errors.New("disk gone")
+	store.write = func(string, []byte) error { return written }
+
+	_, addErr := store.AddProfile("Ben")
+	renameErr := store.RenameProfile(anna.ID, "Annabel")
+	deleteErr := store.DeleteProfile(anna.ID)
+
+	for name, err := range map[string]error{"add": addErr, "rename": renameErr, "delete": deleteErr} {
+		require.ErrorIs(t, err, written, name)
+	}
+	assert.Equal(t, []Profile{anna}, store.Profiles())
+	assert.Equal(t, before, fileBytes(t, profilesPath(dir)))
+}
+
+func TestOpen_RefusesANameWithSpacesAroundIt(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(profilesPath(dir), []byte(`{"profiles":[{"id":"0123456789abcdef","name":"Anna "}]}`), 0o600))
+
+	_, err := Open(dir, time.Now, slog.New(slog.DiscardHandler))
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has spaces around it")
+}
+
+func TestOpen_RefusesAnUnreadableProfilesFile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads files whatever their mode")
+	}
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(profilesPath(dir), []byte(oneProfile), 0))
+
+	_, err := Open(dir, time.Now, slog.New(slog.DiscardHandler))
+
+	require.ErrorIs(t, err, os.ErrPermission)
+	assert.Contains(t, err.Error(), "read "+profilesFileName)
 }

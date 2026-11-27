@@ -1,6 +1,7 @@
 package recordings
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -37,6 +38,17 @@ const (
 
 // ErrDuplicateName refuses a profile name another profile has.
 var ErrDuplicateName = errors.New("another profile has that name")
+
+// capRule says whether a write of profiles.json is held to the store's cap.
+type capRule int
+
+const (
+	// capEnforced refuses a write that grows the file past the cap.
+	capEnforced capRule = iota
+	// capWaived allows the write whatever its size, for a delete, which
+	// must always be possible.
+	capWaived
+)
 
 var profileIDPattern = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
@@ -84,7 +96,7 @@ func (s *Store) AddProfile(name string) (Profile, error) {
 	}
 
 	profile := Profile{ID: id, Name: name}
-	if err := s.saveProfiles(append(slices.Clone(s.profiles), profile)); err != nil {
+	if err := s.saveProfiles(append(slices.Clone(s.profiles), profile), capEnforced); err != nil {
 		return Profile{}, err
 	}
 
@@ -117,7 +129,7 @@ func (s *Store) RenameProfile(id, name string) error {
 
 	profiles := slices.Clone(s.profiles)
 	profiles[at].Name = name
-	return s.saveProfiles(profiles)
+	return s.saveProfiles(profiles, capEnforced)
 }
 
 // DeleteProfile deletes the profile id. It rewrites only profiles.json: a
@@ -136,11 +148,13 @@ func (s *Store) DeleteProfile(id string) error {
 		return ErrNotFound
 	}
 
-	return s.saveProfiles(slices.Delete(slices.Clone(s.profiles), at, at+1))
+	return s.saveProfiles(slices.Delete(slices.Clone(s.profiles), at, at+1), capWaived)
 }
 
 // checkProfileName returns name trimmed, or ErrInvalid when it is empty,
-// over MaxProfileNameBytes, not valid UTF-8 or holds a control character.
+// over MaxProfileNameBytes, not valid UTF-8 or holds a character that is not
+// graphic: a control or format character, such as a zero-width space or a
+// bidirectional override, or a line or paragraph separator.
 func checkProfileName(name string) (string, error) {
 	if !utf8.ValidString(name) {
 		return "", fmt.Errorf("%w: a profile name must be valid UTF-8", ErrInvalid)
@@ -152,11 +166,15 @@ func checkProfileName(name string) (string, error) {
 		return "", fmt.Errorf("%w: a profile name may not be empty", ErrInvalid)
 	case len(name) > MaxProfileNameBytes:
 		return "", fmt.Errorf("%w: a profile name is at most %d bytes, got %d", ErrInvalid, MaxProfileNameBytes, len(name))
-	case strings.ContainsFunc(name, unicode.IsControl):
-		return "", fmt.Errorf("%w: a profile name may not hold a control character", ErrInvalid)
+	case strings.ContainsFunc(name, isNotGraphic):
+		return "", fmt.Errorf("%w: a profile name may hold only letters, marks, numbers, punctuation, symbols and spaces", ErrInvalid)
 	}
 
 	return name, nil
+}
+
+func isNotGraphic(r rune) bool {
+	return !unicode.IsGraphic(r)
 }
 
 // nameTaken reports whether a profile other than except has name, ignoring
@@ -191,11 +209,18 @@ func (s *Store) freshProfileID() (string, error) {
 }
 
 // saveProfiles writes profiles to profiles.json and makes them the store's.
-// The caller holds mu.
-func (s *Store) saveProfiles(profiles []Profile) error {
+// Under capEnforced a write that grows the file past the cap is ErrFull. The
+// caller holds mu.
+func (s *Store) saveProfiles(profiles []Profile, rule capRule) error {
 	data, err := json.Marshal(profilesFile{Profiles: profiles})
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", profilesName, err)
+	}
+
+	if rule == capEnforced {
+		if err := s.checkGrowth(s.profilesBytes, int64(len(data))); err != nil {
+			return err
+		}
 	}
 
 	if err := s.write(profilesName, data); err != nil {
@@ -208,14 +233,28 @@ func (s *Store) saveProfiles(profiles []Profile) error {
 }
 
 // loadProfiles reads profiles.json, which is absent until a profile is
-// added. A file the store did not write as it is, over maxProfilesBytes or
-// breaking a profile bound, fails Open: the store would otherwise drop the
-// profiles on its next write.
+// added. A file the store could not have written fails Open, because the
+// store would otherwise drop the profiles on its next write: one that is not
+// a regular file, is over maxProfilesBytes, is not valid UTF-8, is not one
+// object with a profiles list and no other key, or breaks a profile bound.
 func (s *Store) loadProfiles() error {
-	file, err := os.Open(filepath.Join(s.dir, profilesName))
+	path := filepath.Join(s.dir, profilesName)
+	info, err := os.Lstat(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("read %s: %w", profilesName, err)
+	}
+
+	// Opening a FIFO for reading blocks until a writer comes, so the type is
+	// checked before the open. Lstat refuses a symlink too: the next write
+	// would replace it rather than write where it points.
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", profilesName)
+	}
+
+	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", profilesName, err)
 	}
@@ -230,8 +269,8 @@ func (s *Store) loadProfiles() error {
 		return fmt.Errorf("%s is over %d bytes", profilesName, maxProfilesBytes)
 	}
 
-	var stored profilesFile
-	if err := json.Unmarshal(data, &stored); err != nil {
+	stored, err := decodeProfiles(data)
+	if err != nil {
 		return fmt.Errorf("decode %s: %w", profilesName, err)
 	}
 
@@ -242,6 +281,33 @@ func (s *Store) loadProfiles() error {
 	s.profiles = stored.Profiles
 	s.profilesBytes = int64(len(data))
 	return nil
+}
+
+// decodeProfiles decodes data as exactly one profilesFile. encoding/json
+// would replace bytes that are not UTF-8 with U+FFFD, leave the list nil for
+// a missing key or null, and ignore what follows the value, so each is
+// checked here.
+func decodeProfiles(data []byte) (*profilesFile, error) {
+	if !utf8.Valid(data) {
+		return nil, errors.New("not valid UTF-8")
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var stored profilesFile
+	if err := decoder.Decode(&stored); err != nil {
+		return nil, err
+	}
+
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("data follows the profiles object")
+	}
+
+	if stored.Profiles == nil {
+		return nil, errors.New("no profiles list")
+	}
+
+	return &stored, nil
 }
 
 // checkProfiles checks a list read back against every bound a write keeps.

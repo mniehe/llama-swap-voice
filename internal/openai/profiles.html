@@ -23,7 +23,7 @@ form { display: inline; }
 <tbody>
 {{range .Profiles}}
 <tr>
-<td><form method="post" action="/recordings/profiles/{{.ID}}/rename"><input type="text" name="name" value="{{.Name}}" required maxlength="64"> <button type="submit">Rename</button></form></td>
+<td><form method="post" action="/recordings/profiles/{{.ID}}/rename"><input type="text" name="name" value="{{.Name}}" required maxlength="{{$.MaxNameBytes}}"> <button type="submit">Rename</button></form></td>
 <td><form method="post" action="/recordings/profiles/{{.ID}}/delete"><button type="submit">Delete</button></form></td>
 </tr>
 {{end}}
@@ -34,7 +34,7 @@ form { display: inline; }
 {{end}}
 <h2>Add a profile</h2>
 <form method="post" action="/recordings/profiles">
-<input type="text" name="name" required maxlength="64"> <button type="submit">Add</button>
+<input type="text" name="name" required maxlength="{{$.MaxNameBytes}}"> <button type="submit">Add</button>
 </form>
 </body>
 </html>

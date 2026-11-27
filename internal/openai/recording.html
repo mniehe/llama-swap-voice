@@ -30,7 +30,8 @@ textarea { width: 100%; }
 <label><input type="checkbox" name="keep" value="true"{{if .Keep}} checked{{end}}> Keep. A recording that is not kept is deleted after {{retentionDays}} days.</label>
 <label><input type="checkbox" name="transcriptionError" value="true"{{if .TranscriptionError}} checked{{end}}> Transcription error. A recording with a transcription error is always kept.</label>
 <label>Correct text: what was said, empty when nobody spoke. It is saved only with a transcription error.
-<textarea name="correctText" rows="4" cols="80">{{.CorrectText}}</textarea></label>
+<textarea name="correctText" rows="4" cols="80">
+{{.CorrectText}}</textarea></label>
 </fieldset>
 <fieldset>
 <legend>Speakers</legend>
