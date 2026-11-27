@@ -258,6 +258,15 @@ func TestRecordingRoutes_InvalidOrUnknownIDIsNotFound(t *testing.T) {
 		keep := h.postForm(recordingsPath+"/"+id+"/keep", url.Values{"keep": {"true"}})
 		assert.Equal(t, http.StatusNotFound, keep.StatusCode, "keep %q", id)
 		assert.NotEmpty(t, errorMessage(t, keep))
+
+		page := h.get(recordingsPath + "/" + id)
+		assert.Equal(t, http.StatusNotFound, page.StatusCode, "page %q", id)
+		assert.Equal(t, contentTypeJSON, page.Header.Get("Content-Type"), "page %q", id)
+		assert.NotEmpty(t, errorMessage(t, page))
+
+		edit := h.requestAs(http.MethodPost, recordingsPath+"/"+id, "127.0.0.1", "keep=true", nil)
+		assert.Equal(t, http.StatusNotFound, edit.StatusCode, "edit %q", id)
+		assert.NotEmpty(t, errorMessage(t, edit))
 	}
 
 	data, err := os.ReadFile(filepath.Join(dir, "x.json"))
@@ -556,6 +565,8 @@ func recordingRequests(id string) []recordingRequest {
 		{http.MethodGet, recordingsPath, ""},
 		{http.MethodGet, recordingsPath + "/" + id + "/audio", ""},
 		{http.MethodPost, recordingsPath + "/" + id + "/keep", "keep=true"},
+		{http.MethodGet, recordingsPath + "/" + id, ""},
+		{http.MethodPost, recordingsPath + "/" + id, "keep=true"},
 	}
 }
 
@@ -590,6 +601,12 @@ func TestRecordingRoutes_AllowedHostsAreServed(t *testing.T) {
 
 		keep := h.requestAs(http.MethodPost, recordingsPath+"/"+ids[0]+"/keep", host, "keep=true", nil)
 		assert.Equal(t, http.StatusSeeOther, keep.StatusCode, "keep as %s", host)
+
+		one := h.requestAs(http.MethodGet, recordingsPath+"/"+ids[0], host, "", nil)
+		assert.Equal(t, http.StatusOK, one.StatusCode, "recording page as %s", host)
+
+		edit := h.requestAs(http.MethodPost, recordingsPath+"/"+ids[0], host, "keep=true", nil)
+		assert.Equal(t, http.StatusSeeOther, edit.StatusCode, "recording form as %s", host)
 	}
 }
 
@@ -804,4 +821,204 @@ func (b *logBuffer) text() string {
 	defer b.mu.Unlock()
 
 	return b.buf.String()
+}
+
+const (
+	// correctTextBytes is the store's correct text bound, written out so a
+	// changed constant fails here.
+	correctTextBytes = 16 << 10
+	spokenWords      = "turn off the kitchen lights"
+	scriptCorrection = `<b>turn</b> & off`
+	escapedScript    = `&lt;b&gt;turn&lt;/b&gt; &amp; off`
+	flaggedMark      = "Transcription error"
+)
+
+// fetchRecordingPage fetches the page of the recording id and returns it, after
+// checking the headers every page carries.
+func fetchRecordingPage(t *testing.T, h *harness, id string) string {
+	t.Helper()
+
+	resp := h.get(recordingsPath + "/" + id)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, contentTypeHTML, resp.Header.Get("Content-Type"))
+	assert.Equal(t, "no-store", resp.Header.Get("Cache-Control"))
+	assert.Equal(t, "frame-ancestors 'none'", resp.Header.Get("Content-Security-Policy"))
+
+	return string(readBody(t, resp))
+}
+
+func TestRecordingPage_ShowsTheWholeTranscriptAndTheFormState(t *testing.T) {
+	dir := t.TempDir()
+	transcript := strings.Repeat("x", 2*previewBytes) + scriptTranscript
+	id := plantTranscript(t, dir, transcript)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+
+	plain := fetchRecordingPage(t, h, id)
+
+	assert.Contains(t, plain, strings.Repeat("x", 2*previewBytes)+escapedTranscript, "the whole transcript, escaped")
+	assert.NotContains(t, plain, "<script>")
+	assert.Contains(t, plain, `<audio controls preload="none" src="/recordings/`+id+`/audio">`)
+	assert.Contains(t, plain, `<form method="post" action="/recordings/`+id+`">`)
+	assert.Contains(t, plain, `<input type="checkbox" name="keep" value="true">`)
+	assert.Contains(t, plain, `<input type="checkbox" name="transcriptionError" value="true">`)
+	assert.Contains(t, plain, `<textarea name="correctText" rows="4" cols="80"></textarea>`)
+
+	require.NoError(t, store.Annotate(id, recordings.Annotation{TranscriptionError: true, CorrectText: scriptCorrection}))
+	flagged := fetchRecordingPage(t, h, id)
+
+	assert.Contains(t, flagged, `<input type="checkbox" name="keep" value="true" checked>`)
+	assert.Contains(t, flagged, `<input type="checkbox" name="transcriptionError" value="true" checked>`)
+	assert.Contains(t, flagged, `<textarea name="correctText" rows="4" cols="80">`+escapedScript+`</textarea>`)
+}
+
+// postRecording posts form to the page of the recording id without
+// following the redirect.
+func postRecording(t *testing.T, h *harness, id, form string) *http.Response {
+	t.Helper()
+
+	return h.requestAs(http.MethodPost, recordingsPath+"/"+id, "127.0.0.1", form, nil)
+}
+
+func TestRecordingForm_SavesEachFieldAndRedirectsToThePage(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+	id := ids[0]
+
+	steps := []struct {
+		form string
+		want recordings.Recording
+	}{
+		{"keep=true", recordings.Recording{Keep: true}},
+		{"", recordings.Recording{}},
+		{"transcriptionError=true&correctText=" + url.QueryEscape(spokenWords), recordings.Recording{Keep: true, TranscriptionError: true, CorrectText: spokenWords}},
+		{"transcriptionError=true&correctText=", recordings.Recording{Keep: true, TranscriptionError: true}},
+		{"keep=true&correctText=" + url.QueryEscape(spokenWords), recordings.Recording{Keep: true}},
+	}
+	for _, step := range steps {
+		resp := postRecording(t, h, id, step.form)
+
+		assert.Equal(t, http.StatusSeeOther, resp.StatusCode, "form %q", step.form)
+		assert.Equal(t, recordingsPath+"/"+id, resp.Header.Get("Location"), "form %q", step.form)
+		got, err := store.Recording(id)
+		require.NoError(t, err)
+		assert.Equal(t, step.want.Keep, got.Keep, "keep after %q", step.form)
+		assert.Equal(t, step.want.TranscriptionError, got.TranscriptionError, "error after %q", step.form)
+		assert.Equal(t, step.want.CorrectText, got.CorrectText, "correct text after %q", step.form)
+		assert.Equal(t, "planted 0", got.Transcript, "the transcript is never edited")
+	}
+}
+
+// recordingFormOf returns a recording form padded with a second field to
+// exactly size bytes.
+func recordingFormOf(t *testing.T, size int) string {
+	t.Helper()
+
+	form := "keep=true&pad="
+	require.LessOrEqual(t, len(form), size)
+
+	return form + strings.Repeat("p", size-len(form))
+}
+
+func TestRecordingForm_AtTheLimitIsAccepted(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+
+	resp := postRecording(t, h, ids[0], recordingFormOf(t, maxRecordingFormBytes))
+
+	assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	assert.True(t, onlyRecording(t, store).Keep)
+}
+
+func TestRecordingForm_RefusalsAreBadRequestAndSaveNothing(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+
+	for name, form := range map[string]string{
+		"form one byte over":     recordingFormOf(t, maxRecordingFormBytes+1),
+		"correct text over":      "keep=true&transcriptionError=true&correctText=" + strings.Repeat("x", correctTextBytes+1),
+		"correct text not UTF-8": "keep=true&transcriptionError=true&correctText=%FF",
+		"keep not true":          "keep=yes",
+		"error not true":         "keep=true&transcriptionError=on",
+		"keep twice":             "keep=true&keep=true",
+		"correct text twice":     "keep=true&transcriptionError=true&correctText=a&correctText=b",
+		"malformed escape":       "keep=true&correctText=%zz",
+	} {
+		resp := postRecording(t, h, ids[0], form)
+
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode, name)
+		assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"), name)
+		assert.NotEmpty(t, errorMessage(t, resp), name)
+	}
+	got, err := store.Recording(ids[0])
+	require.NoError(t, err)
+	assert.False(t, got.Keep)
+	assert.False(t, got.TranscriptionError)
+}
+
+func TestRecordingForm_CorrectTextAtTheLimitIsAccepted(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+	text := strings.Repeat("x", correctTextBytes)
+
+	resp := postRecording(t, h, ids[0], "transcriptionError=true&correctText="+text)
+
+	assert.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	got, err := store.Recording(ids[0])
+	require.NoError(t, err)
+	assert.Equal(t, text, got.CorrectText)
+}
+
+func TestRecordingForm_CrossSiteIsForbidden(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+	path := recordingsPath + "/" + ids[0]
+
+	for name, headers := range map[string]map[string]string{
+		"cross-site fetch": {"Sec-Fetch-Site": "cross-site"},
+		"foreign origin":   {"Origin": "http://evil.example"},
+	} {
+		resp := h.requestAs(http.MethodPost, path, "127.0.0.1", "transcriptionError=true", headers)
+
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode, name)
+		assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"), name)
+		assert.NotEmpty(t, errorMessage(t, resp), name)
+	}
+	assert.False(t, onlyRecording(t, store).TranscriptionError)
+}
+
+func TestRecordingKeep_ReleasingAFlaggedRecordingIsConflict(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 1)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+	require.NoError(t, store.Annotate(ids[0], recordings.Annotation{TranscriptionError: true}))
+
+	resp := h.requestAs(http.MethodPost, recordingsPath+"/"+ids[0]+"/keep", "127.0.0.1", "keep=false", nil)
+
+	assert.Equal(t, http.StatusConflict, resp.StatusCode)
+	assert.Equal(t, contentTypeJSON, resp.Header.Get("Content-Type"))
+	assert.Contains(t, errorMessage(t, resp), "clear the transcription error first")
+	assert.True(t, onlyRecording(t, store).Keep)
+}
+
+func TestRecordingsPage_LinksRowsAndMarksFlaggedOnesWithoutRelease(t *testing.T) {
+	dir := t.TempDir()
+	ids := plantRecordings(t, dir, 2)
+	h, store := newRecordingHarnessIn(t, dir, recordedText)
+	flagged, plain := ids[0], ids[1]
+	require.NoError(t, store.Annotate(flagged, recordings.Annotation{TranscriptionError: true}))
+	require.NoError(t, store.SetKeep(plain, true))
+
+	page := string(readBody(t, h.get(recordingsPath)))
+
+	for _, id := range ids {
+		assert.Contains(t, page, `<a href="/recordings/`+id+`">`, "row %s links to its page", id)
+	}
+	assert.Equal(t, 1, strings.Count(page, flaggedMark), "only the flagged row is marked")
+	assert.Contains(t, page, `action="/recordings/`+plain+`/keep"`, "a kept row can be released")
+	assert.NotContains(t, page, `action="/recordings/`+flagged+`/keep"`, "a flagged row cannot be released")
 }

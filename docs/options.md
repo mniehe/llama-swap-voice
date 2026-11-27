@@ -243,7 +243,8 @@ them and review the transcripts. It is off by default.
 **Turning this on stores household speech.** Each recording stays on disk
 for 7 days. A recording that you mark kept on the page stays until you
 release it. The page has no authentication: anyone who can reach the HTTP
-port can listen to every recording and change its keep mark. Keep `host` on
+port can listen to every recording and change its keep mark and its review.
+Keep `host` on
 loopback, or put a reverse proxy that checks who is asking in front of the
 port.
 
@@ -271,7 +272,7 @@ was sent to the ASR model as Ogg Opus (16 kHz mono, 32 kbps, about 14 MB an
 hour), and `<id>.json`:
 
 ```json
-{"at":"2026-11-25T15:30:00.123456789Z","durationMs":2140,"source":"wyoming","transcript":"Turn on the kitchen lights.","keep":false}
+{"at":"2026-11-25T15:30:00.123456789Z","durationMs":2140,"source":"wyoming","transcript":"Turn of the kitten lights.","keep":true,"transcriptionError":true,"correctText":"Turn off the kitchen lights."}
 ```
 
 `source` is `openai` for the HTTP API and `wyoming` for the Wyoming
@@ -279,6 +280,20 @@ listener. `at` is the UTC time, to the nanosecond, at which the
 transcription finished and the recording was queued, not when it was saved.
 The id is that time to the second and a random suffix, such as
 `20261125T153000Z-1a2b3c4d`.
+
+`transcriptionError` and `correctText` hold the review you save on the
+recording's page. `transcriptionError` is `true` when the transcript is
+wrong; such a recording always has `keep` set. `correctText` is what was
+said, at most 16 KiB, and is empty when the flag is off. With the flag on,
+an empty `correctText` means the recogniser wrote text when nobody spoke.
+`transcript` always holds what the recogniser returned; a review never
+changes it. A `.json` written before these fields existed lacks them and
+reads as not flagged, with no correct text.
+
+Rolling back to a release without the review loses it: an older release
+reads these files, but when it rewrites one, for a change of its keep mark,
+it drops the review fields. A recording that was flagged then keeps only its
+`keep`.
 
 The service deletes recordings that are not kept and are older than 7 days,
 once when it starts and then every hour. The two files of all recordings

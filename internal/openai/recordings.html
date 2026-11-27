@@ -10,6 +10,8 @@ table { border-collapse: collapse; width: 100%; }
 th, td { border-bottom: 1px solid #ccc; padding: 0.4rem; text-align: left; vertical-align: middle; }
 td.transcript { max-width: 40rem; }
 tr.kept { background: #eef6ee; }
+tr.flagged { background: #fbeeee; }
+.flag { color: #a00; font-weight: bold; }
 </style>
 </head>
 <body>
@@ -22,16 +24,16 @@ tr.kept { background: #eef6ee; }
 </thead>
 <tbody>
 {{range .Rows}}
-<tr{{if .Keep}} class="kept"{{end}}>
-<td><time datetime="{{.At}}">{{.Shown}}</time></td>
+<tr{{if .TranscriptionError}} class="flagged"{{else if .Keep}} class="kept"{{end}}>
+<td><a href="/recordings/{{.ID}}"><time datetime="{{.At}}">{{.Shown}}</time></a></td>
 <td>{{.Length}}</td>
 <td>{{.Source}}</td>
-<td class="transcript">{{.Transcript}}</td>
+<td class="transcript">{{if .TranscriptionError}}<span class="flag">Transcription error</span><br>{{end}}{{.Transcript}}</td>
 <td><audio controls preload="none" src="/recordings/{{.ID}}/audio"></audio></td>
 <td>
-<form method="post" action="/recordings/{{.ID}}/keep">
+{{if .TranscriptionError}}Kept as a test case{{else}}<form method="post" action="/recordings/{{.ID}}/keep">
 {{if .Keep}}<input type="hidden" name="keep" value="false"><button type="submit">Kept: release</button>{{else}}<input type="hidden" name="keep" value="true"><button type="submit">Keep</button>{{end}}
-</form>
+</form>{{end}}
 </td>
 </tr>
 {{end}}

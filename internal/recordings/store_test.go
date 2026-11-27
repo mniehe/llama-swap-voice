@@ -96,11 +96,13 @@ func names(t *testing.T, dir string) []string {
 }
 
 type fileFields struct {
-	At         string `json:"at"`
-	DurationMs int64  `json:"durationMs"`
-	Source     string `json:"source"`
-	Transcript string `json:"transcript"`
-	Keep       bool   `json:"keep"`
+	At                 string `json:"at"`
+	DurationMs         int64  `json:"durationMs"`
+	Source             string `json:"source"`
+	Transcript         string `json:"transcript"`
+	Keep               bool   `json:"keep"`
+	TranscriptionError bool   `json:"transcriptionError"`
+	CorrectText        string `json:"correctText"`
 }
 
 func readMetadata(t *testing.T, path string) fileFields {

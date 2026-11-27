@@ -27,10 +27,20 @@ const (
 	keepFieldName = "keep"
 	keepOn        = "true"
 	keepOff       = "false"
+	// errorFieldName and correctTextFieldName name the recording form's
+	// fields besides keep. A checkbox is sent with keepOn when ticked and not
+	// at all when not.
+	errorFieldName       = "transcriptionError"
+	correctTextFieldName = "correctText"
 	// maxKeepFormBytes bounds the keep form, whose one field fits in a few
 	// bytes.
 	maxKeepFormBytes = 1 << 10
-	contentTypeHTML  = "text/html; charset=utf-8"
+	// maxRecordingFormBytes bounds the recording form. Percent-encoding
+	// writes a byte as at most three, so the correct text at its bound takes
+	// three times MaxCorrectTextBytes; a KiB covers the field names and the
+	// two checkboxes.
+	maxRecordingFormBytes = 3*recordings.MaxCorrectTextBytes + 1<<10
+	contentTypeHTML       = "text/html; charset=utf-8"
 	// minPlaybackBytesPerSecond is the slowest a client may fetch a
 	// recording: 32 kbps Opus plays at 4 KiB/s, so this leaves a margin of
 	// four.
@@ -51,22 +61,39 @@ const (
 // a JSON error must not carry.
 var servedHeaders = []string{"Content-Type", "Content-Length", "Content-Encoding", "X-Content-Type-Options", "Last-Modified", "Etag"}
 
-//go:embed recordings.html
-var recordingsHTML string
+var (
+	//go:embed recordings.html
+	recordingsHTML string
+	//go:embed recording.html
+	recordingHTML string
+)
 
-var recordingsPage = template.Must(template.New("recordings").Funcs(template.FuncMap{
+var pageFuncs = template.FuncMap{
 	"retentionDays": func() int { return int(recordings.Retention.Hours()) / hoursPerDay },
-}).Parse(recordingsHTML))
+}
+
+var (
+	recordingsPage = template.Must(template.New("recordings").Funcs(pageFuncs).Parse(recordingsHTML))
+	recordingPage  = template.Must(template.New("recording").Funcs(pageFuncs).Parse(recordingHTML))
+)
 
 // recordingRow is one recording as the page shows it.
 type recordingRow struct {
-	ID         string
-	At         string
-	Shown      string
-	Length     string
-	Source     string
-	Transcript string
-	Keep       bool
+	ID                 string
+	At                 string
+	Shown              string
+	Length             string
+	Source             string
+	Transcript         string
+	Keep               bool
+	TranscriptionError bool
+}
+
+// recordingView is what the page of one recording renders: its row, with
+// the whole transcript, and the form's correct text.
+type recordingView struct {
+	recordingRow
+	CorrectText string
 }
 
 // recordingsView is what the page template renders. Older is the id that
@@ -99,12 +126,17 @@ func (s *Server) recordingRoutes() []route {
 	protection.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		s.writeError(w, http.StatusForbidden, errors.New("cross-origin request refused"))
 	}))
-	keep := protection.Handler(http.HandlerFunc(s.handleRecordingKeep))
+	protect := func(next http.HandlerFunc) http.HandlerFunc {
+		return s.allowedHost(protection.Handler(next).ServeHTTP)
+	}
+	recording := recordingsRoute + "/{" + recordingIDKey + "}"
 
 	return []route{
 		{http.MethodGet, recordingsRoute, s.allowedHost(s.handleRecordings)},
-		{http.MethodGet, recordingsRoute + "/{" + recordingIDKey + "}/audio", notStored(s.allowedHost(s.handleRecordingAudio))},
-		{http.MethodPost, recordingsRoute + "/{" + recordingIDKey + "}/keep", s.allowedHost(keep.ServeHTTP)},
+		{http.MethodGet, recording, s.allowedHost(s.handleRecording)},
+		{http.MethodPost, recording, protect(s.handleRecordingEdit)},
+		{http.MethodGet, recording + "/audio", notStored(s.allowedHost(s.handleRecordingAudio))},
+		{http.MethodPost, recording + "/keep", protect(s.handleRecordingKeep)},
 	}
 }
 
@@ -157,10 +189,17 @@ func (s *Server) handleRecordings(w http.ResponseWriter, r *http.Request) {
 		view.Rows = append(view.Rows, newRecordingRow(&list[i]))
 	}
 
-	var page bytes.Buffer
-	if err := recordingsPage.Execute(&page, &view); err != nil {
-		s.log.Error("could not render recordings page", slog.Any("error", err))
-		s.writeError(w, http.StatusInternalServerError, errors.New("could not render recordings page"))
+	s.writePage(w, recordingsPage, &view)
+}
+
+// writePage renders page whole before it sends it, so a template failure is
+// a JSON 500 rather than half a page. No cache keeps it and no other site
+// frames it.
+func (s *Server) writePage(w http.ResponseWriter, page *template.Template, view any) {
+	var rendered bytes.Buffer
+	if err := page.Execute(&rendered, view); err != nil {
+		s.log.Error("could not render page", slog.String("page", page.Name()), slog.Any("error", err))
+		s.writeError(w, http.StatusInternalServerError, fmt.Errorf("could not render %s page", page.Name()))
 		return
 	}
 
@@ -168,9 +207,96 @@ func (s *Server) handleRecordings(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Security-Policy", framePolicy)
 	w.WriteHeader(http.StatusOK)
-	if _, err := page.WriteTo(w); err != nil {
+	if _, err := rendered.WriteTo(w); err != nil {
 		s.logWriteFailure(err)
 	}
+}
+
+// handleRecording shows one recording with its whole transcript and the
+// form that edits it.
+func (s *Server) handleRecording(w http.ResponseWriter, r *http.Request) {
+	rec, err := s.recordings.Recording(r.PathValue(recordingIDKey))
+	if err != nil {
+		s.recordingFailure(w, r, err)
+		return
+	}
+
+	view := recordingView{recordingRow: newRecordingRow(&rec), CorrectText: rec.CorrectText}
+	s.writePage(w, recordingPage, &view)
+}
+
+// handleRecordingEdit saves the recording form and sends the browser back to
+// the recording's page.
+func (s *Server) handleRecordingEdit(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue(recordingIDKey)
+	if !recordings.ValidID(id) {
+		s.recordingFailure(w, r, recordings.ErrNotFound)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxRecordingFormBytes)
+	if err := r.ParseForm(); err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("invalid recording form: %w", err))
+		return
+	}
+
+	edit, err := annotationOf(r.PostForm)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if err := s.recordings.Annotate(id, edit); err != nil {
+		s.recordingFailure(w, r, err)
+		return
+	}
+
+	http.Redirect(w, r, recordingsRoute+"/"+id, http.StatusSeeOther)
+}
+
+// annotationOf reads the recording form. A checkbox field is absent or
+// keepOn, and no field is given twice.
+func annotationOf(form url.Values) (recordings.Annotation, error) {
+	keep, keepErr := checkbox(form, keepFieldName)
+	flagged, flagErr := checkbox(form, errorFieldName)
+	text, textErr := singleField(form, correctTextFieldName)
+	if err := errors.Join(keepErr, flagErr, textErr); err != nil {
+		return recordings.Annotation{}, err
+	}
+
+	return recordings.Annotation{Keep: keep, TranscriptionError: flagged, CorrectText: text}, nil
+}
+
+func checkbox(form url.Values, name string) (bool, error) {
+	if !form.Has(name) {
+		return false, nil
+	}
+
+	value, err := singleField(form, name)
+	if err != nil {
+		return false, err
+	}
+
+	if value != keepOn {
+		return false, fmt.Errorf("%s must be %s when given, got %q", name, keepOn, value)
+	}
+
+	return true, nil
+}
+
+// singleField returns the value of name, empty when it is absent, and fails
+// when it is given more than once.
+func singleField(form url.Values, name string) (string, error) {
+	values := form[name]
+	if len(values) > 1 {
+		return "", fmt.Errorf("give %s at most once, got %d values", name, len(values))
+	}
+
+	if len(values) == 0 {
+		return "", nil
+	}
+
+	return values[0], nil
 }
 
 // pageCursor returns the before parameter, empty for the newest page. The
@@ -196,13 +322,14 @@ func pageCursor(r *http.Request) (string, error) {
 
 func newRecordingRow(rec *recordings.Recording) recordingRow {
 	return recordingRow{
-		ID:         rec.ID,
-		At:         rec.At.UTC().Format(time.RFC3339),
-		Shown:      rec.At.UTC().Format(shownTime),
-		Length:     fmt.Sprintf("%.1f s", rec.Duration.Seconds()),
-		Source:     rec.Source,
-		Transcript: rec.Transcript,
-		Keep:       rec.Keep,
+		ID:                 rec.ID,
+		At:                 rec.At.UTC().Format(time.RFC3339),
+		Shown:              rec.At.UTC().Format(shownTime),
+		Length:             fmt.Sprintf("%.1f s", rec.Duration.Seconds()),
+		Source:             rec.Source,
+		Transcript:         rec.Transcript,
+		Keep:               rec.Keep,
+		TranscriptionError: rec.TranscriptionError,
 	}
 }
 
@@ -345,9 +472,20 @@ func (s *Server) handleRecordingKeep(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, recordingsRoute, http.StatusSeeOther)
 }
 
+// recordingFailure answers err from the store: 404 for a recording or
+// profile it does not hold, 400 for a value it refuses, 409 for a change
+// that conflicts with what it holds, and 500 for anything else, which only
+// the log details.
 func (s *Server) recordingFailure(w http.ResponseWriter, r *http.Request, err error) {
-	if errors.Is(err, recordings.ErrNotFound) {
+	switch {
+	case errors.Is(err, recordings.ErrNotFound):
 		s.writeError(w, http.StatusNotFound, fmt.Errorf("%s not found", r.URL.Path))
+		return
+	case errors.Is(err, recordings.ErrInvalid):
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	case errors.Is(err, recordings.ErrFlaggedKept):
+		s.writeError(w, http.StatusConflict, err)
 		return
 	}
 

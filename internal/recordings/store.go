@@ -31,8 +31,10 @@ const Retention = 7 * 24 * time.Hour
 const (
 	maxStoreBytes   = 1 << 30
 	collectInterval = time.Hour
-	// maxMetadataBytes bounds a metadata read. A transcript at the
-	// upstream's 1 MiB bound, each byte escaped to at most six in JSON, fits.
+	// maxMetadataBytes bounds a metadata read. JSON escapes a byte to at
+	// most six, so a transcript at the upstream's 1 MiB bound takes 6 MiB
+	// and a correct text at MaxCorrectTextBytes 96 KiB; the other fields
+	// take well under a KiB, which leaves most of the last MiB spare.
 	maxMetadataBytes = 7 << 20
 	// maxIDAttempts bounds the redraws of an id already in the store, which
 	// a 32-bit random suffix makes all but impossible.
@@ -53,9 +55,19 @@ const (
 	pcmBytes    = 2
 )
 
+// MaxCorrectTextBytes bounds the correct text an operator may store beside a
+// transcript.
+const MaxCorrectTextBytes = 16 << 10
+
 var (
 	ErrNotFound = errors.New("recording not found")
 	ErrFull     = errors.New("the recordings store is full")
+	// ErrInvalid marks an edit the store refuses because a value breaks a
+	// bound; its message says which.
+	ErrInvalid = errors.New("invalid edit")
+	// ErrFlaggedKept refuses to release a recording flagged with a
+	// transcription error, which must stay kept as a test case.
+	ErrFlaggedKept = errors.New("a recording with a transcription error stays kept: clear the transcription error first")
 
 	// errUnusable marks metadata that cannot be read once open, does not
 	// decode or is over maxMetadataBytes.
@@ -70,33 +82,51 @@ var (
 // Recording describes one saved transcription. List fills Transcript with
 // at most maxPreviewBytes of it, marked with an ellipsis when cut.
 type Recording struct {
-	ID         string
-	At         time.Time
-	Duration   time.Duration
-	Source     string
-	Transcript string
-	Keep       bool
+	ID                 string
+	At                 time.Time
+	Duration           time.Duration
+	Source             string
+	Transcript         string
+	Keep               bool
+	TranscriptionError bool
+	// CorrectText is what the speaker said when TranscriptionError is set.
+	// List leaves it empty; Recording fills it.
+	CorrectText string
+}
+
+// Annotation is an operator's edit of a recording. The transcript itself is
+// never edited.
+type Annotation struct {
+	Keep               bool
+	TranscriptionError bool
+	CorrectText        string
 }
 
 // metadata is the JSON file saved beside each recording. At marshals as
 // RFC 3339 with nanoseconds, so recordings made in one second keep their
 // order.
 type metadata struct {
-	At         time.Time `json:"at"`
-	DurationMs int64     `json:"durationMs"`
-	Source     string    `json:"source"`
-	Transcript string    `json:"transcript"`
-	Keep       bool      `json:"keep"`
+	At                 time.Time `json:"at"`
+	DurationMs         int64     `json:"durationMs"`
+	Source             string    `json:"source"`
+	Transcript         string    `json:"transcript"`
+	Keep               bool      `json:"keep"`
+	TranscriptionError bool      `json:"transcriptionError"`
+	CorrectText        string    `json:"correctText"`
 }
 
 // storedMetadata is metadata as read back. Its pointers tell a missing or
 // null keep or at from a written one, which the store needs to trust a file.
+// The annotation fields may be missing: files written before they existed
+// read as not flagged.
 type storedMetadata struct {
-	At         *time.Time `json:"at"`
-	DurationMs int64      `json:"durationMs"`
-	Source     string     `json:"source"`
-	Transcript string     `json:"transcript"`
-	Keep       *bool      `json:"keep"`
+	At                 *time.Time `json:"at"`
+	DurationMs         int64      `json:"durationMs"`
+	Source             string     `json:"source"`
+	Transcript         string     `json:"transcript"`
+	Keep               *bool      `json:"keep"`
+	TranscriptionError bool       `json:"transcriptionError"`
+	CorrectText        string     `json:"correctText"`
 }
 
 // indexed is what the store remembers of a complete recording, everything
@@ -575,14 +605,22 @@ func (s *Store) recording(rec *indexed) (Recording, error) {
 		return Recording{}, err
 	}
 
+	got := recordingOf(rec, &meta)
+	got.Transcript = preview(meta.Transcript)
+	return got, nil
+}
+
+// recordingOf describes rec without its transcript or correct text, which
+// each caller fills as it needs.
+func recordingOf(rec *indexed, meta *metadata) Recording {
 	return Recording{
-		ID:         rec.id,
-		At:         rec.at,
-		Duration:   time.Duration(rec.durationMs) * time.Millisecond,
-		Source:     rec.source,
-		Transcript: preview(meta.Transcript),
-		Keep:       rec.keep,
-	}, nil
+		ID:                 rec.id,
+		At:                 rec.at,
+		Duration:           time.Duration(rec.durationMs) * time.Millisecond,
+		Source:             rec.source,
+		Keep:               rec.keep,
+		TranscriptionError: meta.TranscriptionError,
+	}
 }
 
 // preview cuts transcript to maxPreviewBytes on a character boundary and
@@ -651,7 +689,8 @@ func (s *Store) Audio(id string) (*os.File, error) {
 }
 
 // SetKeep marks the recording id as kept, which exempts it from expiry and
-// eviction, or clears the mark.
+// eviction, or clears the mark. Clearing the mark of a recording flagged with
+// a transcription error is ErrFlaggedKept.
 func (s *Store) SetKeep(id string, keep bool) error {
 	if !ValidID(id) {
 		return ErrNotFound
@@ -660,27 +699,111 @@ func (s *Store) SetKeep(id string, keep bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, ok := s.byID[id]
-	if !ok {
-		return ErrNotFound
-	}
-
-	meta, err := s.readMetadata(id)
+	rec, meta, err := s.indexedMetadata(id)
 	if err != nil {
 		return err
 	}
 
+	if !keep && meta.TranscriptionError {
+		return ErrFlaggedKept
+	}
+
 	meta.Keep = keep
+	return s.rewrite(rec, &meta)
+}
+
+// Recording returns the recording id with its whole transcript and its
+// correct text.
+func (s *Store) Recording(id string) (Recording, error) {
+	if !ValidID(id) {
+		return Recording{}, ErrNotFound
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, meta, err := s.indexedMetadata(id)
+	if err != nil {
+		return Recording{}, err
+	}
+
+	got := recordingOf(rec, &meta)
+	got.Transcript = meta.Transcript
+	got.CorrectText = meta.CorrectText
+	return got, nil
+}
+
+// Annotate saves edit on the recording id and leaves its transcript as it
+// is. A transcription error keeps the recording whatever edit.Keep says, and
+// without one the correct text is dropped. A correct text over
+// MaxCorrectTextBytes or not valid UTF-8 is ErrInvalid.
+func (s *Store) Annotate(id string, edit Annotation) error {
+	if !ValidID(id) {
+		return ErrNotFound
+	}
+
+	if !edit.TranscriptionError {
+		edit.CorrectText = ""
+	}
+
+	if err := checkCorrectText(edit.CorrectText); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, meta, err := s.indexedMetadata(id)
+	if err != nil {
+		return err
+	}
+
+	meta.Keep = edit.Keep || edit.TranscriptionError
+	meta.TranscriptionError = edit.TranscriptionError
+	meta.CorrectText = edit.CorrectText
+	return s.rewrite(rec, &meta)
+}
+
+func checkCorrectText(text string) error {
+	if len(text) > MaxCorrectTextBytes {
+		return fmt.Errorf("%w: the correct text is %d bytes, over the %d-byte limit", ErrInvalid, len(text), MaxCorrectTextBytes)
+	}
+
+	if !utf8.ValidString(text) {
+		return fmt.Errorf("%w: the correct text is not valid UTF-8", ErrInvalid)
+	}
+
+	return nil
+}
+
+// indexedMetadata returns the index entry and the metadata of the indexed
+// recording id. The caller holds mu.
+func (s *Store) indexedMetadata(id string) (*indexed, metadata, error) {
+	rec, ok := s.byID[id]
+	if !ok {
+		return nil, metadata{}, ErrNotFound
+	}
+
+	meta, err := s.readMetadata(id)
+	if err != nil {
+		return nil, metadata{}, err
+	}
+
+	return rec, meta, nil
+}
+
+// rewrite replaces the metadata file of rec with meta. The caller holds mu.
+func (s *Store) rewrite(rec *indexed, meta *metadata) error {
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return fmt.Errorf("encode recording metadata: %w", err)
 	}
 
-	if err := s.write(id+jsonSuffix, data); err != nil {
+	if err := s.write(rec.id+jsonSuffix, data); err != nil {
 		return err
 	}
 
-	rec.keep = keep
+	rec.keep = meta.Keep
 	rec.jsonBytes = int64(len(data))
 	return nil
 }
@@ -850,10 +973,12 @@ func (s *Store) readMetadata(id string) (metadata, error) {
 	}
 
 	return metadata{
-		At:         *stored.At,
-		DurationMs: stored.DurationMs,
-		Source:     stored.Source,
-		Transcript: stored.Transcript,
-		Keep:       *stored.Keep,
+		At:                 *stored.At,
+		DurationMs:         stored.DurationMs,
+		Source:             stored.Source,
+		Transcript:         stored.Transcript,
+		Keep:               *stored.Keep,
+		TranscriptionError: stored.TranscriptionError,
+		CorrectText:        stored.CorrectText,
 	}, nil
 }

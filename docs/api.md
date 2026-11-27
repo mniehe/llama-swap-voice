@@ -12,8 +12,8 @@ lists the variable behind each one.
 ## Endpoints
 
 The service listens on `127.0.0.1:8920` by default. Every `/v1` path also
-works without the `/v1` prefix. The three `/recordings` paths exist only
-with `recordings.enable` on, and have no `/v1` form.
+works without the `/v1` prefix. The `/recordings` paths exist only with
+`recordings.enable` on, and have no `/v1` form.
 
 | Endpoint | Purpose | Status codes |
 |---|---|---|
@@ -25,8 +25,10 @@ with `recordings.enable` on, and have no `/v1` form.
 | `GET /internal/liveness` | Liveness probe | 200 |
 | `GET /internal/readiness` | Readiness probe | 200; 503 in plain text during shutdown |
 | `GET /recordings` | The [recordings](#recordings) page, in HTML | 200, 400, 403, 500 |
+| `GET /recordings/{id}` | The page of one recording, in HTML | 200, 403, 404, 500 |
+| `POST /recordings/{id}` | Save the review of one recording | 303, 400, 403, 404, 500 |
 | `GET /recordings/{id}/audio` | One recording, as Ogg Opus | 200, 206, 304, 403, 404, 412, 416, 500 |
-| `POST /recordings/{id}/keep` | Mark a recording kept, or release it | 303, 400, 403, 404, 500 |
+| `POST /recordings/{id}/keep` | Mark a recording kept, or release it | 303, 400, 403, 404, 409, 500 |
 
 An unknown path gets a 404 and a wrong method gets a 405.
 
@@ -92,7 +94,7 @@ the option, these paths answer 404 like any unknown path. They have no
 authentication; the recordings hold household speech, so limit who can reach
 the port.
 
-The three paths answer only a request whose `Host` header names an allowed
+The recordings paths answer only a request whose `Host` header names an allowed
 host: `127.0.0.1`, `[::1]` or `localhost` on any port, the listen address
 `host`, or an entry of `recordings.allowedHosts`. Any other `Host` gets a
 403, which stops a DNS-rebinding page in a browser on your network from
@@ -104,8 +106,10 @@ must be in `recordings.allowedHosts`.
 newest 100 recordings, newest first, each with its UTC time, its length, its
 source (`openai` or `wyoming`) and the first 2 KiB of its transcript, cut
 at a character and marked with an ellipsis when longer, and says how many of
-all the recordings it shows. Each row has an audio player and a button that
-marks the recording kept or releases it. When older recordings exist, an
+all the recordings it shows. Each row links to the recording's page and has
+an audio player and a button that marks the recording kept or releases it.
+A row flagged with a transcription error is marked "Transcription error" and
+has no button, because such a recording stays kept. When older recordings exist, an
 "Older" link leads to `GET /recordings?before={id}`, the next 100 recordings
 older than `{id}`. When the recording `{id}` has been deleted since, the
 page starts at the end of the second in its id, so a recording made in that
@@ -129,12 +133,38 @@ carries `Content-Range: bytes */{size}`; a 416 for a `Range` it cannot parse
 carries no `Content-Range`. The transfer may take as long as sending the
 file at 16 KiB/s takes, and at least 10 seconds.
 
+`GET /recordings/{id}` returns the page of one recording, in HTML that needs
+no JavaScript: its time, length and source, an audio player, its whole
+transcript, and a form that reviews it. Like the list, it is rendered whole
+before it is sent and carries `Cache-Control: no-store` and
+`Content-Security-Policy: frame-ancestors 'none'`.
+
+`POST /recordings/{id}` saves that form, an ordinary
+`application/x-www-form-urlencoded` form:
+
+| Field | Meaning |
+|---|---|
+| `keep` | `true` keeps the recording; absent releases it. |
+| `transcriptionError` | `true` flags the transcript as wrong; absent clears the flag. |
+| `correctText` | What was said, at most 16 KiB of UTF-8. Empty, with the flag, means the recogniser wrote text when nobody spoke. |
+
+A ticked checkbox is sent as `true` and an unticked one not at all, as a
+browser does. A flagged recording is always kept, whatever `keep` says, so
+the 7-day expiry never deletes a test case. Without the flag, the service
+stores no correct text, whatever `correctText` says. The original transcript
+is never changed. On success the post answers 303 with
+`Location: /recordings/{id}`. A checkbox with a value other than `true`, a
+field given twice, a correct text over 16 KiB or not valid UTF-8, or a form
+over 49 KiB gets a 400. The service ignores fields it does not know.
+
 `POST /recordings/{id}/keep` takes a form with one field, `keep`, set to
 `true` or `false` and given once. On success it answers 303 with
 `Location: /recordings`. Any other value, a missing or repeated field, or a
-form over 1 KiB gets a 400. A post that a browser marks as coming from
-another site (`Sec-Fetch-Site`, or an `Origin` that does not match the host)
-gets a 403.
+form over 1 KiB gets a 400. Releasing a recording flagged with a
+transcription error gets a 409; clear the flag on its page first.
+
+A post to either form that a browser marks as coming from another site
+(`Sec-Fetch-Site`, or an `Origin` that does not match the host) gets a 403.
 
 An id that does not have the form of a recording id, such as
 `20261125T153000Z-1a2b3c4d`, gets a 404 without touching the disk, as does
@@ -165,9 +195,10 @@ change, so a later failure cuts the transfer.
 
 | Status | Cause |
 |---|---|
-| 400 | A malformed body; an empty or too long `input`; an unknown voice or format; a `speed` out of range; a missing `file`; an upload that the service cannot decode or that is longer than 20 minutes; a malformed recordings page query |
-| 403 | A recordings request whose `Host` is not allowed; a keep post from another site |
+| 400 | A malformed body; an empty or too long `input`; an unknown voice or format; a `speed` out of range; a missing `file`; an upload that the service cannot decode or that is longer than 20 minutes; a malformed recordings page query; a recordings form that breaks a bound |
+| 403 | A recordings request whose `Host` is not allowed; a recordings form post from another site |
 | 404, 405 | An unknown path; a wrong method; an unknown or malformed recording id |
+| 409 | Releasing a recording flagged with a transcription error |
 | 412, 416 | A recording's audio fetched with a precondition that fails, or a range past its end or malformed |
 | 429 and other upstream errors | Passed on from llama-swap or the model server, with its message and `Retry-After` |
 | 500 | A fault inside the service. The cause is in its log. |
@@ -196,6 +227,8 @@ no redirect from llama-swap.
 | Time for a speech request or a transcription | 2 minutes | `request.timeout` |
 | Time for any other request | 10 seconds | fixed |
 | Recordings keep form | 1 KiB | fixed |
+| Recording review form | 49 KiB | fixed |
+| Correct text of a recording | 16 KiB | fixed |
 | Recordings on one page | 100 | fixed |
 | Slowest fetch of a recording's audio | 16 KiB/s | fixed |
 | Recordings waiting to be saved: audio, transcript and 512 bytes each | 64 MiB | fixed |
